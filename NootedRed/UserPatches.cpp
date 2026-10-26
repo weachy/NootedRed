@@ -436,8 +436,8 @@ void UserPatches::init()
                        || checkKernelArgument(kBootArgAVC)
                        || checkKernelArgument(kBootArgAVCEncode);
 
-    this->submitGuardEnabled = checkKernelArgument(kBootArgSubmitGuard) || !checkKernelArgument(kBootArgNoSubmitGuard);
-    this->legacyBlendEnabled = checkKernelArgument(kBootArgLegacyBlend) || !checkKernelArgument(kBootArgNoLegacyBlend);
+    this->submitGuardEnabled = checkKernelArgument(kBootArgSubmitGuard) && !checkKernelArgument(kBootArgNoSubmitGuard);
+    this->legacyBlendEnabled = checkKernelArgument(kBootArgLegacyBlend) && !checkKernelArgument(kBootArgNoLegacyBlend);
 
     if (!this->enabled && !this->vdaEnabled && !this->submitGuardEnabled && !this->legacyBlendEnabled) {
         DBGLOG("UserPatch", "User-space driver patches are disabled");
