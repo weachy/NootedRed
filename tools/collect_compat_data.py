@@ -104,16 +104,26 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def get_macos_version() -> str:
-    ver = platform.mac_ver()[0]
-    if ver:
-        return ver.strip()
-    try:
-        completed = subprocess.run(["sw_vers", "-productVersion"], capture_output=True, text=True, timeout=5)
-        if completed.returncode == 0 and completed.stdout.strip():
-            return completed.stdout.strip()
-    except Exception:
-        pass
+def get_macos_version(sys_root: Path = Path("/")) -> str:
+    plist_path = sys_root / "System/Library/CoreServices/SystemVersion.plist"
+    if plist_path.is_file():
+        try:
+            data = plistlib.loads(plist_path.read_bytes())
+            ver = data.get("ProductUserVisibleVersion") or data.get("ProductVersion")
+            if ver:
+                return str(ver).strip()
+        except Exception:
+            pass
+    if sys_root == Path("/") or sys_root == Path(""):
+        ver = platform.mac_ver()[0]
+        if ver:
+            return ver.strip()
+        try:
+            completed = subprocess.run(["sw_vers", "-productVersion"], capture_output=True, text=True, timeout=5)
+            if completed.returncode == 0 and completed.stdout.strip():
+                return completed.stdout.strip()
+        except Exception:
+            pass
     return "unknown"
 
 
@@ -145,11 +155,21 @@ def load_module(name: str, path: Path):
     return module
 
 
-def find_cache_dir(override: Path | None) -> Path | None:
+def find_cache_dir(override: Path | None, sys_root: Path = Path("/")) -> Path | None:
     if override is not None:
         return override if override.is_dir() else None
-    return next((path for path in CACHE_CANDIDATES if (path / "dyld_shared_cache_x86_64h.map").is_file()),
-                None)
+    candidates = [
+        sys_root / "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld",
+        sys_root / "System/Cryptexes/OS/System/Library/dyld",
+        sys_root / "System/Library/dyld",
+    ]
+    for path in candidates:
+        if (path / "dyld_shared_cache_x86_64h.map").is_file():
+            return path
+    if sys_root.is_dir() and sys_root != Path("/"):
+        for path in sys_root.glob("System/**/dyld_shared_cache_x86_64h.map"):
+            return path.parent
+    return None
 
 
 class CacheReader:
@@ -266,21 +286,37 @@ def find_all(haystack: bytes, needle: bytes, limit: int) -> tuple[list[int], boo
         start = index + 1
 
 
-def collect_metadata(root: Path, warnings: list[str]) -> dict:
+def collect_metadata(root: Path, warnings: list[str], sys_root: Path = Path("/")) -> dict:
     meta = root / "metadata"
-    versions = run(["sw_vers"])
     uname = run(["uname", "-a"])
-    boot_args = run(["nvram", "boot-args"]).get("stdout", "").strip()
-    csr = run(["csrutil", "status"]).get("stdout", "").strip()
+    if sys_root != Path("/"):
+        plist_path = sys_root / "System/Library/CoreServices/SystemVersion.plist"
+        sw_text = ""
+        if plist_path.is_file():
+            try:
+                plist_data = plistlib.loads(plist_path.read_bytes())
+                sw_text = "\n".join(f"{k}: {v}" for k, v in sorted(plist_data.items()))
+            except Exception as e:
+                sw_text = f"Error reading {plist_path}: {e}"
+        else:
+            sw_text = f"Offline sys-root: {sys_root} (SystemVersion.plist missing)"
+        write_text(meta / "sw_vers.txt", sw_text + "\n")
+        write_text(meta / "uname.txt", f"Offline scan of {sys_root} from host: " + (uname.get("stdout", "") or uname.get("stderr", "")))
+        boot_args = ""
+        csr = ""
+    else:
+        versions = run(["sw_vers"])
+        write_text(meta / "sw_vers.txt", versions.get("stdout", "") or versions.get("stderr", ""))
+        write_text(meta / "uname.txt", uname.get("stdout", "") or uname.get("stderr", ""))
+        boot_args = run(["nvram", "boot-args"]).get("stdout", "").strip()
+        csr = run(["csrutil", "status"]).get("stdout", "").strip()
+    write_text(meta / "boot-args.txt", boot_args + "\n")
+    write_text(meta / "csrutil.txt", csr + "\n")
+
     hardware = run(["system_profiler", "SPHardwareDataType", "-json"]).get("stdout", "")
     displays = run(["system_profiler", "SPDisplaysDataType", "-json"]).get("stdout", "")
     kexts = run(["kmutil", "showloaded"]).get("stdout", "")
     kextstat = run(["kextstat"]).get("stdout", "")
-
-    write_text(meta / "sw_vers.txt", versions.get("stdout", "") or versions.get("stderr", ""))
-    write_text(meta / "uname.txt", uname.get("stdout", "") or uname.get("stderr", ""))
-    write_text(meta / "boot-args.txt", boot_args + "\n")
-    write_text(meta / "csrutil.txt", csr + "\n")
 
     try:
         hardware_json = json.loads(hardware)
@@ -324,7 +360,8 @@ def collect_metadata(root: Path, warnings: list[str]) -> dict:
         "csr": csr,
         "nootedred_loaded": nootedred_loaded,
         "userspace_patch_flags": flags,
-        "patched_page_cache_risk": bool(nootedred_loaded and flags),
+        "offline_sys_root": str(sys_root) if sys_root != Path("/") else None,
+        "patched_page_cache_risk": bool(nootedred_loaded and flags and sys_root == Path("/")),
     }
     if environment["patched_page_cache_risk"]:
         warnings.append(
@@ -511,17 +548,18 @@ def detect_patched_gl(gl_bytes: bytes, environment: dict, warnings: list[str],
 
 
 def collect_chromium(root: Path, cache_dir: Path | None, warnings: list[str],
-                     environment: dict) -> dict:
+                     environment: dict, sys_root: Path = Path("/")) -> dict:
     chromium = root / "chromium"
     chromium.mkdir(parents=True, exist_ok=True)
     result: dict = {"gl": {}, "mtl": {}, "patterns": list(CHROMIUM_PATTERNS)}
-    if not GL_DRIVER.is_file():
-        warnings.append(f"GL driver missing: {GL_DRIVER}")
+    gl_driver = sys_root / "System/Library/Extensions/AMDRadeonX5000GLDriver.bundle/Contents/MacOS/AMDRadeonX5000GLDriver"
+    if not gl_driver.is_file():
+        warnings.append(f"GL driver missing: {gl_driver}")
         return result
 
-    gl_bytes = GL_DRIVER.read_bytes()
+    gl_bytes = gl_driver.read_bytes()
     (chromium / "GLDriver.bin").write_bytes(gl_bytes)
-    info_plist = GL_DRIVER.parents[2] / "Contents" / "Info.plist"
+    info_plist = gl_driver.parents[2] / "Contents" / "Info.plist"
     versions: dict = {}
     try:
         info = plistlib.loads(info_plist.read_bytes())
@@ -533,9 +571,9 @@ def collect_chromium(root: Path, cache_dir: Path | None, warnings: list[str],
     except Exception:  # noqa: BLE001
         pass
     gl_uuid = macho_file_uuid(gl_bytes)
-    write_text(chromium / "GLDriver-nm.txt", run(["nm", "-m", str(GL_DRIVER)], timeout=180).get("stdout", ""))
+    write_text(chromium / "GLDriver-nm.txt", run(["nm", "-m", str(gl_driver)], timeout=180).get("stdout", ""))
     result["gl"] = {
-        "path": str(GL_DRIVER),
+        "path": str(gl_driver),
         "size": len(gl_bytes),
         "sha256": sha256(gl_bytes),
         "uuid": gl_uuid,
@@ -706,17 +744,19 @@ def scan_chromium_sites(root: Path, gl_bytes: bytes | None, mtl_bytes: bytes | N
 
 
 def collect_vda(root: Path, cache_dir: Path | None, warnings: list[str],
-                include_generators: bool, include_kc: bool) -> dict:
+                include_generators: bool, include_kc: bool, sys_root: Path = Path("/")) -> dict:
     vda = root / "vda"
     generated = vda / "generated"
     generated.mkdir(parents=True, exist_ok=True)
     result: dict = {"kernel": {}, "generated": [], "firmware": []}
+    kc_file = sys_root / "System/Library/KernelCollections/SystemKernelExtensions.kc"
 
     # Kernel source identification: parsed independently of the generator so a new build still leaves
     # useful evidence behind when the header generation refuses to run.
     try:
         module = load_module("nred_vcn_gen", TOOLS_DIR / "gen_vcn_kernel_data.py")
-        kc = module.KernelCollection(module.DEFAULT_KC)
+        actual_kc = kc_file if kc_file.is_file() else module.DEFAULT_KC
+        kc = module.KernelCollection(actual_kc)
         result["kernel"] = module.collect_source_info(kc)
         write_json(vda / "kernel-info.json", result["kernel"])
         try:
@@ -727,18 +767,18 @@ def collect_vda(root: Path, cache_dir: Path | None, warnings: list[str],
     except Exception as error:  # noqa: BLE001
         warnings.append(f"kernel collection parsing failed: {error}")
 
-    if include_kc and KERNEL_COLLECTION.is_file():
+    if include_kc and kc_file.is_file():
         destination = vda / "SystemKernelExtensions.kc"
         try:
-            shutil.copyfile(KERNEL_COLLECTION, destination)
-            result["kernel_collection"] = {"path": str(KERNEL_COLLECTION),
+            shutil.copyfile(kc_file, destination)
+            result["kernel_collection"] = {"path": str(kc_file),
                                            "size": destination.stat().st_size}
             warnings.append("kernel collection copied; the archive will be large")
         except OSError as error:
             warnings.append(f"could not copy kernel collection: {error}")
 
     if include_generators:
-        os_ver = get_macos_version()
+        os_ver = get_macos_version(sys_root)
         if os_ver.startswith("13."):
             os_suffix = "Ventura"
         elif os_ver.startswith("14."):
@@ -779,6 +819,10 @@ def collect_vda(root: Path, cache_dir: Path | None, warnings: list[str],
                 shutil.copyfile(committed, output_path)
 
             command = [sys.executable, str(script_path), output_flag, str(output_path)]
+            if script == "gen_vcn_kernel_data.py" and kc_file.is_file():
+                command.extend(["--kc", str(kc_file)])
+            elif cache_dir is not None:
+                command.extend(["--cache-dir", str(cache_dir)])
             outcome = run(command, timeout=900)
             entry = {
                 "name": name,
@@ -793,6 +837,10 @@ def collect_vda(root: Path, cache_dir: Path | None, warnings: list[str],
                 # A patched page cache makes live reads return our replacements; the committed header is
                 # then the only usable source. Record a --check verdict and keep the verified header.
                 check_command = [sys.executable, str(script_path), "--check"]
+                if script == "gen_vcn_kernel_data.py" and kc_file.is_file():
+                    check_command.extend(["--kc", str(kc_file)])
+                elif cache_dir is not None:
+                    check_command.extend(["--cache-dir", str(cache_dir)])
                 if committed.is_file():
                     check_command.extend([output_flag, str(committed)])
                 check = run(check_command, timeout=900)
@@ -818,9 +866,9 @@ def collect_vda(root: Path, cache_dir: Path | None, warnings: list[str],
     return result
 
 
-def collect_firmware(root: Path) -> list[dict]:
+def collect_firmware(root: Path, sys_root: Path = Path("/")) -> list[dict]:
     collected = []
-    extensions = Path("/System/Library/Extensions")
+    extensions = sys_root / "System/Library/Extensions"
     for bundle in sorted(extensions.glob("AMDRadeon*.kext")):
         resources = bundle / "Contents" / "Resources"
         if not resources.is_dir():
@@ -865,11 +913,11 @@ def collect_manifest(root: Path, args, metadata: dict, chromium: dict, vda: dict
 
 
 def main() -> int:
-    macos_ver = get_macos_version()
-    default_name = f"nred-compat-{macos_ver}"
     parser = argparse.ArgumentParser(description="Collect compatibility data for a macOS build/APU")
+    parser.add_argument("--sys-root", type=Path, default=Path("/"),
+                        help="system root directory (e.g. /Volumes/Macintosh\\ HD for an external disk, default: /)")
     parser.add_argument("--out", type=Path, default=Path("."),
-                        help=f"destination parent directory (default: current directory, generating {default_name})")
+                        help="destination parent directory (default: current directory, generating nred-compat-<ver>)")
     parser.add_argument("--zip", action="store_true", help="also create <out>.zip")
     parser.add_argument("--cache-dir", type=Path, help="override the dyld shared cache directory")
     parser.add_argument("--include-kc", action="store_true",
@@ -877,6 +925,10 @@ def main() -> int:
     parser.add_argument("--no-generators", action="store_true",
                         help="do not try to run the VCN/VA/GVA generators")
     args = parser.parse_args()
+
+    sys_root = args.sys_root.resolve()
+    macos_ver = get_macos_version(sys_root)
+    default_name = f"nred-compat-{macos_ver}"
 
     out_arg = args.out
     if out_arg.name.startswith("nred-compat"):
@@ -889,13 +941,13 @@ def main() -> int:
     root.mkdir(parents=True)
     warnings: list[str] = []
 
-    cache_dir = find_cache_dir(args.cache_dir)
+    cache_dir = find_cache_dir(args.cache_dir, sys_root)
     if cache_dir is None:
         warnings.append("dyld shared cache not found; Chromium/MTL and VA/GVA data will be incomplete")
 
-    metadata = collect_metadata(root, warnings)
-    chromium = collect_chromium(root, cache_dir, warnings, metadata)
-    vda = collect_vda(root, cache_dir, warnings, not args.no_generators, args.include_kc)
+    metadata = collect_metadata(root, warnings, sys_root)
+    chromium = collect_chromium(root, cache_dir, warnings, metadata, sys_root)
+    vda = collect_vda(root, cache_dir, warnings, not args.no_generators, args.include_kc, sys_root)
     manifest = collect_manifest(root, args, metadata, chromium, vda, warnings)
 
     if args.zip:

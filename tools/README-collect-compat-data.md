@@ -12,15 +12,18 @@ It is read-only, does not install anything and does not need root. It replaces t
 
 ## Requirements
 
-- Run on the target macOS install, normally the machine being diagnosed.
-- **Prefer a pristine boot** for data that will be used to generate new patch sets: boot with `-NRedOff`
+- Run on the target macOS install, or use `--sys-root` pointing to a mounted offline macOS disk volume.
+- **Prefer a pristine boot** for data collected from the live system that will be used to generate new patch sets: boot with `-NRedOff`
   (or without NootedRed) so the kext has not patched the file-backed page cache. The collector detects
-  the patched state and, for the already-committed 15.8.1 pages, reconstructs the vanilla pages from
-  `NootedRed/UserPatches.cpp`; for any other build you need the pristine boot.
+  the patched state and, for the already-committed pages, reconstructs the vanilla pages from
+  `NootedRed/UserPatches.cpp`.
+  > **Tip**: When collecting from an offline volume via `--sys-root` (e.g. an external SSD), files on disk are completely unaffected by live kext memory patches, naturally satisfying the pristine requirements.
 - `python3`, `nm`, `ioreg`, `system_profiler`, `kmutil`/`ffmpeg` are used when present; missing tools only
   produce warnings.
 
 ## Usage
+
+### 1. Live system collection (running on target OS)
 
 The script automatically detects the running macOS version (e.g. `14.8.9`) and stores output into a directory named `nred-compat-<macos-version>`:
 
@@ -28,17 +31,35 @@ The script automatically detects the running macOS version (e.g. `14.8.9`) and s
 # Collect to /tmp/nred-compat-<macos-version>
 python3 tools/collect_compat_data.py --out /tmp
 
-# Collect and generate /tmp/nred-compat-<macos-version>.zip (supports /tmp and /tmp/)
-python3 tools/collect_compat_data.py --out /tmp/ --zip
+# Collect and generate /tmp/nred-compat-<macos-version>.zip
+python3 tools/collect_compat_data.py --out /tmp --zip
 
-# Collect to current directory (./nred-compat-<macos-version>) and zip
-python3 tools/collect_compat_data.py --zip
+# Collect to current directory (./nred-compat-<macos-version>) with full KC and zip
+python3 tools/collect_compat_data.py --include-kc --zip
 ```
 
-Options:
+### 2. External / offline disk collection (without rebooting)
+
+If you have an external SSD or another partition with macOS installed (e.g. macOS 13.x, 14.x, 15.x, or 26.x mounted at `/Volumes/<VolumeName>`), you can collect its complete compatibility dataset directly without rebooting into it:
+
+```sh
+# Collect from mounted external disk volume
+python3 tools/collect_compat_data.py --sys-root "/Volumes/Macintosh HD" --include-kc --zip
+
+# Collect to a specific output path (e.g. into DEV/AnalysisData)
+python3 tools/collect_compat_data.py --sys-root "/Volumes/Ventura" --out ../AnalysisData --include-kc --zip
+```
+
+When `--sys-root` is supplied:
+- The OS version is automatically read from `<sys-root>/System/Library/CoreServices/SystemVersion.plist`, generating the proper directory name (e.g. `nred-compat-13.6.4`).
+- `AMDRadeonX5000GLDriver`, `SystemKernelExtensions.kc`, firmware, and dyld shared cache are extracted directly from the specified volume.
+- Current host GPU and display metadata are recorded alongside offline system information.
+
+### Options
 
 | Option | Meaning |
 | --- | --- |
+| `--sys-root DIR` | system root directory (default: `/`; pass e.g. `/Volumes/<VolumeName>` for an attached external disk) |
 | `--out DIR` | destination parent directory (default: current directory, generating `nred-compat-<macos-version>`; supports `/path` and `/path/`) |
 | `--zip` | also create `<out>.zip` archive alongside the output folder |
 | `--cache-dir DIR` | override the dyld shared cache directory |
@@ -77,17 +98,17 @@ patterns (`c7477804000000`, `83e0fe`, `750b`, `0f94c0`) with the file/VA offset,
 context and a reference to the unique 4 KiB page image. Pick the correct sites in a disassembler, then
 write a spec for `tools/gen_patch_data.py` (format in `tools/README-patchgen.md`).
 
-## VDA data
+## VDA data and cross-version compatibility
 
 `vda/generated/` contains the three headers as generated on the target build, or the committed headers
-when the generators can verify them against the live system (`--check` fallback) but cannot regenerate
-because the page cache is patched. `vda/generator-results.json` records both outcomes. If generation
-fails entirely, the kernel/user-space build is not 15.8.1-compatible: keep the dataset, add
-`--include-kc`, and re-derive the tables for that build.
+when the generators can verify them against the system (`--check` fallback). `vda/generator-results.json`
+records both outcomes. If generation fails on a new macOS major/minor build: keep the dataset, pass
+`--include-kc`, and provide the archive so the missing signatures or struct offsets can be added.
 
-`vda/kernel-info.json` is still collected on unknown builds: it contains the kernel collection UUID and
-the X5000/X6000 kext UUIDs, versions and segment hashes. The VDA path is currently gated to the exact
-15.8.1 build, so this is the identity evidence needed to widen that gate later.
+`vda/kernel-info.json` is collected on all builds: it contains the kernel collection UUID and
+the X5000/X6000 kext UUIDs, versions and segment hashes. NootedRed uses this identity evidence to
+validate and drive dynamic patching across macOS 13 (Ventura), macOS 14 (Sonoma), macOS 15 (Sequoia),
+and macOS 26 (Tahoe).
 
 ## Privacy and redistribution
 
