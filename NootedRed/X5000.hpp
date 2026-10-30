@@ -57,7 +57,14 @@ class X5000
     mach_vm_address_t              orgObtainAccelChannelGroup{0};
     mach_vm_address_t              orgHwlConvertChipFamily{0};
     mach_vm_address_t              orgPM4SubmitCommandBuffer{0};
+    mach_vm_address_t              orgAllocateLargeBlocks{0};
+    mach_vm_address_t              orgRTHardwareDidStart{0};
+    UInt32                         gfxOffSupportedOffset{0x206b8};
     void                           (*notifyGfxAccess)(void*){nullptr};
+    UInt64                         (*orgTotalFreeMemory)(void*){nullptr};
+    bool                           (*orgAllocate)(void*, void*, UInt64, UInt64, UInt32, bool, UInt32, UInt32){nullptr};
+    bool                           (*orgAllocateNonContiguous)(void*, void*, UInt64, UInt64, UInt32, bool, bool, UInt64,
+                                                               UInt32, UInt32){nullptr};
 
 public:
     static X5000& singleton();
@@ -77,6 +84,9 @@ private:
     static void   initializeFamilyType(void* self);
     static void*  allocateAMDHWDisplay(void* self);
     static UInt64 wrapAdjustVRAMAddress(void* self, UInt64 addr);
+    static bool   wrapAllocateLargeBlocks(void* self, void* elem, UInt64 size, UInt64 align, UInt64 minBlockSize,
+                                          UInt32 orig, UInt32 opType, bool onlyNonVisible);
+    static void   wrapRTHardwareDidStart(void* self);
     static UInt32 returnZero();
     static void*  wrapObtainAccelChannelGroup(void* self, UInt32 priority);
     static void*  wrapObtainAccelChannelGroup1304(void* self, UInt32 priority, void* task);

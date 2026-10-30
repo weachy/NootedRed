@@ -79,6 +79,160 @@ static const UInt8 kCreateAccelChannelsPatched[]  = {0x8D, 0x44, 0x09, 0x01};
 static const UInt8 kCreateAccelChannelsOriginal10_14[] = {0x8D, 0x04, 0x09, 0x8D, 0x4C, 0x09, 0x02};
 static const UInt8 kCreateAccelChannelsPatched10_14[]  = {0x8D, 0x04, 0x09, 0x8D, 0x4C, 0x09, 0x01};
 
+namespace
+{
+    // Fixes an unsigned 32-bit underflow in IOAccelMemoryAllocator2::allocPages
+    // when non-contiguous allocation (`isContiguousOnly == false`) encounters a
+    // small free hole whose aligned start `(holeStart + align - 1) & ~(align - 1)`
+    // exceeds `holeEnd`.
+    void patchIOAccelAllocPages(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide,
+                                const size_t size)
+    {
+        const auto allocNonContig =
+            patcher.solveSymbol(id,
+                                "__ZN26AMDRadeonX5000_AMDHWMemory21allocateNonContiguousEP16AMDMemoryElementyyyybby15_"
+                                "eOP_ORIGINATOR9_eOP_TYPE",
+                                slide, size);
+        if (allocNonContig == 0) {
+            patcher.clearError();
+            return;
+        }
+
+        const auto* const fnBytes    = reinterpret_cast<const UInt8*>(allocNonContig);
+        mach_vm_address_t allocPages = 0;
+        for (size_t i = 0; i < 0x110; ++i) {
+            // Match `callq allocPages (e8 rel32); addq $0x10, %rsp (48 83 c4 10); testb %al, %al (84 c0)`.
+            // Across macOS 13-26, allocPages is the only 8-argument call in allocateNonContiguous(yyyy)
+            // that pops 16 bytes of stack arguments and tests %al.
+            if (fnBytes[i] == 0xE8 && fnBytes[i + 5] == 0x48 && fnBytes[i + 6] == 0x83 && fnBytes[i + 7] == 0xC4 &&
+                fnBytes[i + 8] == 0x10 && fnBytes[i + 9] == 0x84 && fnBytes[i + 10] == 0xC0) {
+                SInt32 rel = 0;
+                memcpy(&rel, fnBytes + i + 1, sizeof(rel));
+                allocPages = allocNonContig + i + 5 + static_cast<mach_vm_address_t>(static_cast<SInt64>(rel));
+                break;
+            }
+        }
+        if (allocPages == 0) { return; }
+
+        auto* const targetBytes = reinterpret_cast<UInt8*>(allocPages);
+        if (targetBytes[0] != 0x55 || targetBytes[1] != 0x48 || targetBytes[2] != 0x89 || targetBytes[3] != 0xE5) {
+            return;
+        }
+
+        for (size_t off = 0x40; off < 0x160; ++off) {
+            // Match across macOS 13-26:
+            //   +0: 41 29 C9              subl %ecx, %r9d
+            //   +3: 44 23 4D <disp8>      andl <disp8>(%rbp), %r9d
+            //   +7: 0F 84/8E <rel32>      je / jle <skip_hole>
+            //  +13: 4D 8D 34 09           leaq (%r9,%rcx), %r14
+            if (targetBytes[off] == 0x41 && targetBytes[off + 1] == 0x29 && targetBytes[off + 2] == 0xC9 &&
+                targetBytes[off + 3] == 0x44 && targetBytes[off + 4] == 0x23 && targetBytes[off + 5] == 0x4D &&
+                targetBytes[off + 7] == 0x0F && (targetBytes[off + 8] == 0x84 || targetBytes[off + 8] == 0x8E) &&
+                targetBytes[off + 13] == 0x4D && targetBytes[off + 14] == 0x8D && targetBytes[off + 15] == 0x34 &&
+                targetBytes[off + 16] == 0x09) {
+                if (targetBytes[off + 8] == 0x84 &&
+                    MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
+                    targetBytes[off + 8] = 0x8E;
+                    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+                    SYSLOG("X5000", "Patched IOAccelMemoryAllocator2::allocPages non-contiguous hole underflow");
+                }
+                return;
+            }
+        }
+    }
+
+    // Fixes AMDAccelVideoContext::processCommand jumping to the loop-completion
+    // success block (`this->0x644 = 0`) instead of the error epilogue (`this->0x644 = -6`)
+    // when `fetchResource()` fails to prepare a video buffer.
+    void patchVideoProcessCommand(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide,
+                                  const size_t size, const char* const procCmdSym, const char* const fetchResSym)
+    {
+        const auto procCmd  = patcher.solveSymbol(id, procCmdSym, slide, size);
+        const auto fetchRes = patcher.solveSymbol(id, fetchResSym, slide, size);
+        if (procCmd == 0 || fetchRes == 0) {
+            patcher.clearError();
+            return;
+        }
+
+        auto* const fnBytes = reinterpret_cast<UInt8*>(procCmd);
+        for (size_t i = 0; i < 0x280; ++i) {
+            if (fnBytes[i] != 0xE8) { continue; }
+            SInt32 callRel = 0;
+            memcpy(&callRel, fnBytes + i + 1, sizeof(callRel));
+            if (procCmd + i + 5 + static_cast<mach_vm_address_t>(static_cast<SInt64>(callRel)) != fetchRes) {
+                continue;
+            }
+
+            for (size_t j = i + 5; j < i + 20; ++j) {
+                if (fnBytes[j] == 0x0F && fnBytes[j + 1] == 0x84) {
+                    SInt32 jeRel = 0;
+                    memcpy(&jeRel, fnBytes + j + 2, sizeof(jeRel));
+                    const ptrdiff_t jeTargetOff = static_cast<ptrdiff_t>(j) + 6 + jeRel;
+                    if (jeTargetOff <= 0 || jeTargetOff >= 0x580) { return; }
+
+                    for (size_t m = static_cast<size_t>(jeTargetOff); m < static_cast<size_t>(jeTargetOff) + 0x30;
+                         ++m) {
+                        if (fnBytes[m] == 0x48 && fnBytes[m + 1] == 0x81 && fnBytes[m + 2] == 0xC4) {
+                            const auto newRel = static_cast<SInt32>(m - (j + 6));
+                            if (newRel != jeRel &&
+                                MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
+                                memcpy(fnBytes + j + 2, &newRel, sizeof(newRel));
+                                MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+                                SYSLOG("X5000",
+                                       "Patched AMDAccelVideoContext::processCommand fetchResource failure exit");
+                            }
+                            return;
+                        }
+                    }
+                    return;
+                }
+            }
+            return;
+        }
+    }
+
+    // Fixes AMDSWScheduler::advance dereferencing a null peer channel pointer
+    // on single-GPU APUs (which have no crossfire peer GPU: 0x68(%r12) == NULL),
+    // causing a kernel page fault at CR2: 0x48.
+    void patchSWSchedulerAdvance(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide,
+                                 const size_t size)
+    {
+        const auto advanceSym =
+            patcher.solveSymbol(id,
+                                "__ZN29AMDRadeonX5000_AMDSWScheduler7advanceERNS_12HwChannelCtxE",
+                                slide, size);
+        if (advanceSym == 0) {
+            patcher.clearError();
+            return;
+        }
+
+        auto* const fnBytes = reinterpret_cast<UInt8*>(advanceSym);
+        // Across macOS 15 - 26:
+        // Match:
+        //   49 8b 7c 24 68       movq 0x68(%r12), %rdi
+        //   48 83 7f 48 00       cmpq $0x0, 0x48(%rdi)   <-- crashes when %rdi (peer channel) is null on APU
+        // We replace "cmpq $0x0, 0x48(%rdi)" (48 83 7f 48 00) with
+        // "testq %rdi, %rdi; nop; nop"       (48 85 ff 90 90) so null %rdi safely takes the jump.
+        for (size_t i = 0x200; i < 0x380; ++i) {
+            if (fnBytes[i] == 0x49 && fnBytes[i + 1] == 0x8B && fnBytes[i + 2] == 0x7C &&
+                fnBytes[i + 3] == 0x24 && fnBytes[i + 4] == 0x68 &&
+                fnBytes[i + 5] == 0x48 && fnBytes[i + 6] == 0x83 && fnBytes[i + 7] == 0x7F &&
+                fnBytes[i + 8] == 0x48 && fnBytes[i + 9] == 0x00) {
+                if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
+                    fnBytes[i + 5] = 0x48;
+                    fnBytes[i + 6] = 0x85;
+                    fnBytes[i + 7] = 0xFF;
+                    fnBytes[i + 8] = 0x90;
+                    fnBytes[i + 9] = 0x90;
+                    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+                    SYSLOG("X5000", "Patched AMDSWScheduler::advance null peer channel dereference");
+                }
+                return;
+            }
+        }
+    }
+}    // namespace
+
 static X5000 moduleInstance;
 
 X5000& X5000::singleton() { return moduleInstance; }
@@ -152,7 +306,7 @@ X5000::X5000()
             this->hasGetAllClockLimitsField  = 0xBE;
             this->dccDisplayableSupportField = 0xC0;
             this->hwChannelHWInterfaceField  = 0x20;
-            if (currentKernelVersion() >= MACOS_14) { this->hwChannelSubmitCommandBuffer = 0x188; }
+            if (currentKernelVersion() >= MACOS_14_4) { this->hwChannelSubmitCommandBuffer = 0x188; }
             else {
                 this->hwChannelSubmitCommandBuffer = 0x190;
             }
@@ -212,8 +366,101 @@ void X5000::processKext(KernelPatcher& patcher, const size_t id, const mach_vm_a
     PANIC_COND(!PenguinWizardry::PatternRouteRequest::routeAll(patcher, id, requests, slide, size), "X5000",
                "Failed to route symbols");
 
-    // Disabled for the Quick Look / Metal compute hang bisect.
-    // Re-enable with a version-correct vtable offset (0x198 on 15.8.1) afterwards.
+    this->orgTotalFreeMemory = reinterpret_cast<decltype(this->orgTotalFreeMemory)>(
+        patcher.solveSymbol(id, "__ZN26AMDRadeonX5000_AMDHWMemory15totalFreeMemoryEv", slide, size));
+    this->orgAllocate = reinterpret_cast<decltype(this->orgAllocate)>(patcher.solveSymbol(
+        id,
+        "__ZN26AMDRadeonX5000_AMDHWMemory8allocateEP16AMDMemoryElementyy28_eAMD_MEMORY_ALLOCATION_TYPEb15_eOP_ORIGINATOR9_eOP_TYPE",
+        slide, size));
+    this->orgAllocateNonContiguous = reinterpret_cast<decltype(this->orgAllocateNonContiguous)>(patcher.solveSymbol(
+        id,
+        "__ZN26AMDRadeonX5000_AMDHWMemory21allocateNonContiguousEP16AMDMemoryElementyyyybby15_eOP_ORIGINATOR9_eOP_TYPE",
+        slide, size));
+
+    if (this->orgTotalFreeMemory != nullptr && this->orgAllocate != nullptr && this->orgAllocateNonContiguous != nullptr) {
+        PenguinWizardry::PatternRouteRequest allocLargeReq{
+            "__ZN26AMDRadeonX5000_AMDHWMemory19allocateLargeBlocksEP16AMDMemoryElementyyy15_eOP_ORIGINATOR9_eOP_TYPEb",
+            wrapAllocateLargeBlocks, this->orgAllocateLargeBlocks};
+        if (!allocLargeReq.route(patcher, id, slide, size)) {
+            patcher.clearError();
+            SYSLOG("X5000", "Failed to route AMDHWMemory::allocateLargeBlocks");
+        }
+    }
+    patchIOAccelAllocPages(patcher, id, slide, size);
+    patchVideoProcessCommand(
+        patcher, id, slide, size,
+        "__ZN35AMDRadeonX5000_AMDAccelVideoContext14processCommandEPj16VideoCommandTypeS0_j",
+        "__ZN35AMDRadeonX5000_AMDAccelVideoContext13fetchResourceEP22_AMDVideoResourceParamP21_AMDVideoResourceInfo");
+    patchSWSchedulerAdvance(patcher, id, slide, size);
+
+    const auto isGfxOffSupported =
+        patcher.solveSymbol(id, "__ZN28AMDRadeonX5000_AMDRTHardware17isGfxOffSupportedEv", slide, size);
+    if (isGfxOffSupported != 0) {
+        const auto* code = reinterpret_cast<const UInt8*>(isGfxOffSupported);
+        if (code[0] == 0x55 && code[1] == 0x48 && code[2] == 0x89 && code[3] == 0xe5 && code[4] == 0x8a &&
+            code[5] == 0x87) {
+            this->gfxOffSupportedOffset = *reinterpret_cast<const UInt32*>(code + 6);
+            DBGLOG("X5000", "Detected gfxOffSupportedOffset = 0x%x", this->gfxOffSupportedOffset);
+        } else {
+            this->gfxOffSupportedOffset = 0x206b8;
+        }
+    } else {
+        patcher.clearError();
+        this->gfxOffSupportedOffset = 0x206b8;
+    }
+
+    PenguinWizardry::PatternRouteRequest rtStartReq{
+        "__ZN28AMDRadeonX5000_AMDRTHardware16hardwareDidStartEv",
+        wrapRTHardwareDidStart, this->orgRTHardwareDidStart};
+    if (!rtStartReq.route(patcher, id, slide, size)) {
+        patcher.clearError();
+        SYSLOG("X5000", "Failed to route AMDRTHardware::hardwareDidStart");
+    }
+
+    PenguinWizardry::PatternRouteRequest gfxOffRoutes[] = {
+        {"__ZN28AMDRadeonX5000_AMDRTHardware17isGfxOffSupportedEv", returnZero},
+        {"__ZN28AMDRadeonX5000_AMDRTHardware12enableGfxOffEv", returnZero},
+        {"__ZN30AMDRadeonX5000_AMDGFX9Hardware19gfxOffTimerCallbackEv", returnZero},
+    };
+    for (auto& req : gfxOffRoutes) {
+        if (!req.route(patcher, id, slide, size)) {
+            patcher.clearError();
+            DBGLOG("X5000", "Optional GFXOFF route omitted: %s", req.symbol);
+        }
+    }
+    NRed::singleton().setProp32("NRedGFXOFFPatched", 1);
+
+    if (currentKernelVersion() >= MACOS_11) {
+        PenguinWizardry::PatternSolveRequest solveRequest{"__ZN30AMDRadeonX5000_AMDGFX9Hardware15notifyGfxAccessEv",
+                                                          this->notifyGfxAccess};
+        PANIC_COND(!solveRequest.solve(patcher, id, slide, size), "X5000", "Failed to resolve notifyGfxAccess");
+
+        bool hooked = false;
+        if (pm4ComputeChannelVT != nullptr && this->orgPM4SubmitCommandBuffer != 0) {
+            auto* vt = reinterpret_cast<mach_vm_address_t*>(pm4ComputeChannelVT);
+            for (size_t idx = (0x170 / sizeof(mach_vm_address_t)); idx <= (0x1B0 / sizeof(mach_vm_address_t)); ++idx) {
+                if (vt[idx] == this->orgPM4SubmitCommandBuffer) {
+                    if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
+                        vt[idx] = reinterpret_cast<mach_vm_address_t>(computeSubmitCommandBuffer);
+                        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+                        hooked = true;
+                        DBGLOG("X5000", "Successfully hooked computeSubmitCommandBuffer at dynamic vtable offset 0x%lx",
+                               idx * sizeof(mach_vm_address_t));
+                    }
+                    break;
+                }
+            }
+        }
+        if (!hooked) {
+            if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
+                this->hwChannelSubmitCommandBuffer(pm4ComputeChannelVT) =
+                    reinterpret_cast<mach_vm_address_t>(computeSubmitCommandBuffer);
+                MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+                hooked = true;
+                SYSLOG("X5000", "Fallback hooked computeSubmitCommandBuffer via field offset");
+            }
+        }
+    }
 
     if (currentKernelVersion() >= MACOS_13_4) {
         PenguinWizardry::PatternRouteRequest request{
@@ -398,6 +645,110 @@ UInt64 X5000::wrapAdjustVRAMAddress(void* const self, const UInt64 addr)
     auto ret = FunctionCast(wrapAdjustVRAMAddress, singleton().orgAdjustVRAMAddress)(self, addr);
     if (ret != addr) { return ret + NRed::singleton().getFbOffset(); }
     return ret;
+}
+
+bool X5000::wrapAllocateLargeBlocks(void* const self, void* const elem, const UInt64 size, const UInt64 align,
+                                    const UInt64 minBlockSize, const UInt32 orig, const UInt32 opType,
+                                    const bool onlyNonVisible)
+{
+    auto& inst = singleton();
+    if (self == nullptr || elem == nullptr || size == 0) { return false; }
+
+    const UInt64 pageAlignedSize = (size + PAGE_MASK) & ~static_cast<UInt64>(PAGE_MASK);
+    if (inst.orgTotalFreeMemory != nullptr && inst.orgTotalFreeMemory(self) < pageAlignedSize) {
+        // Fast-fail without walking the allocator free list or spamming IOLog while
+        // IOAcceleratorFamily2 is evicting small LRU buffers one by one to make room.
+        return false;
+    }
+
+    const UInt64 blockGranularity = minBlockSize >= PAGE_SIZE ? minBlockSize : 0x10000ULL;
+    const UInt64 roundedSize =
+        size > blockGranularity ? ((size + blockGranularity - 1) & ~(blockGranularity - 1)) : pageAlignedSize;
+    const UInt64 safeAlign = align >= blockGranularity ? align : blockGranularity;
+
+    // 1. Contiguous attempt in Non-Visible range [256MB, totalVRAMSize] (allocType = 1)
+    if (inst.orgAllocate(self, elem, size, align, 1, false, orig, opType)) { return true; }
+
+    // 2. Contiguous attempt in Visible range [reservedNdrvEnd, 256MB] (allocType = 0) if allowed
+    if (!onlyNonVisible && inst.orgAllocate(self, elem, size, align, 0, false, orig, opType)) { return true; }
+
+    auto tryNonContiguousRange = [&](const UInt32 allocType) -> bool {
+        if (roundedSize > blockGranularity &&
+            (inst.orgTotalFreeMemory == nullptr || inst.orgTotalFreeMemory(self) >= roundedSize)) {
+            UInt64 chunkSize = 1;
+            UInt64 tmp       = roundedSize;
+            while ((tmp & 1) == 0) {
+                tmp >>= 1;
+                chunkSize <<= 1;
+            }
+            if (tmp == 1) { chunkSize >>= 1; }
+
+            if (chunkSize >= blockGranularity &&
+                inst.orgAllocateNonContiguous(self, elem, roundedSize, align, allocType, false, false, chunkSize, orig,
+                                              opType)) {
+                return true;
+            }
+            if (chunkSize > blockGranularity) {
+                const UInt64 halfChunk = chunkSize >> 1;
+                if (halfChunk >= blockGranularity &&
+                    inst.orgAllocateNonContiguous(self, elem, roundedSize, align, allocType, false, false, halfChunk,
+                                                  orig, opType)) {
+                    return true;
+                }
+                if (halfChunk > blockGranularity &&
+                    inst.orgAllocateNonContiguous(self, elem, roundedSize, align, allocType, false, false,
+                                                  blockGranularity, orig, opType)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // 3. Non-contiguous attempts in Non-Visible range [256MB, totalVRAMSize] (allocType = 1)
+    if (tryNonContiguousRange(1)) { return true; }
+
+    // 4. Fallback to Full UMA VRAM range [reservedNdrvEnd, totalVRAMSize] (allocType = 2):
+    //    On AMD APUs, BAR0-visible and non-visible UMA are backed by identical system RAM,
+    //    and totalFreeMemory() includes free space in [reservedNdrvEnd, 256MB].
+    if (inst.orgAllocate(self, elem, size, align, 2, false, orig, opType)) { return true; }
+    if (tryNonContiguousRange(2)) { return true; }
+
+    // 5. Fine-grained non-contiguous fallback (16KB -> 4KB segment lengths with 64KB+ start alignment)
+    //    when VRAM is heavily fragmented:
+    if (pageAlignedSize > 0x4000ULL) {
+        const UInt64 align16K = (pageAlignedSize + 0x3FFFULL) & ~0x3FFFULL;
+        if (inst.orgTotalFreeMemory == nullptr || inst.orgTotalFreeMemory(self) >= align16K) {
+            if (inst.orgAllocateNonContiguous(self, elem, align16K, safeAlign, 1, false, false, 0x4000ULL, orig,
+                                              opType) ||
+                inst.orgAllocateNonContiguous(self, elem, align16K, safeAlign, 2, false, false, 0x4000ULL, orig,
+                                              opType)) {
+                return true;
+            }
+        }
+    }
+    if (pageAlignedSize > PAGE_SIZE) {
+        if (inst.orgAllocateNonContiguous(self, elem, pageAlignedSize, safeAlign, 1, false, false, PAGE_SIZE, orig,
+                                          opType) ||
+            inst.orgAllocateNonContiguous(self, elem, pageAlignedSize, safeAlign, 2, false, false, PAGE_SIZE, orig,
+                                          opType) ||
+            inst.orgAllocateNonContiguous(self, elem, pageAlignedSize, PAGE_SIZE, 2, false, false, PAGE_SIZE, orig,
+                                          opType)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void X5000::wrapRTHardwareDidStart(void* const self)
+{
+    FunctionCast(wrapRTHardwareDidStart, singleton().orgRTHardwareDidStart)(self);
+    if (self != nullptr && singleton().gfxOffSupportedOffset != 0) {
+        *reinterpret_cast<UInt8*>(reinterpret_cast<uintptr_t>(self) + singleton().gfxOffSupportedOffset) = 0;
+        NRed::singleton().setProp32("NRedGFXOFFDisabled", 1);
+        DBGLOG("X5000", "Disabled GFXOFF in RTHardware (offset 0x%x)", singleton().gfxOffSupportedOffset);
+    }
 }
 
 UInt32 X5000::returnZero() { return 0; }
