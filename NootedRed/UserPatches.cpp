@@ -200,15 +200,24 @@ namespace
         0x95, 0xC1, 0x48, 0x8B, 0x9D, 0x78, 0xFE, 0xFF, 0xFF, 0x4A, 0x0F, 0xBA, 0x64, 0x33, 0x08, 0x22,
         0x0F, 0x93, 0xC0, 0x08, 0xC8, 0x4C, 0x8B, 0xB5, 0x70, 0xFE, 0xFF, 0xFF, 0x0F, 0xB6, 0xC0, 0x41,
     };
+    // Mask stack displacements (bytes 5-8, 23-26) to wildcards for cross-minor Sonoma robustness
+    static const UInt8 kResolverMask32_GateSonoma[] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+    };
+    static const UInt8 kResolverMask32_AllowSonoma[] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
 
     static const UserPatches::SignaturePatch kResolverSignatures_Sonoma[] = {
-        {kResolverHwCtx_Sonoma, kResolverMask32, sizeof(kResolverHwCtx_Sonoma), 16, kGLDriverHwInfoReplace,
-         sizeof(kGLDriverHwInfoReplace), 0, 1, 0xE000},
+        {kResolverHwCtx_Sonoma, kResolverMask32_RipMasked, sizeof(kResolverHwCtx_Sonoma), 16, kGLDriverHwInfoReplace,
+         sizeof(kGLDriverHwInfoReplace), 0, 1, ~static_cast<UInt64>(0)},
         {kResolverDualCtx_Sonoma, kResolverMask32, sizeof(kResolverDualCtx_Sonoma), 16, kGLDriverDualQuadReplace,
-         sizeof(kGLDriverDualQuadReplace), 0, 1, 0x8000},
-        {kResolverGateCtx_Sonoma, kResolverMask32, sizeof(kResolverGateCtx_Sonoma), 16, kMTLGateReplace,
+         sizeof(kGLDriverDualQuadReplace), 0, 1, ~static_cast<UInt64>(0)},
+        {kResolverGateCtx_Sonoma, kResolverMask32_GateSonoma, sizeof(kResolverGateCtx_Sonoma), 16, kMTLGateReplace,
          sizeof(kMTLGateReplace), 0, 1, ~static_cast<UInt64>(0)},
-        {kResolverAllowCtx_Sonoma, kResolverMask32, sizeof(kResolverAllowCtx_Sonoma), 16, kMTLAllowReplace_Sonoma,
+        {kResolverAllowCtx_Sonoma, kResolverMask32_AllowSonoma, sizeof(kResolverAllowCtx_Sonoma), 16, kMTLAllowReplace_Sonoma,
          sizeof(kMTLAllowReplace_Sonoma), 0, 1, ~static_cast<UInt64>(0)},
     };
     constexpr size_t kResolverSignatureCount_Sonoma = arrsize(kResolverSignatures_Sonoma);
@@ -230,16 +239,24 @@ namespace
         0xFF, 0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x49, 0x85, 0x54, 0x03, 0x08,
         0x0F, 0x94, 0xC0, 0x08, 0xC8, 0x4C, 0x8B, 0xB5, 0x88, 0xFE, 0xFF, 0xFF, 0x48, 0x8B, 0xB5, 0x50,
     };
+    static const UInt8 kResolverMask32_GateSequoia[] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+    };
+    static const UInt8 kResolverMask32_SetzSequoia[] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x00,
+    };
 
     // Resolver fallback for the 15.8.1 GL/Metal sites.
     static const UserPatches::SignaturePatch kResolverSignatures[] = {
-        {kResolverHwCtx, kResolverMask32, sizeof(kResolverHwCtx), 16, kGLDriverHwInfoReplace,
-         sizeof(kGLDriverHwInfoReplace), 0, 1, 0xE000},
+        {kResolverHwCtx, kResolverMask32_RipMasked, sizeof(kResolverHwCtx), 16, kGLDriverHwInfoReplace,
+         sizeof(kGLDriverHwInfoReplace), 0, 1, ~static_cast<UInt64>(0)},
         {kResolverDualCtx, kResolverMask32, sizeof(kResolverDualCtx), 16, kGLDriverDualQuadReplace,
-         sizeof(kGLDriverDualQuadReplace), 0, 1, 0x8000},
-        {kResolverGateCtx, kResolverMask32, sizeof(kResolverGateCtx), 16, kMTLGateReplace,
+         sizeof(kGLDriverDualQuadReplace), 0, 1, ~static_cast<UInt64>(0)},
+        {kResolverGateCtx, kResolverMask32_GateSequoia, sizeof(kResolverGateCtx), 16, kMTLGateReplace,
          sizeof(kMTLGateReplace), 0, 1, ~static_cast<UInt64>(0)},
-        {kResolverSetzCtx, kResolverMask32, sizeof(kResolverSetzCtx), 16, kMTLAllowReplace_Sequoia,
+        {kResolverSetzCtx, kResolverMask32_SetzSequoia, sizeof(kResolverSetzCtx), 16, kMTLAllowReplace_Sequoia,
          sizeof(kMTLAllowReplace_Sequoia), 0, 1, ~static_cast<UInt64>(0)},
     };
     constexpr size_t kResolverSignatureCount = arrsize(kResolverSignatures);
@@ -270,9 +287,9 @@ namespace
 
     static const UserPatches::SignaturePatch kResolverSignatures_Tahoe[] = {
         {kResolverHwCtx_Tahoe, kResolverMask32_HwTahoe, sizeof(kResolverHwCtx_Tahoe), 16, kGLDriverHwInfoReplace,
-         sizeof(kGLDriverHwInfoReplace), 0, 1, 0xE000},
+         sizeof(kGLDriverHwInfoReplace), 0, 1, ~static_cast<UInt64>(0)},
         {kResolverDualCtx_Tahoe, kResolverMask32, sizeof(kResolverDualCtx_Tahoe), 16, kGLDriverDualQuadReplace,
-         sizeof(kGLDriverDualQuadReplace), 0, 1, 0x8000},
+         sizeof(kGLDriverDualQuadReplace), 0, 1, ~static_cast<UInt64>(0)},
         {kResolverGateCtx_Tahoe, kResolverMask32, sizeof(kResolverGateCtx_Tahoe), 16, kMTLGateReplace_Tahoe,
          sizeof(kMTLGateReplace_Tahoe), 0, 1, ~static_cast<UInt64>(0)},
         {kResolverAllowCtx_Tahoe, kResolverMask32, sizeof(kResolverAllowCtx_Tahoe), 16, kMTLAllowReplace_Tahoe,
@@ -300,9 +317,9 @@ namespace
 
     static const UserPatches::SignaturePatch kResolverSignatures_Ventura[] = {
         {kResolverHwCtx_Ventura, kResolverMask32_RipMasked, sizeof(kResolverHwCtx_Ventura), 16, kGLDriverHwInfoReplace,
-         sizeof(kGLDriverHwInfoReplace), 0, 1, 0xE000},
+         sizeof(kGLDriverHwInfoReplace), 0, 1, ~static_cast<UInt64>(0)},
         {kResolverDualCtx_Ventura, kResolverMask32, sizeof(kResolverDualCtx_Ventura), 16, kGLDriverDualQuadReplace,
-         sizeof(kGLDriverDualQuadReplace), 0, 1, 0x8000},
+         sizeof(kGLDriverDualQuadReplace), 0, 1, ~static_cast<UInt64>(0)},
         {kResolverGateCtx_Ventura, kResolverMask32, sizeof(kResolverGateCtx_Ventura), 16, kMTLGateReplace,
          sizeof(kMTLGateReplace), 0, 1, ~static_cast<UInt64>(0)},
         {kResolverAllowCtx_Ventura, kResolverMask32, sizeof(kResolverAllowCtx_Ventura), 16, kMTLAllowReplace_Sonoma,
@@ -455,8 +472,8 @@ void UserPatches::init()
             this->vdaSignatureCount = kVDAResolverSignatureCount_Ventura;
             this->gvaSignature      = &kGVAResolverSignature_Ventura;
         } else if (getKernelVersion() == KernelVersion::Sonoma) {
-            this->vdaSignatures     = kVDAResolverSignatures_Modern;
-            this->vdaSignatureCount = kVDAResolverSignatureCount_Modern;
+            this->vdaSignatures     = kVDAResolverSignatures_Sonoma;
+            this->vdaSignatureCount = kVDAResolverSignatureCount_Sonoma;
             this->gvaSignature      = &kGVAResolverSignature_Sonoma;
         } else if (getKernelVersion() >= KernelVersion::Tahoe) {
             this->vdaSignatures     = kVDAResolverSignatures_Modern;
@@ -928,20 +945,22 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
 
     // Process exclusion defense: WindowServer and loginwindow NEVER decode video via VDA
     // and must never have their shared cache pages scanned or modified by VDA resolver.
+    bool isWindowServerOrLogin = false;
+    char procName[64]{};
+    int pid = 0;
     if (isSharedCache) {
         proc_t proc = current_proc();
-        int pid = proc != nullptr ? proc_pid(proc) : 0;
-        char procName[64]{};
+        pid = proc != nullptr ? proc_pid(proc) : 0;
         if (pid > 0) { proc_name(pid, procName, sizeof(procName)); }
         if (strcmp(procName, "WindowServer") == 0 || strcmp(procName, "loginwindow") == 0) {
-            return;
+            isWindowServerOrLogin = true;
         }
     }
 
     const auto* const bytes = static_cast<const UInt8*>(data);
 
     // VDA Dynamic Resolver path (AMDRadeonVADriver2: loose bundle or dyld_shared_cache)
-    if ((isVADriver || isSharedCache) && this->vdaEnabled && this->vdaSignatures != nullptr && this->vdaSignatureCount > 0) {
+    if (!isWindowServerOrLogin && (isVADriver || isSharedCache) && this->vdaEnabled && this->vdaSignatures != nullptr && this->vdaSignatureCount > 0) {
         if (VCNBridge::singleton().loadReady() && !isFairPlayClient(current_task())) {
             bool vdaAllApplied = true;
             for (size_t i = 0; i < this->vdaSignatureCount && i < kMaxVDASignatures; ++i) {
@@ -997,7 +1016,7 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     }
 
     // AppleGVA Dynamic Resolver path (dyld_shared_cache or standalone AppleGVA bundle)
-    if ((isAppleGVA || isSharedCache) && this->vdaEnabled && this->gvaSignature != nullptr &&
+    if (!isWindowServerOrLogin && (isAppleGVA || isSharedCache) && this->vdaEnabled && this->gvaSignature != nullptr &&
         this->gvaSignatureApplied < this->gvaSignature->count) {
         if (!isFairPlayClient(current_task())) {
             size_t matchOffset = 0;
@@ -1034,16 +1053,9 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
 
     // Gate 2: GL patches ONLY apply to AMDRadeonX5000GLDriver; Metal patches ONLY apply to dyld shared cache.
     if (isGLDriver) {
-        for (size_t signatureIndex = 0; signatureIndex < this->signatureCount; signatureIndex++) {
+        for (size_t signatureIndex = 0; signatureIndex < 2 && signatureIndex < this->signatureCount; signatureIndex++) {
             const auto& signature = this->signatures[signatureIndex];
-            // Skip Metal signatures (which have wildcard pageOffset ~0ULL)
-            if (signature.pageOffset == ~static_cast<UInt64>(0)) {
-                continue;
-            }
             if (signatureIndex < kMaxSignatures && this->signatureApplied[signatureIndex] >= signature.count) {
-                continue;
-            }
-            if (signature.pageOffset != pageOffset) {
                 continue;
             }
 
@@ -1063,6 +1075,9 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
                 if (signatureIndex < kMaxSignatures) {
                     this->signatureApplied[signatureIndex]++;
                 }
+                static volatile UInt32 glResolverCounter{0};
+                const auto glCount = static_cast<UInt32>(OSIncrementAtomic(&glResolverCounter) + 1);
+                NRed::singleton().setProp32("NRedGLResolverApplied", glCount);
             }
         }
     } else if (isSharedCache) {
@@ -1101,6 +1116,14 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
                                    gateMatch, allowMatch);
                             if (2 < kMaxSignatures) { this->signatureApplied[2]++; }
                             if (3 < kMaxSignatures) { this->signatureApplied[3]++; }
+
+                            static volatile UInt32 blendResolverCounter{0};
+                            const auto count = static_cast<UInt32>(OSIncrementAtomic(&blendResolverCounter) + 1);
+                            NRed::singleton().setProp32("NRedLegacyBlendApplied", count);
+                            if (strcmp(procName, "WindowServer") == 0) {
+                                NRed::singleton().setProp32("NRedLegacyBlendWindowServerPID", static_cast<UInt32>(pid));
+                                NRed::singleton().setProp32("NRedLegacyBlendWindowServerApplied", 1);
+                            }
                         }
                     }
                 }
