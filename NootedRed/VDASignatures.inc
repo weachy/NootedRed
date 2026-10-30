@@ -134,7 +134,8 @@ namespace
     static const UInt8 kVDAFind_StatusStride_Modern[]    = {0x48, 0x69, 0xC0, 0xA4, 0x00, 0x00, 0x00};
     static const UInt8 kVDAReplace_StatusStride_Modern[] = {0x48, 0x69, 0xC0, 0x30, 0x00, 0x00, 0x00};
 
-    // 9. Vcn2EncoderSourcePitch: Vcn2Encoder::setEncodeParams -> true source texture pitch read
+    // 9a. Vcn2EncoderSourcePitch (macOS 13 Ventura, macOS 14 Sonoma):
+    // Vcn2Encoder::setEncodeParams -> read true texture pitch instead of reconstructed width
     static const UInt8 kVDACtx_SourcePitch[] = {
         0x8B, 0x8A, 0x84, 0x00, 0x00, 0x00, 0x8B, 0x97, 0x24, 0x04, 0x00, 0x00, 0x0F, 0xAF, 0xD1, 0x0F,
         0xB6, 0xFA, 0xB8, 0x00, 0x01, 0x00, 0x00, 0x29, 0xF8, 0x85, 0xFF, 0x0F, 0x44, 0xC7, 0x01, 0xD0
@@ -150,6 +151,25 @@ namespace
     static const UInt8 kVDAReplace_SourcePitch[] = {
         0x8B, 0x82, 0x80, 0x00, 0x00, 0x00, 0x8B, 0x8A, 0x84, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90,
         0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+    };
+
+    // 9b. Vcn2EncoderSourcePitch (macOS 15 Sequoia, macOS 26 Tahoe):
+    // Vcn2Encoder::setEncodeParams -> read true texture pitch instead of 256-byte aligned width (25 bytes)
+    static const UInt8 kVDACtx_SourcePitch_Modern[] = {
+        0x8B, 0x8A, 0x84, 0x00, 0x00, 0x00, 0x8B, 0x87, 0x24, 0x04, 0x00, 0x00, 0x0F, 0xAF, 0xC1, 0x05,
+        0xFF, 0x00, 0x00, 0x00, 0x25, 0x00, 0xFF, 0xFF, 0xFF
+    };
+    static const UInt8 kVDAMask_SourcePitch_Modern[] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+    };
+    static const UInt8 kVDAFind_SourcePitch_Modern[] = {
+        0x8B, 0x8A, 0x84, 0x00, 0x00, 0x00, 0x8B, 0x87, 0x24, 0x04, 0x00, 0x00, 0x0F, 0xAF, 0xC1, 0x05,
+        0xFF, 0x00, 0x00, 0x00, 0x25, 0x00, 0xFF, 0xFF, 0xFF
+    };
+    static const UInt8 kVDAReplace_SourcePitch_Modern[] = {
+        0x8B, 0x82, 0x80, 0x00, 0x00, 0x00, 0x8B, 0x8A, 0x84, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90,
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
     };
 
     // Resolver table for macOS 13 (Ventura)
@@ -184,8 +204,8 @@ namespace
     };
     constexpr size_t kVDAResolverSignatureCount_Ventura = arrsize(kVDAResolverSignatures_Ventura);
 
-    // Resolver table for modern macOS (14 Sonoma, 15 Sequoia, 26 Tahoe)
-    static const UserPatches::SignaturePatch kVDAResolverSignatures_Modern[] = {
+    // Resolver table for macOS 14 (Sonoma)
+    static const UserPatches::SignaturePatch kVDAResolverSignatures_Sonoma[] = {
         {kVDACtx_Identify, kVDAMask_Identify, sizeof(kVDACtx_Identify), 17,
          kVDAReplace_Identify, sizeof(kVDAReplace_Identify), 0, 1, ~0ULL,
          kVDAFind_Identify, sizeof(kVDAFind_Identify)},
@@ -196,6 +216,9 @@ namespace
          kVDAReplace_AddrLibCreate, sizeof(kVDAReplace_AddrLibCreate), 0, 1, ~0ULL,
          kVDAFind_AddrLibCreate, sizeof(kVDAFind_AddrLibCreate)},
         {kVDACtx_ConvertFamily_Modern, kVDAMask_ConvertFamily_Modern, sizeof(kVDACtx_ConvertFamily_Modern), 0,
+         kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 1, ~0ULL,
+         kVDAFind_ConvertFamily, sizeof(kVDAFind_ConvertFamily)},
+        {kVDACtx_ConvertFamily_Ventura, kVDAMask_ConvertFamily_Ventura, sizeof(kVDACtx_ConvertFamily_Ventura), 0,
          kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 1, ~0ULL,
          kVDAFind_ConvertFamily, sizeof(kVDAFind_ConvertFamily)},
         {kVDACtx_EngineAndBlt, kVDAMask_EngineAndBlt, sizeof(kVDACtx_EngineAndBlt), 0,
@@ -213,6 +236,41 @@ namespace
         {kVDACtx_SourcePitch, kVDAMask_SourcePitch, sizeof(kVDACtx_SourcePitch), 0,
          kVDAReplace_SourcePitch, sizeof(kVDAReplace_SourcePitch), 0, 1, ~0ULL,
          kVDAFind_SourcePitch, sizeof(kVDAFind_SourcePitch)},
+    };
+    constexpr size_t kVDAResolverSignatureCount_Sonoma = arrsize(kVDAResolverSignatures_Sonoma);
+
+    // Resolver table for modern macOS (15 Sequoia, 26 Tahoe)
+    static const UserPatches::SignaturePatch kVDAResolverSignatures_Modern[] = {
+        {kVDACtx_Identify, kVDAMask_Identify, sizeof(kVDACtx_Identify), 17,
+         kVDAReplace_Identify, sizeof(kVDAReplace_Identify), 0, 1, ~0ULL,
+         kVDAFind_Identify, sizeof(kVDAFind_Identify)},
+        {kVDACtx_AddrLibInit, kVDAMask_AddrLibInit, sizeof(kVDACtx_AddrLibInit), 9,
+         kVDAReplace_AddrLibInit, sizeof(kVDAReplace_AddrLibInit), 0, 1, ~0ULL,
+         kVDAFind_AddrLibInit, sizeof(kVDAFind_AddrLibInit)},
+        {kVDACtx_AddrLibCreate, kVDAMask_AddrLibCreate, sizeof(kVDACtx_AddrLibCreate), 2,
+         kVDAReplace_AddrLibCreate, sizeof(kVDAReplace_AddrLibCreate), 0, 1, ~0ULL,
+         kVDAFind_AddrLibCreate, sizeof(kVDAFind_AddrLibCreate)},
+        {kVDACtx_ConvertFamily_Modern, kVDAMask_ConvertFamily_Modern, sizeof(kVDACtx_ConvertFamily_Modern), 0,
+         kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 1, ~0ULL,
+         kVDAFind_ConvertFamily, sizeof(kVDAFind_ConvertFamily)},
+        {kVDACtx_ConvertFamily_Ventura, kVDAMask_ConvertFamily_Ventura, sizeof(kVDACtx_ConvertFamily_Ventura), 0,
+         kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 1, ~0ULL,
+         kVDAFind_ConvertFamily, sizeof(kVDAFind_ConvertFamily)},
+        {kVDACtx_EngineAndBlt, kVDAMask_EngineAndBlt, sizeof(kVDACtx_EngineAndBlt), 0,
+         kVDAReplace_EngineAndBlt, sizeof(kVDAReplace_EngineAndBlt), 0, 2, ~0ULL,
+         kVDAFind_EngineAndBlt, sizeof(kVDAFind_EngineAndBlt)},
+        {kVDACtx_VideoProcessors, kVDAMask_VideoProcessors, sizeof(kVDACtx_VideoProcessors), 7,
+         kVDAReplace_VideoProcessors, sizeof(kVDAReplace_VideoProcessors), 0, 3, ~0ULL,
+         kVDAFind_VideoProcessors, sizeof(kVDAFind_VideoProcessors)},
+        {kVDACtx_EncFeedbackStride, kVDAMask_EncFeedbackStride, sizeof(kVDACtx_EncFeedbackStride), 4,
+         kVDAReplace_EncFeedbackStride, sizeof(kVDAReplace_EncFeedbackStride), 0, 1, ~0ULL,
+         kVDAFind_EncFeedbackStride, sizeof(kVDAFind_EncFeedbackStride)},
+        {kVDACtx_StatusStride_Modern, kVDAMask_StatusStride_Modern, sizeof(kVDACtx_StatusStride_Modern), 3,
+         kVDAReplace_StatusStride_Modern, sizeof(kVDAReplace_StatusStride_Modern), 0, 2, ~0ULL,
+         kVDAFind_StatusStride_Modern, sizeof(kVDAFind_StatusStride_Modern)},
+        {kVDACtx_SourcePitch_Modern, kVDAMask_SourcePitch_Modern, sizeof(kVDACtx_SourcePitch_Modern), 0,
+         kVDAReplace_SourcePitch_Modern, sizeof(kVDAReplace_SourcePitch_Modern), 0, 1, ~0ULL,
+         kVDAFind_SourcePitch_Modern, sizeof(kVDAFind_SourcePitch_Modern)},
     };
     constexpr size_t kVDAResolverSignatureCount_Modern = arrsize(kVDAResolverSignatures_Modern);
 

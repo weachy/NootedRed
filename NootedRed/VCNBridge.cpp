@@ -55,44 +55,32 @@ namespace
     const char* const kBootArgNoVDA = "-NRedNoVDA";
 
 
-    // All generated data in this tree was derived from
-    // macOS 15.8.1 (24H32, Darwin 24.6.0), macOS 14.8.9 (23J631, Darwin 23.6.0)
-    // and macOS 26.7.1 (25G241, Darwin 25.6.0).
+    // VCN bridge supports macOS 13 through 26 (Darwin 22 - 25).
+    // Version-specific ABI stability is guarded dynamically by verifyKernelABI() vtable checks.
     bool isSupportedOS()
     {
-        if (currentKernelVersion().major() == 22 && currentKernelVersion().minor() == 6) {
-            return true;
-        }
-        if (currentKernelVersion().major() == 24
-            || (currentKernelVersion().major() == 23 && currentKernelVersion().minor() == 6)) {
-            return true;
-        }
-#ifdef NRED_HAS_VCN_TAHOE
-        if (currentKernelVersion().major() == 25 && currentKernelVersion().minor() == 6) { return true; }
-#endif
-        return false;
+        const auto major = currentKernelVersion().major();
+        return (major >= 22 && major <= 25);
     }
 
     // The build string is checked once the accelerator starts, not in NRed::init: the early kext-load
     // phase can run before `osversion` is populated, which would otherwise disable a valid bridge.
-    // Allow any patch/sub-build of the supported minor series (e.g. 14.7.x matches "23H", 14.8.x matches "23J", 15.8.x matches "24H").
+    // Major release prefix check ensures sanity while allowing all minor updates (e.g. 14.0-14.8, 15.0-15.8).
     bool isSupportedBuild()
     {
         if (!isSupportedOS()) { return false; }
-        // If the early-boot version string is not populated yet, the ABI guards are the remaining
-        // protection; once it is visible, require the matching minor release family.
-        if (currentKernelVersion().major() == 22) {
-            return strncmp(osversion, "22G", 3) == 0 || strncmp(osversion, "22H", 3) == 0;
-        }
         if (osversion[0] == '\0') { return true; }
-        if (currentKernelVersion().major() == 24) {
-            return strncmp(osversion, "24H", 3) == 0 || strncmp(osversion, "24G", 3) == 0;
-        } else if (currentKernelVersion().major() == 23) {
-            return strncmp(osversion, "23H", 3) == 0 || strncmp(osversion, "23J", 3) == 0 || strncmp(osversion, "23G", 3) == 0;
+        const auto major = currentKernelVersion().major();
+        if (major == 22) {
+            return strncmp(osversion, "22", 2) == 0;
+        } else if (major == 23) {
+            return strncmp(osversion, "23", 2) == 0;
+        } else if (major == 24) {
+            return strncmp(osversion, "24", 2) == 0;
         }
 #ifdef NRED_HAS_VCN_TAHOE
-        else if (currentKernelVersion().major() == 25) {
-            return strncmp(osversion, "25G", 3) == 0;
+        else if (major == 25) {
+            return strncmp(osversion, "25", 2) == 0;
         }
 #endif
         return false;
@@ -234,7 +222,7 @@ void VCNBridge::init()
     }
 
     if (!isSupportedOS()) {
-        SYSLOG("VCN", "VCN data supports Ventura 13.6.4 (22G513), Darwin 23.6/24.6/25.6; hardware decode ignored on this build");
+        SYSLOG("VCN", "VCN bridge only supports Darwin 22 to 25 (macOS 13 to 26); hardware decode ignored on this build");
         this->requested = false;
         return;
     }
