@@ -42,8 +42,8 @@ If you need to diagnose or disable specific features, use the following opt-out 
 
 ### Important Notes & Prerequisites
 
-1. **Fix for App Store Stalls & HEIC Preview Freezes (macOS 14+ Sonoma & Sequoia)**:
-   - On macOS 14 (Sonoma) and macOS 15 (Sequoia), Apple's `CoreMedia` framework attempts to use an unsupported Metal transfer session path by default, which may cause App Store UI stutter or freezes when opening/previewing HEIC photos in Finder.
+1. **Fix for App Store Stalls & HEIC Preview Freezes (macOS 14+ Sonoma, Sequoia & Tahoe)**:
+   - On macOS 14 (Sonoma), macOS 15 (Sequoia), and macOS 26 (Tahoe), Apple's `CoreMedia` framework attempts to use an unsupported Metal transfer session path by default, which may cause App Store UI stutter or freezes when opening/previewing HEIC photos in Finder.
    - To fix this issue, run the following two commands in **Terminal** and reboot:
      ```bash
      sudo defaults write /Library/Preferences/com.apple.coremedia allowMetalTransferSession -bool NO
@@ -66,3 +66,4 @@ If you need to diagnose or disable specific features, use the following opt-out 
 
 ### Package Hashes (SHA-256)
 - **`NootedRed-1.2.1-RELEASE.zip`**: `4d2231100484d4bd1e35fc8a4485dce48ab4ad0acbda3c73a6deab2a9589551f`
+
