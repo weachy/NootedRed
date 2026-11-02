@@ -1,7 +1,7 @@
 includes(path.join(os.getenv("AppleForgePath") or "../AppleForge", "xmake/rules/AppleForge.lua"))
 
 set_project("NootedRed")
-set_version("1.2.1")
+set_version("1.2.2")
 
 AppleForge_ApplyDefaults()
 set_allowedarchs("x86_64")

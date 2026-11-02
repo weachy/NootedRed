@@ -600,23 +600,35 @@ def build_plan(cache: DyldCache, image: MachOImage):
                         actual = cache.read(site, len(find)) if site + len(find) <= func_end else b""
             elif spec["key"] == "Vcn2EncoderSourcePitch":
                 window = cache.read(function, min(func_end - function, 512))
+                find_modern = bytes.fromhex("8B8A840000008B87240400000FAFC105FF0000002500FFFFFF")
+                replace_modern = bytes.fromhex("8B82800000008B8A8400000090909090909090909090909090")
                 if site + len(find) <= func_end and cache.read(site, len(find)) == find:
                     actual = find
+                elif (cand_off := window.find(find)) >= 0:
+                    site = function + cand_off
+                    actual = find
+                elif (cand_off_m := window.find(find_modern)) >= 0:
+                    site = function + cand_off_m
+                    find = find_modern
+                    replace = replace_modern
+                    actual = find
+                    print(f"[NootedRed VDA] Vcn2EncoderSourcePitch dynamically resolved (modern 25B) at +{cand_off_m:#x}", file=sys.stderr)
                 else:
-                    cand_off = window.find(find)
-                    if cand_off >= 0:
-                        site = function + cand_off
+                    # Anchored by `31 d2 f7 f1` (xor %edx, %edx; div %ecx) before `89 43 18 d1 e8 89 43 1c`
+                    xor_idx = window.find(b"\x31\xd2\xf7\xf1")
+                    if xor_idx >= 25 and window[xor_idx - 25 : xor_idx].startswith(b"\x8b\x8a\x84\x00\x00\x00"):
+                        site = function + (xor_idx - 25)
+                        find = window[xor_idx - 25 : xor_idx]
+                        replace = replace_modern
                         actual = find
+                        print(f"[NootedRed VDA] Vcn2EncoderSourcePitch dynamically resolved at +{xor_idx - 25:#x}: find={find.hex()}", file=sys.stderr)
+                    elif xor_idx >= 32 and window[xor_idx - 32 : xor_idx].startswith(b"\x8b\x8a\x84\x00\x00\x00"):
+                        site = function + (xor_idx - 32)
+                        find = window[xor_idx - 32 : xor_idx]
+                        actual = find
+                        print(f"[NootedRed VDA] Vcn2EncoderSourcePitch dynamically resolved at +{xor_idx - 32:#x}: find={find.hex()}", file=sys.stderr)
                     else:
-                        # Anchored by `31 d2 f7 f1` (xor %edx, %edx; div %ecx) before `89 43 18 d1 e8 89 43 1c`
-                        xor_idx = window.find(b"\x31\xd2\xf7\xf1")
-                        if xor_idx >= 32:
-                            site = function + (xor_idx - 32)
-                            find = window[xor_idx - 32 : xor_idx]
-                            actual = find
-                            print(f"[NootedRed VDA] Vcn2EncoderSourcePitch dynamically resolved at +{xor_idx - 32:#x}: find={find.hex()}", file=sys.stderr)
-                        else:
-                            actual = cache.read(site, len(find)) if site + len(find) <= func_end else b""
+                        actual = cache.read(site, len(find)) if site + len(find) <= func_end else b""
             elif spec["key"] == "ForceGfx9VideoProcessors":
                 window = cache.read(function, 128)
                 if site + len(find) <= func_end and cache.read(site, len(find)) == find:

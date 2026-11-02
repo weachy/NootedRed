@@ -56,23 +56,6 @@
 #include <libkern/c++/OSMetaClass.h>
 #include <mach/i386/vm_types.h>
 
-// Generated user-space VDA patch tables (Ventura 13.6.4, Sonoma, Sequoia and Tahoe). They are
-// produced by tools/gen_vda_*_data.py and are committed with this branch; the VCN bridge itself does
-// not depend on them, but VDA user-space patching is a no-op if they are absent.
-#include <VDAVADataVentura.hpp>
-#if __has_include(<VDAVADataSonoma.hpp>)
-#include <VDAVADataSonoma.hpp>
-#endif
-#if __has_include(<VDAVADataSequoia.hpp>)
-#include <VDAVADataSequoia.hpp>
-#endif
-#if __has_include(<VDAVADataTahoe.hpp>)
-#include <VDAVADataTahoe.hpp>
-#endif
-#if __has_include(<VDAVAData.hpp>)
-#include <VDAVAData.hpp>
-#endif
-
 static NRed moduleInstance;
 
 NRed& NRed::singleton() { return moduleInstance; }
@@ -88,32 +71,6 @@ void NRed::init()
     Backlight::singleton().init();
 
     this->forceVDA = checkKernelArgument("-NRedForceVDA");
-
-    if (getKernelVersion() == KernelVersion::Ventura) {
-        UserPatches::singleton().registerVDAFix(VDAVADataVentura::Patches,
-                                               arrsize(VDAVADataVentura::Patches));
-    } else if (getKernelVersion() == KernelVersion::Sonoma) {
-#if __has_include(<VDAVADataSonoma.hpp>)
-        if constexpr (arrsize(VDAVADataSonoma::Patches) > 0) {
-            UserPatches::singleton().registerVDAFix(VDAVADataSonoma::Patches,
-                                                    arrsize(VDAVADataSonoma::Patches));
-        }
-#endif
-    } else if (getKernelVersion() >= KernelVersion::Tahoe) {
-#if __has_include(<VDAVADataTahoe.hpp>)
-        if constexpr (arrsize(VDAVADataTahoe::Patches) > 0) {
-            UserPatches::singleton().registerVDAFix(VDAVADataTahoe::Patches,
-                                                    arrsize(VDAVADataTahoe::Patches));
-        }
-#endif
-    } else if (getKernelVersion() >= KernelVersion::Sequoia) {
-#if __has_include(<VDAVADataSequoia.hpp>)
-        if constexpr (arrsize(VDAVADataSequoia::Patches) > 0) {
-            UserPatches::singleton().registerVDAFix(VDAVADataSequoia::Patches,
-                                                    arrsize(VDAVADataSequoia::Patches));
-        }
-#endif
-    }
 
     UserPatches::singleton().init();
 

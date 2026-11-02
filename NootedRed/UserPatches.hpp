@@ -137,65 +137,24 @@ public:
     void init();
 
     // Replaces the built-in GL driver patch table.  `patchTable` has to point to static storage, as it
-    // is captured by pointer and used once the patcher becomes available.  May be called before or
-    // after `init`, as long as both happen from `NRed::init`.
-    void registerGLDriverFix(const PagePatch* patchTable, size_t count);
+    // Replaces the built-in GL driver patch table (deprecated, dynamic resolver in use).
+    void registerGLDriverFix(const PagePatch* = nullptr, size_t = 0) {}
 
-    // Replaces the built-in version/family-aware patch-set table.  `sets` has to point to static storage.
-    // May be called before or after `init`, as long as both happen from `NRed::init`.
-    void registerPatchSets(const PatchSet* sets, size_t count);
+    // Replaces the built-in version/family-aware patch-set table (deprecated, dynamic resolver in use).
+    void registerPatchSets(const PatchSet* = nullptr, size_t = 0) {}
 
-    // Adds the -NRedVDA user-space patch table (VA driver / AppleGVA).  Same storage/lifetime rules as
-    // `registerGLDriverFix`.  Applied in addition to the selected GL patch set.
-    void registerVDAFix(const PagePatch* patchTable, size_t count);
+    // Adds the -NRedVDA user-space patch table (deprecated, dynamic resolver in use).
+    void registerVDAFix(const PagePatch* = nullptr, size_t = 0) {}
 
-    // Installs the native page patch backend.  Called from `NRed::processPatcher` once the device ID and
+    // Installs the dynamic signature patch backend. Called from `NRed::processPatcher` once the device ID and
     // profile are known (it must run before user processes validate pages).
     void processPatcher(KernelPatcher& patcher);
 
 private:
-    // Longest supported replacement, in bytes.
-    static constexpr size_t kMaxPatchSize = 32;
-
-    // Amount of distinct pages and per-page sites the native backend supports.  The combined selected GL
-    // set (3 pages), VA (8) and AppleGVA (1) tables currently use 12 pages; keep headroom so a new table
-    // cannot be silently dropped by the page cap.  The backend refuses the whole table on overflow.
-    static constexpr size_t kMaxNativePages  = 16;
-    static constexpr size_t kMaxSitesPerPage = 16;
-
-    // Maximum combined (GL + VDA) patch entries in the native backend.
-    static constexpr size_t kMaxNativePatches = 64;
-
     // Maximum amount of signature patches in a patch set.
-    static constexpr size_t kMaxSignatures   = 8;
+    static constexpr size_t kMaxSignatures    = 8;
     static constexpr size_t kMaxVDASignatures = 16;
 
-    // Amount of patches handed over to Lilu's user patcher.
-    static constexpr size_t kMaxLiluPatches = 8;
-
-    struct NativeSite
-    {
-        size_t       offset{0};
-        const UInt8* find{nullptr};
-        const UInt8* replace{nullptr};
-        size_t       size{0};
-    };
-
-    struct NativePage
-    {
-        const UInt8* image{nullptr};
-        UInt64       head{0};
-        NativeSite   sites[kMaxSitesPerPage]{};
-        size_t       siteCount{0};
-        bool         vda{false};
-        bool         mismatchLogged{false};
-    };
-
-    const PatchSet* patchSets{nullptr};
-    size_t          patchSetCount{0};
-
-    // Resolver fallback selected together with the patch set.  Exact page images stay the primary path;
-    // this only runs once the exact image does not match and the user opted in with `-NRedGLFixResolve`.
     const SignaturePatch* signatures{nullptr};
     size_t                signatureCount{0};
     size_t                signatureApplied[kMaxSignatures]{};
@@ -207,49 +166,19 @@ private:
     bool                  resolverEnabled{false};
     bool                  resolverOnly{false};
 
-    const PagePatch* patches{nullptr};
-    size_t           patchCount{0};
-
-    struct PatchTable
-    {
-        const PagePatch* table{nullptr};
-        size_t           count{0};
-    };
-
-    PatchTable vdaTables[2]{};
-    size_t     vdaTableCount{0};
-
-    PagePatch nativePatches[kMaxNativePatches]{};
-    bool      nativePatchIsVDA[kMaxNativePatches]{};
-    size_t    nativePatchCount{0};
-    bool      enabled{false};
-    bool      vdaEnabled{false};
+    bool                  enabled{false};
+    bool                  vdaEnabled{false};
 
     void selectPatchSet();
     auto currentApuMask() const -> ApuMask;
 
-    NativePage nativePages[kMaxNativePages]{};
-    size_t     nativePageCount{0};
-    SInt32     vdaAppliedCount{0};
-
-    UserPatcher::BinaryModPatch liluPatches[kMaxLiluPatches]{};
-    UserPatcher::BinaryModInfo  liluModInfo{};
-    size_t                      liluPatchCount{0};
+    SInt32                vdaAppliedCount{0};
 
     mach_vm_address_t orgCsValidatePage{0};
     mach_vm_address_t orgCsValidateRange{0};
 
-    auto installUserPatcher() -> bool;
     auto installNativePagePatcher(KernelPatcher& patcher) -> bool;
-    auto buildNativePatches() -> bool;
-    void patchNativePage(const void* data, UInt64 pageOffset, void* vnode);
     void patchSignaturePage(const void* data, UInt64 pageOffset, void* vnode);
-
-    // Returns true when `data` is an already-patched version of an exact native page.  This is the normal
-    // state for a page after the first process validated it: the kernel keeps the patched bytes, so a later
-    // validation would otherwise fall through to the resolver and scan a page that no longer has the
-    // original signature context.
-    auto isPatchedPage(const NativePage& page, const UInt8* data) const -> bool;
 
     bool              submitGuardEnabled{false};
     bool              legacyBlendEnabled{false};

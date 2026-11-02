@@ -14,16 +14,6 @@
 		EF0400010000000000000012 /* CompatTarget.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EF0400020000000000000012 /* CompatTarget.cpp */; };
 		EF0400030000000000000012 /* CompatTarget.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000012 /* CompatTarget.hpp */; };
 		EF0400030000000000000013 /* VCNKernelData.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000013 /* VCNKernelData.hpp */; };
-		EF0400030000000000000014 /* VDAVAData.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000014 /* VDAVAData.hpp */; };
-		EF0400030000000000000015 /* VDAVADataSonoma.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000015 /* VDAVADataSonoma.hpp */; };
-		EF0400030000000000000016 /* VDAVADataSequoia.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000016 /* VDAVADataSequoia.hpp */; };
-		EF0400030000000000000017 /* VDAGVAData.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000017 /* VDAGVAData.hpp */; };
-		EF0400030000000000000018 /* VDAGVADataSonoma.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000018 /* VDAGVADataSonoma.hpp */; };
-		EF0400030000000000000019 /* VDAGVADataSequoia.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000019 /* VDAGVADataSequoia.hpp */; };
-		EF0400030000000000000020 /* TahoePatchData.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000020 /* TahoePatchData.hpp */; };
-		EF0400030000000000000021 /* UserPatchesSonoma.inc in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000021 /* UserPatchesSonoma.inc */; };
-		EF0400030000000000000022 /* UserPatchesSequoia.inc in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000022 /* UserPatchesSequoia.inc */; };
-		EF0400030000000000000023 /* UserPatchesTahoe.inc in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000023 /* UserPatchesTahoe.inc */; };
 		EF0400010000000000000002 /* DeviceProfile.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EF0400020000000000000002 /* DeviceProfile.cpp */; };
 		EF0400030000000000000002 /* DeviceProfile.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000002 /* DeviceProfile.hpp */; };
 		EF0400010000000000000001 /* UserPatches.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EF0400020000000000000001 /* UserPatches.cpp */; };
@@ -137,16 +127,6 @@
 		EF0400020000000000000012 /* CompatTarget.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = CompatTarget.cpp; sourceTree = "<group>"; };
 		EF0400040000000000000012 /* CompatTarget.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = CompatTarget.hpp; sourceTree = "<group>"; };
 		EF0400040000000000000013 /* VCNKernelData.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = VCNKernelData.hpp; sourceTree = "<group>"; };
-		EF0400040000000000000014 /* VDAVAData.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = VDAVAData.hpp; sourceTree = "<group>"; };
-		EF0400040000000000000015 /* VDAVADataSonoma.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = VDAVADataSonoma.hpp; sourceTree = "<group>"; };
-		EF0400040000000000000016 /* VDAVADataSequoia.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = VDAVADataSequoia.hpp; sourceTree = "<group>"; };
-		EF0400040000000000000017 /* VDAGVAData.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = VDAGVAData.hpp; sourceTree = "<group>"; };
-		EF0400040000000000000018 /* VDAGVADataSonoma.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = VDAGVADataSonoma.hpp; sourceTree = "<group>"; };
-		EF0400040000000000000019 /* VDAGVADataSequoia.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = VDAGVADataSequoia.hpp; sourceTree = "<group>"; };
-		EF0400040000000000000020 /* TahoePatchData.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = TahoePatchData.hpp; sourceTree = "<group>"; };
-		EF0400040000000000000021 /* UserPatchesSonoma.inc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = UserPatchesSonoma.inc; sourceTree = "<group>"; };
-		EF0400040000000000000022 /* UserPatchesSequoia.inc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = UserPatchesSequoia.inc; sourceTree = "<group>"; };
-		EF0400040000000000000023 /* UserPatchesTahoe.inc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = UserPatchesTahoe.inc; sourceTree = "<group>"; };
 		EF0400020000000000000002 /* DeviceProfile.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = DeviceProfile.cpp; sourceTree = "<group>"; };
 		EF0400040000000000000002 /* DeviceProfile.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = DeviceProfile.hpp; sourceTree = "<group>"; };
 		EF0400020000000000000001 /* UserPatches.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = UserPatches.cpp; sourceTree = "<group>"; };
@@ -362,16 +342,6 @@
 				EF0400020000000000000012 /* CompatTarget.cpp */,
 				EF0400040000000000000012 /* CompatTarget.hpp */,
 				EF0400040000000000000013 /* VCNKernelData.hpp */,
-				EF0400040000000000000014 /* VDAVAData.hpp */,
-				EF0400040000000000000015 /* VDAVADataSonoma.hpp */,
-				EF0400040000000000000016 /* VDAVADataSequoia.hpp */,
-				EF0400040000000000000017 /* VDAGVAData.hpp */,
-				EF0400040000000000000018 /* VDAGVADataSonoma.hpp */,
-				EF0400040000000000000019 /* VDAGVADataSequoia.hpp */,
-				EF0400040000000000000020 /* TahoePatchData.hpp */,
-				EF0400040000000000000021 /* UserPatchesSonoma.inc */,
-				EF0400040000000000000022 /* UserPatchesSequoia.inc */,
-				EF0400040000000000000023 /* UserPatchesTahoe.inc */,
 				405460882CDBDF58007865E5 /* AGDP.hpp */,
 				4054608B2CDBDF89007865E5 /* AGDP.cpp */,
 				40F46B1C2E6DF54E00B0E9CE /* AMDGFX9DCN1Display.hpp */,
@@ -660,16 +630,6 @@
 				EF0400030000000000000011 /* VCNBridge.hpp in Headers */,
 				EF0400030000000000000012 /* CompatTarget.hpp in Headers */,
 				EF0400030000000000000013 /* VCNKernelData.hpp in Headers */,
-				EF0400030000000000000014 /* VDAVAData.hpp in Headers */,
-				EF0400030000000000000015 /* VDAVADataSonoma.hpp in Headers */,
-				EF0400030000000000000016 /* VDAVADataSequoia.hpp in Headers */,
-				EF0400030000000000000017 /* VDAGVAData.hpp in Headers */,
-				EF0400030000000000000018 /* VDAGVADataSonoma.hpp in Headers */,
-				EF0400030000000000000019 /* VDAGVADataSequoia.hpp in Headers */,
-				EF0400030000000000000020 /* TahoePatchData.hpp in Headers */,
-				EF0400030000000000000021 /* UserPatchesSonoma.inc in Headers */,
-				EF0400030000000000000022 /* UserPatchesSequoia.inc in Headers */,
-				EF0400030000000000000023 /* UserPatchesTahoe.inc in Headers */,
 				4091C1642E3FE1C2004577D5 /* HWDisplay.hpp in Headers */,
 				4039AD362E6CAB2300A693C7 /* TypeName.hpp in Headers */,
 				4069F00F29C3A241005293B4 /* ATOMBIOS.hpp in Headers */,
@@ -1075,7 +1035,7 @@
 				MODULE_NAME = org.ChefKiss.NootedRed;
 				MODULE_START = "$(PRODUCT_NAME)_kern_start";
 				MODULE_STOP = "$(PRODUCT_NAME)_kern_stop";
-				MODULE_VERSION = 1.2.1;
+				MODULE_VERSION = 1.2.2;
 				OTHER_LDFLAGS = "-static";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(MODULE_NAME)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1096,7 +1056,7 @@
 				MODULE_NAME = org.ChefKiss.NootedRed;
 				MODULE_START = "$(PRODUCT_NAME)_kern_start";
 				MODULE_STOP = "$(PRODUCT_NAME)_kern_stop";
-				MODULE_VERSION = 1.2.1;
+				MODULE_VERSION = 1.2.2;
 				OTHER_LDFLAGS = "-static";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(MODULE_NAME)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1220,7 +1180,7 @@
 				MODULE_NAME = org.ChefKiss.NootedRed;
 				MODULE_START = "$(PRODUCT_NAME)_kern_start";
 				MODULE_STOP = "$(PRODUCT_NAME)_kern_stop";
-				MODULE_VERSION = 1.2.1;
+				MODULE_VERSION = 1.2.2;
 				OTHER_LDFLAGS = "-static";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(MODULE_NAME)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1336,7 +1296,7 @@
 				MODULE_NAME = org.ChefKiss.NootedRed;
 				MODULE_START = "$(PRODUCT_NAME)_kern_start";
 				MODULE_STOP = "$(PRODUCT_NAME)_kern_stop";
-				MODULE_VERSION = 1.2.1;
+				MODULE_VERSION = 1.2.2;
 				OTHER_LDFLAGS = "-static";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(MODULE_NAME)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
