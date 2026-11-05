@@ -27,14 +27,10 @@
 #include <NRed.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <UserPatches.hpp>
-#include <UserSubmitGuard.hpp>
 #include <VCNBridge.hpp>
 #include <libkern/OSAtomic.h>
 #include <libkern/OSTypes.h>
 #include <mach/i386/vm_types.h>
-#include <mach/vm_map.h>
-#include <mach/vm_region.h>
-#include <kern/task.h>
 #include <IOKit/IOUserClient.h>
 #include <libkern/c++/OSBoolean.h>
 #include <sys/vnode.h>
@@ -58,17 +54,6 @@ namespace
     const char* const kBootArgGLFixNoResolve   = "-NRedGLFixNoResolve";
     const char* const kBootArgNoVDA            = "-NRedNoVDA";
     const char* const kBootArgNoHEVC           = "-NRedNoHEVC";
-    const char* const kBootArgNoSubmitGuard    = "-NRedNoSubmitGuard";
-    const char* const kBootArgSubmitGuard      = "-NRedSubmitGuard";
-    const char* const kBootArgNoLegacyBlend    = "-NRedNoLegacyBlend";
-    const char* const kBootArgLegacyBlend      = "-NRedLegacyBlend";
-
-    struct SharedRegionCheckArgs
-    {
-        user_addr_t startAddress;
-    };
-    static_assert(sizeof(SharedRegionCheckArgs) == 8);
-    using SharedRegionCheck = int (*)(proc_t, SharedRegionCheckArgs*, int*);
 
     bool isFairPlayClient(const task_t task)
     {
@@ -77,38 +62,6 @@ namespace
         const bool client = (entitlement == kOSBooleanTrue);
         if (entitlement != nullptr) { entitlement->release(); }
         return client;
-    }
-
-    using GetTaskMap = vm_map_t (*)(task_t);
-    using RegionRecurse = kern_return_t (*)(vm_map_t, mach_vm_address_t*, mach_vm_size_t*, natural_t*,
-                                            vm_region_recurse_info_t, mach_msg_type_number_t*);
-    using CopyIn = int (*)(const void*, void*, size_t);
-    using CopyOut = int (*)(const void*, void*, size_t);
-
-    GetTaskMap    getTaskMapFunc{nullptr};
-    RegionRecurse queryRegionFunc{nullptr};
-    CopyIn        copyInFunc{nullptr};
-    CopyOut       copyOutFunc{nullptr};
-
-    bool leafProtection(vm_map_t map, const mach_vm_address_t page, vm_prot_t& protection)
-    {
-        if (queryRegionFunc == nullptr) { return false; }
-        natural_t depth{0};
-        for (UInt32 attempt = 0; attempt < 8; ++attempt) {
-            auto address = page;
-            mach_vm_size_t size{0};
-            vm_region_submap_short_info_data_64_t info{};
-            mach_msg_type_number_t count = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
-            const auto result = queryRegionFunc(map, &address, &size, &depth,
-                                                reinterpret_cast<vm_region_recurse_info_t>(&info), &count);
-            if (result != KERN_SUCCESS) { return false; }
-            if (count < VM_REGION_SUBMAP_SHORT_INFO_COUNT_64 || address > page || page - address >= size
-                || size - (page - address) < PAGE_SIZE) { return false; }
-            if (!info.is_submap) { protection = info.protection; return true; }
-            if (depth == ~0U) { break; }
-            ++depth;
-        }
-        return false;
     }
 
     // The patch bytes and page images below are specific to one driver build, and the native backend hooks
@@ -151,21 +104,21 @@ namespace
     static const UInt8 kMTLGateFind[]    = {0x75, 0x0B};
     static const UInt8 kMTLGateReplace[] = {0xEB, 0x0B};
 
-    // macOS 14 (Sonoma) Allow pattern: 0F 93 C0 (setae al) -> 31 C0 90 (xor eax,eax; nop)
+    // macOS 14 (Sonoma) Allow pattern: 0F 93 C0 (setae al) -> B0 01 90 (mov al,1; nop)
     static const UInt8 kMTLAllowFind_Sonoma[]    = {0x0F, 0x93, 0xC0};
-    static const UInt8 kMTLAllowReplace_Sonoma[] = {0x31, 0xC0, 0x90};
+    static const UInt8 kMTLAllowReplace_Sonoma[] = {0xB0, 0x01, 0x90};
 
-    // macOS 15 (Sequoia) Allow pattern: 0F 94 C0 (setz al) -> 31 C0 90 (xor eax,eax; nop)
+    // macOS 15 (Sequoia) Allow pattern: 0F 94 C0 (setz al) -> B0 01 90 (mov al,1; nop)
     static const UInt8 kMTLAllowFind_Sequoia[]    = {0x0F, 0x94, 0xC0};
-    static const UInt8 kMTLAllowReplace_Sequoia[] = {0x31, 0xC0, 0x90};
+    static const UInt8 kMTLAllowReplace_Sequoia[] = {0xB0, 0x01, 0x90};
 
     // macOS 26 (Tahoe) Gate: 74 28 (je +0x28) -> EB 00 (jmp +0x00, fallthrough / no-op jump)
     static const UInt8 kMTLGateFind_Tahoe[]    = {0x74, 0x28};
     static const UInt8 kMTLGateReplace_Tahoe[] = {0xEB, 0x00};
 
-    // macOS 26 (Tahoe) Allow pattern: 0F 94 C1 (sete cl) -> 31 C9 90 (xor ecx,ecx; nop)
+    // macOS 26 (Tahoe) Allow pattern: 0F 94 C1 (sete cl) -> B1 01 90 (mov cl,1; nop)
     static const UInt8 kMTLAllowFind_Tahoe[]    = {0x0F, 0x94, 0xC1};
-    static const UInt8 kMTLAllowReplace_Tahoe[] = {0x31, 0xC9, 0x90};
+    static const UInt8 kMTLAllowReplace_Tahoe[] = {0xB1, 0x01, 0x90};
 
     #include "VDASignatures.inc"
 
@@ -350,10 +303,7 @@ void UserPatches::init()
 
     this->vdaEnabled = !checkKernelArgument(kBootArgNoVDA);
 
-    this->submitGuardEnabled = checkKernelArgument(kBootArgSubmitGuard) || !checkKernelArgument(kBootArgNoSubmitGuard);
-    this->legacyBlendEnabled = checkKernelArgument(kBootArgLegacyBlend) || !checkKernelArgument(kBootArgNoLegacyBlend);
-
-    if (!this->enabled && !this->vdaEnabled && !this->submitGuardEnabled && !this->legacyBlendEnabled) {
+    if (!this->enabled && !this->vdaEnabled) {
         DBGLOG("UserPatch", "User-space driver patches are disabled");
         return;
     }
@@ -386,8 +336,6 @@ void UserPatches::init()
         this->gvaSignatureApplied = 0;
         SYSLOG("UserPatch", "Enabling user-space VDA driver patches with dynamic Resolver fallback");
     }
-    if (this->submitGuardEnabled) { SYSLOG("UserPatch", "Enabling user-space Metal SubmitGuard (free tail filler)"); }
-    if (this->legacyBlendEnabled) { SYSLOG("UserPatch", "Enabling user-space Metal LegacyBlend (dual-quad fix)"); }
 }
 
 auto UserPatches::currentApuMask() const -> ApuMask
@@ -436,10 +384,6 @@ void UserPatches::selectPatchSet()
 
 void UserPatches::processPatcher(KernelPatcher& patcher)
 {
-    if (this->submitGuardEnabled || this->legacyBlendEnabled) {
-        this->installSubmitGuard(patcher);
-    }
-
     if (!this->enabled && !this->vdaEnabled) {
         DBGLOG("UserPatch", "User-space driver patches are disabled");
         return;
@@ -563,24 +507,24 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
         return;
     }
 
-    // Process exclusion defense: WindowServer and loginwindow NEVER decode video via VDA
-    // and must never have their shared cache pages scanned or modified by VDA resolver.
-    bool isWindowServerOrLogin = false;
-    char procName[64]{};
-    int pid = 0;
+    const auto* const bytes = static_cast<const UInt8*>(data);
+
+    // Compositor isolation: WindowServer and loginwindow NEVER decode video via VDA.
+    // Explicitly bypass VDA / AppleGVA signature scanning for compositor processes
+    // so they are never touched by short signatures, while ensuring Metal patches below still apply.
+    bool skipVDA = false;
     if (isSharedCache) {
         proc_t proc = current_proc();
-        pid = proc != nullptr ? proc_pid(proc) : 0;
+        int pid = proc != nullptr ? proc_pid(proc) : 0;
+        char procName[32]{};
         if (pid > 0) { proc_name(pid, procName, sizeof(procName)); }
         if (strcmp(procName, "WindowServer") == 0 || strcmp(procName, "loginwindow") == 0) {
-            isWindowServerOrLogin = true;
+            skipVDA = true;
         }
     }
 
-    const auto* const bytes = static_cast<const UInt8*>(data);
-
-    // VDA Dynamic Resolver path (AMDRadeonVADriver2: loose bundle or dyld_shared_cache)
-    if (!isWindowServerOrLogin && (isVADriver || isSharedCache) && this->vdaEnabled && this->vdaSignatures != nullptr && this->vdaSignatureCount > 0) {
+    // VDA Dynamic Resolver path (AMDRadeonVADriver2: embedded in dyld_shared_cache or loose bundle)
+    if (!skipVDA && (isVADriver || isSharedCache) && this->vdaEnabled && this->vdaSignatures != nullptr && this->vdaSignatureCount > 0) {
         if (VCNBridge::singleton().loadReady() && !isFairPlayClient(current_task())) {
             bool vdaAllApplied = true;
             for (size_t i = 0; i < this->vdaSignatureCount && i < kMaxVDASignatures; ++i) {
@@ -630,13 +574,13 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
                 }
             }
         }
-        if (isVADriver) {
+        if (isVADriver && !isSharedCache) {
             return;
         }
     }
 
-    // AppleGVA Dynamic Resolver path (dyld_shared_cache or standalone AppleGVA bundle)
-    if (!isWindowServerOrLogin && (isAppleGVA || isSharedCache) && this->vdaEnabled && this->gvaSignature != nullptr &&
+    // AppleGVA Dynamic Resolver path (embedded in dyld_shared_cache or standalone AppleGVA bundle)
+    if (!skipVDA && (isAppleGVA || isSharedCache) && this->vdaEnabled && this->gvaSignature != nullptr &&
         this->gvaSignatureApplied < this->gvaSignature->count) {
         if (!isFairPlayClient(current_task())) {
             size_t matchOffset = 0;
@@ -655,6 +599,9 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
                     }
                 }
             }
+        }
+        if (isAppleGVA && !isSharedCache) {
+            return;
         }
     }
 
@@ -740,10 +687,6 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
                             static volatile UInt32 blendResolverCounter{0};
                             const auto count = static_cast<UInt32>(OSIncrementAtomic(&blendResolverCounter) + 1);
                             NRed::singleton().setProp32("NRedLegacyBlendApplied", count);
-                            if (strcmp(procName, "WindowServer") == 0) {
-                                NRed::singleton().setProp32("NRedLegacyBlendWindowServerPID", static_cast<UInt32>(pid));
-                                NRed::singleton().setProp32("NRedLegacyBlendWindowServerApplied", 1);
-                            }
                         }
                     }
                 }
@@ -776,478 +719,4 @@ boolean_t UserPatches::wrapCsValidateRange(void* const vnode, void* const pager,
     }
 
     return result;
-}
-
-int UserPatches::wrapSharedRegionCheck(proc_t process, void* args, int* returnValue)
-{
-    auto& patches = singleton();
-    const auto result = FunctionCast(wrapSharedRegionCheck, patches.orgSharedRegionCheck)(process, args, returnValue);
-    if (result == 0 && args != nullptr) {
-        if (patches.submitGuardEnabled) {
-            patches.applySubmitGuard(process, args);
-        }
-        if (patches.legacyBlendEnabled) {
-            mach_vm_offset_t base = UserSubmitGuardData::kDyldSharedCacheBase;
-            const auto* rArgs = static_cast<const SharedRegionCheckArgs*>(args);
-            if (rArgs->startAddress != 0 && copyInFunc != nullptr) {
-                mach_vm_offset_t userBase{0};
-                if (copyInFunc(reinterpret_cast<const void*>(rArgs->startAddress), &userBase, sizeof(userBase)) == 0 && userBase != 0) {
-                    base = userBase;
-                }
-            }
-            auto map = getTaskMapFunc ? getTaskMapFunc(current_task()) : nullptr;
-            if (map != nullptr) {
-                patches.applyLegacyBlend(map, base, process);
-            }
-        }
-    }
-    return result;
-}
-
-void UserPatches::applySubmitGuard(proc_t process, void* rawArgs)
-{
-    if (getTaskMapFunc == nullptr || copyInFunc == nullptr || copyOutFunc == nullptr) {
-        return;
-    }
-
-    const auto kernelMajor = currentKernelVersion().major();
-    const auto methodOffset = UserSubmitGuardData::getMethodOffset(kernelMajor);
-    if (methodOffset == 0) {
-        return;
-    }
-
-    auto map = getTaskMapFunc(current_task());
-    if (map == nullptr) {
-        return;
-    }
-
-    mach_vm_offset_t base = UserSubmitGuardData::kDyldSharedCacheBase;
-    if (rawArgs != nullptr) {
-        const auto* args = static_cast<const SharedRegionCheckArgs*>(rawArgs);
-        if (args->startAddress != 0) {
-            mach_vm_offset_t userBase{0};
-            if (copyInFunc(reinterpret_cast<const void*>(args->startAddress), &userBase, sizeof(userBase)) == 0 && userBase != 0) {
-                base = userBase;
-            }
-        }
-    }
-
-    const auto method = base + methodOffset;
-    UInt8 entry[UserSubmitGuardData::MethodPatchSize];
-    if (copyInFunc(reinterpret_cast<const void*>(method), entry, sizeof(entry)) != 0) {
-        return;
-    }
-
-    static constexpr UInt8 patchedPrefix[6] = {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
-    if (memcmp(entry, patchedPrefix, sizeof(patchedPrefix)) == 0) {
-        // Already patched in this process space.
-        return;
-    }
-
-    if (memcmp(entry, UserSubmitGuardData::MethodOriginal, sizeof(entry)) != 0) {
-        // Entry does not match expected prologue; safely avoid touching.
-        return;
-    }
-
-    vm_address_t page{0};
-    auto result = vm_allocate(map, &page, PAGE_SIZE, VM_FLAGS_ANYWHERE);
-    if (result != KERN_SUCCESS) {
-        return;
-    }
-
-    UInt8 payload[sizeof(UserSubmitGuardData::Payload)];
-    memcpy(payload, UserSubmitGuardData::Payload, sizeof(payload));
-    const UInt64 continuation = method + UserSubmitGuardData::MethodPatchSize;
-    memcpy(payload + UserSubmitGuardData::PayloadJumpOffset, &continuation, sizeof(continuation));
-
-    if (copyOutFunc(payload, reinterpret_cast<void*>(page), sizeof(payload)) != 0) {
-        vm_deallocate(map, page, PAGE_SIZE);
-        return;
-    }
-
-    result = vm_protect(map, page, PAGE_SIZE, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-    if (result != KERN_SUCCESS) {
-        vm_deallocate(map, page, PAGE_SIZE);
-        return;
-    }
-
-    UInt8 patch[UserSubmitGuardData::MethodPatchSize];
-    memset(patch, 0x90, sizeof(patch));
-    memcpy(patch, patchedPrefix, sizeof(patchedPrefix));
-    const UInt64 target = page;
-    memcpy(patch + 6, &target, sizeof(target));
-
-    const UInt64 methodPage = method & ~static_cast<UInt64>(PAGE_SIZE - 1);
-    vm_prot_t protection{VM_PROT_NONE};
-    if (!leafProtection(map, methodPage, protection)
-        || protection != (VM_PROT_READ | VM_PROT_EXECUTE)) {
-        vm_deallocate(map, page, PAGE_SIZE);
-        return;
-    }
-
-    result = vm_protect(map, methodPage, PAGE_SIZE, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (result != KERN_SUCCESS) {
-        vm_deallocate(map, page, PAGE_SIZE);
-        return;
-    }
-
-    const auto written = copyOutFunc(patch, reinterpret_cast<void*>(method), sizeof(patch));
-
-    // Restore protections: first current, then maximum
-    auto restored = vm_protect(map, methodPage, PAGE_SIZE, FALSE, protection);
-    if (restored != KERN_SUCCESS) {
-        restored = vm_protect(map, methodPage, PAGE_SIZE, FALSE, protection);
-    }
-    if (restored == KERN_SUCCESS) {
-        const auto maxRestored = vm_protect(map, methodPage, PAGE_SIZE, TRUE, protection);
-        if (maxRestored != KERN_SUCCESS) {
-            restored = maxRestored;
-            SYSLOG("UserPatch", "Failed to restore maximum protection for submit method page (0x%X)", maxRestored);
-        }
-    } else {
-        SYSLOG("UserPatch", "Failed to restore current protection for submit method page (0x%X)", restored);
-    }
-
-    if (written == 0 && restored == KERN_SUCCESS) {
-        static volatile UInt32 appliedCounter{0};
-        const auto count = static_cast<UInt32>(OSIncrementAtomic(&appliedCounter) + 1);
-        NRed::singleton().setProp32("NRedSubmitGuardApplied", count);
-
-        const auto proc = (process != nullptr) ? process : current_proc();
-        if (proc != nullptr) {
-            const auto pid = proc_pid(proc);
-            char name[32]{};
-            if (pid > 0) { proc_name(pid, name, sizeof(name)); }
-            name[sizeof(name) - 1] = '\0';
-            if (strcmp(name, "WindowServer") == 0) {
-                NRed::singleton().setProp32("NRedSubmitGuardWindowServerPID", static_cast<UInt32>(pid));
-                NRed::singleton().setProp32("NRedSubmitGuardWindowServerApplied", 1);
-            }
-            DBGLOG("UserPatch", "SubmitGuard installed in %s (PID %d)", name, pid);
-        }
-    }
-
-    // Also apply Metal LegacyBlend / dual-quad fix to this dyld shared cache instance
-    if (this->legacyBlendEnabled) {
-        this->applyLegacyBlend(map, base, process);
-    }
-}
-
-namespace
-{
-    inline bool isAllowOpcode(UInt8 b0, UInt8 b1, UInt8 b2)
-    {
-        return (b0 == 0x31 && (b1 == 0xC0 || b1 == 0xC9) && b2 == 0x90) ||
-               (b0 == 0x0F && (b1 == 0x93 || b1 == 0x94) && (b2 == 0xC0 || b2 == 0xC1));
-    }
-
-    inline bool isAllowAlreadyPatched(UInt8 b0, UInt8 b1, UInt8 b2)
-    {
-        return (b0 == 0xB0 && b1 == 0x01 && b2 == 0x90) ||
-               (b0 == 0x31 && (b1 == 0xC0 || b1 == 0xC9) && b2 == 0x90);
-    }
-}
-
-void UserPatches::applyLegacyBlend(vm_map_t map, mach_vm_offset_t base, proc_t process)
-{
-    if (!this->legacyBlendEnabled) {
-        return;
-    }
-    if (copyInFunc == nullptr || copyOutFunc == nullptr) {
-        return;
-    }
-
-    const auto kernelMajor = currentKernelVersion().major();
-    mach_vm_offset_t baseGateOffset = 0;
-    mach_vm_offset_t baseAllowOffset = 0;
-    UInt32 expectedDelta = 0;
-
-    if (kernelMajor == 22) {
-        // macOS 13 Ventura (Darwin 22)
-        baseGateOffset = 0x3000BC24CULL;
-        baseAllowOffset = 0x3000BC278ULL;
-        expectedDelta = 0x2C;
-    } else if (kernelMajor == 23) {
-        // macOS 14 Sonoma (Darwin 23)
-        baseGateOffset = 0x30354D1BCULL;
-        baseAllowOffset = 0x30354D1DBULL;
-        expectedDelta = 0x1F;
-    } else if (kernelMajor == 24) {
-        // macOS 15 Sequoia (Darwin 24)
-        baseGateOffset = 0x3087B3164ULL;
-        baseAllowOffset = 0x3087B3198ULL;
-        expectedDelta = 0x34;
-    } else if (kernelMajor == 25) {
-        // macOS 26 Tahoe (Darwin 25)
-        baseGateOffset = 0x310CDEDE4ULL;
-        baseAllowOffset = 0x310CDEE06ULL;
-        expectedDelta = 0x22;
-    } else {
-        return;
-    }
-
-    auto recordSuccess = [&]() {
-        static volatile UInt32 blendCounter{0};
-        const auto count = static_cast<UInt32>(OSIncrementAtomic(&blendCounter) + 1);
-        NRed::singleton().setProp32("NRedLegacyBlendApplied", count);
-
-        const auto proc = (process != nullptr) ? process : current_proc();
-        if (proc != nullptr) {
-            const auto pid = proc_pid(proc);
-            char name[32]{};
-            if (pid > 0) { proc_name(pid, name, sizeof(name)); }
-            name[sizeof(name) - 1] = '\0';
-            if (strcmp(name, "WindowServer") == 0) {
-                NRed::singleton().setProp32("NRedLegacyBlendWindowServerPID", static_cast<UInt32>(pid));
-                NRed::singleton().setProp32("NRedLegacyBlendWindowServerApplied", 1);
-            }
-            DBGLOG("UserPatch", "LegacyBlend recorded in %s (PID %d)", name, pid);
-        }
-    };
-
-    const bool isTahoe = (kernelMajor == 25);
-    const UInt8 gateOrig0 = isTahoe ? 0x74 : 0x75;
-    const UInt8 gateOrig1 = isTahoe ? 0x28 : 0x0B;
-    const UInt8 gatePatch0 = 0xEB;
-    const UInt8 gatePatch1 = isTahoe ? 0x00 : 0x0B;
-
-    mach_vm_offset_t resolvedGateOffset = 0;
-    mach_vm_offset_t resolvedAllowOffset = 0;
-    bool needsGatePatch = false;
-    bool needsAllowPatch = false;
-    UInt8 targetGate[2] = {gatePatch0, gatePatch1};
-    UInt8 targetAllow[3] = {0xB0, 0x01, 0x90};
-
-    if (isTahoe) {
-        targetAllow[0] = 0x31; targetAllow[1] = 0xC9; targetAllow[2] = 0x90;
-    }
-
-    // Step 1: Fast path - test nominal hardcoded offsets first
-    bool fastPathSuccess = false;
-    {
-        UInt8 gateBytes[2]{};
-        if (copyInFunc(reinterpret_cast<const void*>(base + baseGateOffset), gateBytes, sizeof(gateBytes)) == 0) {
-            if (gateBytes[0] == gateOrig0 && gateBytes[1] == gateOrig1) {
-                UInt8 allowBytes[3]{};
-                if (copyInFunc(reinterpret_cast<const void*>(base + baseAllowOffset), allowBytes, sizeof(allowBytes)) == 0) {
-                    if (isAllowOpcode(allowBytes[0], allowBytes[1], allowBytes[2])) {
-                        resolvedGateOffset = baseGateOffset;
-                        resolvedAllowOffset = baseAllowOffset;
-                        needsGatePatch = true;
-                        needsAllowPatch = true;
-                        fastPathSuccess = true;
-                    }
-                }
-            } else if (gateBytes[0] == gatePatch0 && gateBytes[1] == gatePatch1) {
-                UInt8 allowBytes[3]{};
-                if (copyInFunc(reinterpret_cast<const void*>(base + baseAllowOffset), allowBytes, sizeof(allowBytes)) == 0) {
-                    if (isAllowAlreadyPatched(allowBytes[0], allowBytes[1], allowBytes[2])) {
-                        recordSuccess();
-                        return; // Already patched in this shared region instance
-                    }
-                }
-            }
-        }
-    }
-
-    // Step 2: Dynamic Window Search (if fast path didn't match nominal offsets, e.g. due to minor build shifts)
-    if (!fastPathSuccess && (kernelMajor == 22 || kernelMajor == 23 || kernelMajor == 24 || kernelMajor == 25)) {
-        constexpr size_t kRadius = 128;
-        // Ensure kScanSize covers [-128, +128] scan window plus maximum delta and instruction length:
-        // 256 + maxDelta (~68) + 3 bytes <= 384 bytes.
-        constexpr size_t kScanSize = 256 + 128; // 384 bytes total
-        UInt8 win[kScanSize]{};
-        const mach_vm_address_t scanBase = base + baseGateOffset - kRadius;
-
-        if (copyInFunc(reinterpret_cast<const void*>(scanBase), win, sizeof(win)) == 0) {
-            size_t matchCount = 0;
-            mach_vm_offset_t matchedGate = 0;
-            mach_vm_offset_t matchedAllow = 0;
-            bool matchedAlreadyPatched = false;
-
-            for (size_t i = 0; i <= 256; ++i) {
-                const bool isGateCandidate = (win[i] == gateOrig0 && win[i + 1] == gateOrig1);
-                const bool isPatchedCandidate = (win[i] == gatePatch0 && win[i + 1] == gatePatch1);
-                if (!isGateCandidate && !isPatchedCandidate) {
-                    continue;
-                }
-
-                // Check allow instruction in allowable delta range [expectedDelta - 16, expectedDelta + 16]
-                const size_t minDelta = (expectedDelta >= 16) ? (expectedDelta - 16) : 0;
-                const size_t maxDelta = expectedDelta + 16;
-                for (size_t d = minDelta; d <= maxDelta; ++d) {
-                    const size_t j = i + d;
-                    if (j + 3 > kScanSize) {
-                        break;
-                    }
-                    if (isGateCandidate && isAllowOpcode(win[j], win[j + 1], win[j + 2])) {
-                        matchedGate = (baseGateOffset - kRadius) + i;
-                        matchedAllow = (baseGateOffset - kRadius) + j;
-                        matchCount++;
-                        break;
-                    } else if (isPatchedCandidate && isAllowAlreadyPatched(win[j], win[j + 1], win[j + 2])) {
-                        matchedAlreadyPatched = true;
-                        matchCount++;
-                        break;
-                    }
-                }
-            }
-
-            if (matchCount == 1) {
-                if (matchedAlreadyPatched) {
-                    recordSuccess();
-                    return; // Already safely patched
-                }
-                resolvedGateOffset = matchedGate;
-                resolvedAllowOffset = matchedAllow;
-                needsGatePatch = true;
-                if (resolvedAllowOffset != 0) {
-                    needsAllowPatch = true;
-                }
-                DBGLOG("UserPatch", "LegacyBlend dynamically matched at gate +0x%llX, allow +0x%llX",
-                       resolvedGateOffset, resolvedAllowOffset);
-            } else {
-                // 0 matches or ambiguous (>1 matches). Safely abort without touching dyld cache!
-                return;
-            }
-        } else {
-            return;
-        }
-    }
-
-    // Step 3: Strict "All-or-Nothing" atomic check
-    // If either site is missing or unverified, DO NOT touch the shared region!
-    if (resolvedAllowOffset != 0) {
-        if (!needsGatePatch || !needsAllowPatch) {
-            return;
-        }
-    } else {
-        if (!needsGatePatch) {
-            return;
-        }
-    }
-
-    // Step 4: Page protection & atomic write
-    const mach_vm_address_t gateAddr = base + resolvedGateOffset;
-    const mach_vm_address_t allowAddr = (resolvedAllowOffset != 0) ? (base + resolvedAllowOffset) : 0;
-
-    const mach_vm_address_t gatePage = gateAddr & ~static_cast<mach_vm_address_t>(PAGE_SIZE - 1);
-    const mach_vm_address_t allowPage = (allowAddr != 0) ? (allowAddr & ~static_cast<mach_vm_address_t>(PAGE_SIZE - 1)) : 0;
-
-    vm_prot_t gateProt{VM_PROT_NONE};
-    if (!leafProtection(map, gatePage, gateProt) || gateProt != (VM_PROT_READ | VM_PROT_EXECUTE)) {
-        return;
-    }
-
-    vm_prot_t allowProt{VM_PROT_NONE};
-    if (allowPage != 0 && allowPage != gatePage) {
-        if (!leafProtection(map, allowPage, allowProt) || allowProt != (VM_PROT_READ | VM_PROT_EXECUTE)) {
-            return;
-        }
-    }
-
-    // Backup original gate bytes before writing for rollback on partial failure
-    UInt8 orgGate[2]{};
-    if (copyInFunc(reinterpret_cast<const void*>(gateAddr), orgGate, sizeof(orgGate)) != 0) {
-        return;
-    }
-
-    if (vm_protect(map, gatePage, PAGE_SIZE, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
-        return;
-    }
-    if (allowPage != 0 && allowPage != gatePage) {
-        if (vm_protect(map, allowPage, PAGE_SIZE, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
-            auto rollback = vm_protect(map, gatePage, PAGE_SIZE, FALSE, gateProt);
-            if (rollback == KERN_SUCCESS) {
-                vm_protect(map, gatePage, PAGE_SIZE, TRUE, gateProt);
-            }
-            return;
-        }
-    }
-
-    int writeErr = 0;
-    writeErr = copyOutFunc(targetGate, reinterpret_cast<void*>(gateAddr), sizeof(targetGate));
-    if (writeErr == 0 && allowAddr != 0) {
-        const int allowErr = copyOutFunc(targetAllow, reinterpret_cast<void*>(allowAddr), sizeof(targetAllow));
-        if (allowErr != 0) {
-            // Rollback gate patch to maintain all-or-nothing consistency
-            copyOutFunc(orgGate, reinterpret_cast<void*>(gateAddr), sizeof(orgGate));
-            writeErr = allowErr;
-            SYSLOG("UserPatch", "LegacyBlend allow patch failed (0x%X), rolled back gate patch", allowErr);
-        }
-    }
-
-    auto restoredGate = vm_protect(map, gatePage, PAGE_SIZE, FALSE, gateProt);
-    if (restoredGate != KERN_SUCCESS) {
-        restoredGate = vm_protect(map, gatePage, PAGE_SIZE, FALSE, gateProt);
-    }
-    if (restoredGate == KERN_SUCCESS) {
-        const auto maxGate = vm_protect(map, gatePage, PAGE_SIZE, TRUE, gateProt);
-        if (maxGate != KERN_SUCCESS) {
-            restoredGate = maxGate;
-            SYSLOG("UserPatch", "Failed to restore maximum protection for gate page (0x%X)", maxGate);
-        }
-    } else {
-        SYSLOG("UserPatch", "Failed to restore current protection for gate page (0x%X)", restoredGate);
-    }
-
-    kern_return_t restoredAllow = KERN_SUCCESS;
-    if (allowPage != 0 && allowPage != gatePage) {
-        restoredAllow = vm_protect(map, allowPage, PAGE_SIZE, FALSE, allowProt);
-        if (restoredAllow != KERN_SUCCESS) {
-            restoredAllow = vm_protect(map, allowPage, PAGE_SIZE, FALSE, allowProt);
-        }
-        if (restoredAllow == KERN_SUCCESS) {
-            const auto maxAllow = vm_protect(map, allowPage, PAGE_SIZE, TRUE, allowProt);
-            if (maxAllow != KERN_SUCCESS) {
-                restoredAllow = maxAllow;
-                SYSLOG("UserPatch", "Failed to restore maximum protection for allow page (0x%X)", maxAllow);
-            }
-        } else {
-            SYSLOG("UserPatch", "Failed to restore current protection for allow page (0x%X)", restoredAllow);
-        }
-    }
-
-    if (writeErr == 0 && restoredGate == KERN_SUCCESS && restoredAllow == KERN_SUCCESS) {
-        recordSuccess();
-    }
-}
-
-bool UserPatches::installSubmitGuard(KernelPatcher& patcher)
-{
-    const auto kernelMajor = currentKernelVersion().major();
-    if (kernelMajor != 22 && kernelMajor != 23 && kernelMajor != 24 && kernelMajor != 25) {
-        DBGLOG("UserPatch", "SubmitGuard not supported on Darwin %u", kernelMajor);
-        return false;
-    }
-
-    getTaskMapFunc = reinterpret_cast<GetTaskMap>(patcher.solveSymbol(KernelPatcher::KernelID, "_get_task_map"));
-    patcher.clearError();
-    queryRegionFunc = reinterpret_cast<RegionRecurse>(
-        patcher.solveSymbol(KernelPatcher::KernelID, "_mach_vm_region_recurse"));
-    patcher.clearError();
-    copyInFunc = reinterpret_cast<CopyIn>(patcher.solveSymbol(KernelPatcher::KernelID, "_copyin"));
-    patcher.clearError();
-    copyOutFunc = reinterpret_cast<CopyOut>(patcher.solveSymbol(KernelPatcher::KernelID, "_copyout"));
-    patcher.clearError();
-
-    if (!getTaskMapFunc || !queryRegionFunc || !copyInFunc || !copyOutFunc) {
-        SYSLOG("UserPatch", "Failed to resolve kernel symbols for SubmitGuard");
-        return false;
-    }
-
-    KernelPatcher::RouteRequest request{"_shared_region_check_np", wrapSharedRegionCheck, this->orgSharedRegionCheck};
-    if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1)) {
-        patcher.clearError();
-        SYSLOG("UserPatch", "Failed to route _shared_region_check_np for SubmitGuard");
-        return false;
-    }
-
-    NRed::singleton().setProp32("NRedSubmitGuardEnabled", 1);
-    NRed::singleton().setProp32("NRedSubmitGuardVersion", 1);
-    NRed::singleton().setProp32("NRedLegacyBlendEnabled", 1);
-    NRed::singleton().setProp32("NRedLegacyBlendVersion", 1);
-    SYSLOG("UserPatch", "SubmitGuard and LegacyBlend enabled for Darwin %u (offset 0x%llX)", kernelMajor,
-           UserSubmitGuardData::getMethodOffset(kernelMajor));
-    return true;
 }

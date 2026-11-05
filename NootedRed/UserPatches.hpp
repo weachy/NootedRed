@@ -180,15 +180,6 @@ private:
     auto installNativePagePatcher(KernelPatcher& patcher) -> bool;
     void patchSignaturePage(const void* data, UInt64 pageOffset, void* vnode);
 
-    bool              submitGuardEnabled{false};
-    bool              legacyBlendEnabled{false};
-    mach_vm_address_t orgSharedRegionCheck{0};
-
-    auto installSubmitGuard(KernelPatcher& patcher) -> bool;
-    void applySubmitGuard(proc_t process, void* args);
-    void applyLegacyBlend(vm_map_t map, mach_vm_offset_t base, proc_t process);
-    static int wrapSharedRegionCheck(proc_t process, void* args, int* returnValue);
-
     static void      wrapCsValidatePage(void* vnode, void* pager, UInt64 pageOffset, const void* data, int* validated,
                                         int* tainted, int* nx);
     static boolean_t wrapCsValidateRange(void* vnode, void* pager, UInt64 pageOffset, const void* data, UInt64 dataSize,
