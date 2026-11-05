@@ -210,11 +210,32 @@ IOReturn Backlight::wrapSetAttributeForConnection(IOService* const framebuffer, 
 IOReturn Backlight::wrapGetAttributeForConnection(IOService* framebuffer, IOIndex connectIndex, IOSelect attribute,
                                                   uintptr_t* value)
 {
-    const auto ret = FunctionCast(wrapGetAttributeForConnection, singleton().orgGetAttributeForConnection)(
+    auto ret = FunctionCast(wrapGetAttributeForConnection, singleton().orgGetAttributeForConnection)(
         framebuffer, connectIndex, attribute, value);
-    if (attribute != kIOAppleBacklightAttribute) { return ret; }
-    *value = singleton().curBacklightLvl;
-    return kIOReturnSuccess;
+    if (attribute == kIOAppleBacklightAttribute) {
+        if (value != nullptr) { *value = singleton().curBacklightLvl; }
+        return kIOReturnSuccess;
+    }
+
+    if (attribute == kConnectionEnable && connectIndex == 0 && (ret != kIOReturnSuccess || (value != nullptr && *value == 0))) {
+        if (singleton().embeddedPanelLink != nullptr) {
+            // Early boot race condition on laptops with internal eDP panels:
+            // When WindowServer starts rapidly (e.g. SetApfsTrimTimeout=0, fast NVMe, non-verbose boot),
+            // WindowServer queries kConnectionEnable while asynchronous eDP link training is still settling.
+            // Rather than immediately reporting "no devices" (which triggers CoreDisplay assertion abort),
+            // briefly poll with bounded delays (up to ~100ms) for link training to complete.
+            for (int retry = 0; retry < 5; retry++) {
+                IOSleep(20);
+                ret = FunctionCast(wrapGetAttributeForConnection, singleton().orgGetAttributeForConnection)(
+                    framebuffer, connectIndex, attribute, value);
+                if (ret == kIOReturnSuccess && value != nullptr && *value != 0) {
+                    break;
+                }
+            }
+        }
+    }
+
+    return ret;
 }
 
 void* Backlight::wrapLinkCreate(void* data)

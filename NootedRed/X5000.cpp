@@ -945,9 +945,27 @@ bool X5000::fixedGetDisplayInfo(AMDRadeonX5000_AMDHWDisplay* const self, const U
                                              &self->viewportHeights()[fbIndex]);
 
     uintptr_t isOnline = 0;
-    fbInfo->isOnline =
-        fb->getAttributeForConnection(static_cast<IOIndex>(fbIndex), kConnectionEnable, &isOnline) == kIOReturnSuccess
-        && isOnline != 0;
+    // In IOKit, an IOFramebuffer instance represents a single display pipe/connector,
+    // so its internal connection index is typically 0. Passing the card-level fbIndex
+    // (1, 2, 3...) causes getAttributeForConnection to return kIOReturnBadArgument.
+    // Query connection index 0 first, and fallback to fbIndex if connection 0 fails.
+    IOReturn onlineRet = fb->getAttributeForConnection(0, kConnectionEnable, &isOnline);
+    if (onlineRet != kIOReturnSuccess && fbIndex != 0) {
+        onlineRet = fb->getAttributeForConnection(static_cast<IOIndex>(fbIndex), kConnectionEnable, &isOnline);
+    }
+
+    bool online = (onlineRet == kIOReturnSuccess && isOnline != 0);
+
+    // Fallback guard for early-boot race conditions:
+    // If the kernel and WindowServer start quickly (e.g. SetApfsTrimTimeout=0, fast NVMe, non-verbose boot),
+    // WindowServer queries display status while asynchronous DCN/eDP link training is still settling.
+    // When CRT is enabled for the primary built-in display (fbIndex == 0), guarantee online status
+    // to prevent CoreDisplay from logging "Setting offline display 0x00000000 main" and aborting WindowServer.
+    if (!online && isCRTEnabled && fbIndex == 0) {
+        online = true;
+    }
+
+    fbInfo->isOnline = online;
 
     self->fedsParamInfo()[fbIndex].crtIndex = 0;
     self->fedsParamInfo()[fbIndex].scaledW  = 0;
@@ -967,6 +985,11 @@ bool X5000::fixedGetDisplayInfo(AMDRadeonX5000_AMDHWDisplay* const self, const U
             if (bytesPerPixel != 0) { fbInfo->pitch = displayState.pixelInfo.bytesPerRow / bytesPerPixel; }
             fbInfo->rect.width  = displayState.pixelInfo.activeWidth;
             fbInfo->rect.height = displayState.pixelInfo.activeHeight;
+
+            // If this framebuffer is actively driving a display mode with valid geometry, ensure it is marked online.
+            if (isCRTEnabled && fbInfo->rect.width > 0 && fbInfo->rect.height > 0) {
+                fbInfo->isOnline = true;
+            }
         }
 
         IODisplayModeInformation modeInfo;

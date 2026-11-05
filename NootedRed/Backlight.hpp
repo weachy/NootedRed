@@ -57,6 +57,8 @@ public:
 
     void init();
 
+    bool hasEmbeddedPanel() const { return embeddedPanelLink != nullptr; }
+
     void processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t slide, size_t size);
 
 private:
