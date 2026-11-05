@@ -31,8 +31,9 @@ static VDA moduleInstance;
 namespace
 {
 
-    const char* const kBootArgNoVDA  = "-NRedNoVDA";
-    const char* const kBootArgNoHEVC = "-NRedNoHEVC";
+    const char* const kBootArgNoVDA    = "-NRedNoVDA";
+    const char* const kBootArgNoHEVC   = "-NRedNoHEVC";
+    const char* const kBootArgNoHEVC10 = "-NRedNoHEVC10";
 
 }    // namespace
 
@@ -40,11 +41,13 @@ VDA& VDA::singleton() { return moduleInstance; }
 
 void VDA::init()
 {
-    const bool noVda  = checkKernelArgument(kBootArgNoVDA);
-    const bool noHevc = checkKernelArgument(kBootArgNoHEVC);
+    const bool noVda    = checkKernelArgument(kBootArgNoVDA);
+    const bool noHevc   = checkKernelArgument(kBootArgNoHEVC);
+    const bool noHevc10 = checkKernelArgument(kBootArgNoHEVC10);
 
-    this->enabled     = !noVda;
-    this->hevcAllowed = this->enabled && !noHevc;
+    this->enabled       = !noVda;
+    this->hevcAllowed   = this->enabled && !noHevc;
+    this->hevc10Allowed = this->hevcAllowed && !noHevc10;
 
     if (!this->enabled) {
         DBGLOG("VDA", "-NRedNoVDA active: all hardware video acceleration disabled (AVC + HEVC)");
@@ -55,7 +58,11 @@ void VDA::init()
         DBGLOG("VDA", "-NRedNoHEVC active: HEVC hardware encode/decode disabled; AVC hardware encode/decode enabled");
     }
     else {
-        DBGLOG("VDA", "Hardware video acceleration enabled by default: AVC + HEVC (8/10-bit decode, 8-bit encode)");
+        if (this->hevc10Allowed) {
+            DBGLOG("VDA", "Hardware video acceleration enabled: AVC + HEVC (8/10-bit decode, 8-bit encode)");
+        } else {
+            DBGLOG("VDA", "-NRedNoHEVC10 active: 10-bit HEVC decode disabled");
+        }
     }
 }
 
@@ -77,11 +84,14 @@ void VDA::processPatcher()
         NRed::singleton().setProp32("NRedVDAAVCOnly", 0);
         NRed::singleton().setProp32("NRedVDAHEVCEncodeAllowed", 0);
         NRed::singleton().setProp32("NRedVDAHEVCDecodeAllowed", 0);
+        NRed::singleton().setProp32("NRedVDAHEVC10Allowed", 0);
         NRed::singleton().setProp32("NRedVDAMediaEnabled", 0);
         return;
     }
 
-    const char* modeName = this->hevcAllowed ? "default (AVC + HEVC)" : "-NRedNoHEVC (AVC only)";
+    const char* modeName = this->hevcAllowed ?
+        (this->hevc10Allowed ? "default (AVC + HEVC 8/10-bit)" : "default (AVC + 8-bit HEVC)") :
+        "-NRedNoHEVC (AVC only)";
 
     // The bridge reports its own readiness under the VCN tag; VDA only publishes the requested profile and
     // generation here.  If the bridge fails, software decode stays in use.
@@ -92,6 +102,7 @@ void VDA::processPatcher()
     NRed::singleton().setProp32("NRedVDAAVCOnly", static_cast<UInt32>(!this->hevcAllowed));
     NRed::singleton().setProp32("NRedVDAHEVCEncodeAllowed", static_cast<UInt32>(this->hevcAllowed));
     NRed::singleton().setProp32("NRedVDAHEVCDecodeAllowed", static_cast<UInt32>(this->hevcAllowed));
+    NRed::singleton().setProp32("NRedVDAHEVC10Allowed", static_cast<UInt32>(this->hevc10Allowed));
     // The VCN bridge owns the effective enablement and updates this property after engine allocation.
     NRed::singleton().setProp32("NRedVDAMediaEnabled", 0);
     NRed::singleton().setProp32("NRedVCNGeneration", vcnGeneration);

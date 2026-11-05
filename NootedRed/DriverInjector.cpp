@@ -124,7 +124,8 @@ bool DriverInjector::wrapAddDrivers(void* const self, OSArray* const array, cons
                 else {
                     // 1. HEVC Decode policy:
                     // - If !isHEVCDecodeAllowed() (-NRedNoHEVC): strip IOGVAHEVCDecode and IOGVAHEVCDecodeCapabilities.
-                    // - Default: preserve full HEVC hardware decode (8-bit and 10-bit).
+                    // - If !isHEVC10Allowed() (-NRedNoHEVC10): strip Profile 2 and 3 so VideoToolbox cleanly stays on 8-bit.
+                    // - Default: preserve full native HEVC hardware decode (8-bit and 10-bit at Level 153).
                     if (!VDA::singleton().isHEVCDecodeAllowed()) {
                         for (UInt32 i = 0; i < count; ++i) {
                             auto* const pDict = OSDynamicCast(OSDictionary, driver.personalities->getObject(i));
@@ -139,8 +140,38 @@ bool DriverInjector::wrapAddDrivers(void* const self, OSArray* const array, cons
                         }
                         DBGLOG("DriverInjector", "-NRedNoHEVC active: stripped HEVC decode capabilities from %s", driver.identifier);
                     }
+                    else if (!VDA::singleton().isHEVC10Allowed()) {
+                        auto strip10Bit = [](OSDictionary* p) {
+                            if (p == nullptr) { return; }
+                            auto* const hevcCaps = OSDynamicCast(OSDictionary, p->getObject("IOGVAHEVCDecodeCapabilities"));
+                            if (hevcCaps == nullptr) { return; }
+                            auto* const details = OSDynamicCast(OSDictionary, hevcCaps->getObject("VTPerProfileDetails"));
+                            if (details != nullptr) {
+                                details->removeObject("2");
+                                details->removeObject("3");
+                            }
+                            auto* const profArray = OSArray::withCapacity(1);
+                            if (profArray != nullptr) {
+                                auto* const oneNum = OSNumber::withNumber(static_cast<unsigned long long>(1), 32);
+                                if (oneNum != nullptr) {
+                                    profArray->setObject(oneNum);
+                                    oneNum->release();
+                                }
+                                hevcCaps->setObject("VTSupportedProfileArray", profArray);
+                                profArray->release();
+                            }
+                        };
+
+                        for (UInt32 i = 0; i < count; ++i) {
+                            strip10Bit(OSDynamicCast(OSDictionary, driver.personalities->getObject(i)));
+                        }
+                        if (dict != nullptr) {
+                            strip10Bit(dict);
+                        }
+                        DBGLOG("DriverInjector", "-NRedNoHEVC10 active: stripped HEVC Profile 2/3 from %s", driver.identifier);
+                    }
                     else {
-                        DBGLOG("DriverInjector", "Full HEVC hardware decode (8-bit and 10-bit) enabled for %s", driver.identifier);
+                        DBGLOG("DriverInjector", "Full HEVC hardware decode (8-bit and 10-bit Main 10) enabled for %s", driver.identifier);
                     }
 
                     // 2. HEVC Encode policy:

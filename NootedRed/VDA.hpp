@@ -31,11 +31,12 @@ class VDA
 {
     bool enabled{true};
     bool hevcAllowed{true};
+    bool hevc10Allowed{true};
 
 public:
     static VDA& singleton();
 
-    // Parses -NRedNoVDA and -NRedNoHEVC boot arguments. Called from NRed::init().
+    // Parses -NRedNoVDA, -NRedNoHEVC, and -NRedNoHEVC10 boot arguments. Called from NRed::init().
     void init();
 
     // Resolves the running device profile and logs the media policy. Called from NRed::processPatcher().
@@ -51,6 +52,11 @@ public:
     // True when HEVC 8-bit hardware encode is allowed (default true, disabled by -NRedNoHEVC or -NRedNoVDA).
     bool isHEVCEncodeAllowed() const { return this->enabled && this->hevcAllowed; }
 
-    // True when HEVC hardware decode (8-bit and 10-bit) is allowed (default true, disabled by -NRedNoHEVC or -NRedNoVDA).
+    // True when HEVC hardware decode (8-bit) is allowed (default true, disabled by -NRedNoHEVC or -NRedNoVDA).
     bool isHEVCDecodeAllowed() const { return this->enabled && this->hevcAllowed; }
+
+    // True when HEVC 10-bit (Profile 2 / Main 10) hardware decode is allowed.
+    // Default true: AMD VCN 2.2 fully supports 10-bit HEVC decode via AMDRadeonVADriver2.
+    // Can be disabled with -NRedNoHEVC10 if explicitly desired.
+    bool isHEVC10Allowed() const { return this->enabled && this->hevcAllowed && this->hevc10Allowed; }
 };
