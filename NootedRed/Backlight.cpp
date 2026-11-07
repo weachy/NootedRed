@@ -218,7 +218,9 @@ IOReturn Backlight::wrapGetAttributeForConnection(IOService* framebuffer, IOInde
     }
 
     if (attribute == kConnectionEnable && connectIndex == 0 && (ret != kIOReturnSuccess || (value != nullptr && *value == 0))) {
-        if (singleton().embeddedPanelLink != nullptr) {
+        const char* const loc = framebuffer != nullptr ? framebuffer->getLocation() : nullptr;
+        const bool isFB0      = (loc == nullptr || (loc[0] == '0' && loc[1] == '\0'));
+        if (isFB0 && singleton().embeddedPanelLink != nullptr) {
             // Early boot race condition on laptops with internal eDP panels:
             // When WindowServer starts rapidly (e.g. SetApfsTrimTimeout=0, fast NVMe, non-verbose boot),
             // WindowServer queries kConnectionEnable while asynchronous eDP link training is still settling.
