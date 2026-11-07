@@ -37,12 +37,6 @@
 
 static UserPatches moduleInstance;
 
-extern "C" {
-    int proc_pid(proc_t);
-    void proc_name(int, char*, int);
-    proc_t current_proc(void);
-}
-
 namespace
 {
 
@@ -54,15 +48,6 @@ namespace
     const char* const kBootArgGLFixNoResolve   = "-NRedGLFixNoResolve";
     const char* const kBootArgNoVDA            = "-NRedNoVDA";
     const char* const kBootArgNoHEVC           = "-NRedNoHEVC";
-
-    bool isFairPlayClient(const task_t task)
-    {
-        if (task == nullptr) { return false; }
-        auto* entitlement = IOUserClient::copyClientEntitlement(task, "com.apple.private.fpsd.client");
-        const bool client = (entitlement == kOSBooleanTrue);
-        if (entitlement != nullptr) { entitlement->release(); }
-        return client;
-    }
 
     // The patch bytes and page images below are specific to one driver build, and the native backend hooks
     // code signing page validation. Enabled by default; pass -NRedNoGLFix to opt out.
@@ -509,23 +494,12 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
 
     const auto* const bytes = static_cast<const UInt8*>(data);
 
-    // Compositor isolation: WindowServer and loginwindow NEVER decode video via VDA.
-    // Explicitly bypass VDA / AppleGVA signature scanning for compositor processes
-    // so they are never touched by short signatures, while ensuring Metal patches below still apply.
-    bool skipVDA = false;
-    if (isSharedCache) {
-        proc_t proc = current_proc();
-        int pid = proc != nullptr ? proc_pid(proc) : 0;
-        char procName[32]{};
-        if (pid > 0) { proc_name(pid, procName, sizeof(procName)); }
-        if (strcmp(procName, "WindowServer") == 0 || strcmp(procName, "loginwindow") == 0) {
-            skipVDA = true;
-        }
-    }
-
     // VDA Dynamic Resolver path (AMDRadeonVADriver2: embedded in dyld_shared_cache or loose bundle)
-    if (!skipVDA && (isVADriver || isSharedCache) && this->vdaEnabled && this->vdaSignatures != nullptr && this->vdaSignatureCount > 0) {
-        if (VCNBridge::singleton().loadReady() && !isFairPlayClient(current_task())) {
+    // Note: _cs_validate_page is invoked by XNU only once per physical page when the page enters the
+    // global shared-cache vm_object. Do not gate on per-process identity (e.g. WindowServer or BootCache)
+    // or accelerator start timing, as skipping a page during its first fault caches it unpatched globally.
+    if ((isVADriver || isSharedCache) && this->vdaEnabled && this->vdaSignatures != nullptr && this->vdaSignatureCount > 0) {
+        {
             bool vdaAllApplied = true;
             for (size_t i = 0; i < this->vdaSignatureCount && i < kMaxVDASignatures; ++i) {
                 if (this->vdaSignatureApplied[i] < this->vdaSignatures[i].count) {
@@ -580,9 +554,9 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     }
 
     // AppleGVA Dynamic Resolver path (embedded in dyld_shared_cache or standalone AppleGVA bundle)
-    if (!skipVDA && (isAppleGVA || isSharedCache) && this->vdaEnabled && this->gvaSignature != nullptr &&
+    if ((isAppleGVA || isSharedCache) && this->vdaEnabled && this->gvaSignature != nullptr &&
         this->gvaSignatureApplied < this->gvaSignature->count) {
-        if (!isFairPlayClient(current_task())) {
+        {
             size_t matchOffset = 0;
             if (matchSignature(bytes, *this->gvaSignature, matchOffset)) {
                 if (matchOffset + this->gvaSignature->patchOffset + this->gvaSignature->replaceSize <= kPageSize) {

@@ -34,7 +34,9 @@ namespace
     static const UInt8 kVDAFind_AddrLibInit[]    = {0x41, 0x81, 0xFC, 0x8D, 0x00, 0x00, 0x00};
     static const UInt8 kVDAReplace_AddrLibInit[] = {0x41, 0x81, 0xFC, 0x8E, 0x00, 0x00, 0x00};
 
-    // 3. AddrLibCreateVegaToRV: Addr::Lib::Create -> accept family 0x8E and take Addr::Gfx9HwlInit
+    // 3. AddrLibCreateVegaToRV: Addr::Lib::Create -> accept both 0x8D (Metal drivers) and 0x8E (VA drivers)
+    // `cmp eax, 0x8d` (3D 8D 00 00 00) -> `cmp eax, eax; nop; nop; nop` (39 C0 90 90 90) so ZF=1 for both
+    // 0x8D (AMDRadeonX5000MTLDriver/AMDMTLBronzeDriver/AMDRadeonX6000MTLDriver) and 0x8E (AMDRadeonVADriver2).
     static const UInt8 kVDACtx_AddrLibCreate[] = {
         0x74, 0x21, 0x3D, 0x8D, 0x00, 0x00, 0x00, 0x0F, 0x85, 0x00, 0x00, 0x00, 0x00
     };
@@ -42,9 +44,10 @@ namespace
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00
     };
     static const UInt8 kVDAFind_AddrLibCreate[]    = {0x3D, 0x8D, 0x00, 0x00, 0x00};
-    static const UInt8 kVDAReplace_AddrLibCreate[] = {0x3D, 0x8E, 0x00, 0x00, 0x00};
+    static const UInt8 kVDAReplace_AddrLibCreate[] = {0x39, 0xC0, 0x90, 0x90, 0x90};
 
-    // 4a. Gfx9ConvertChipFamilyVegaToRV (Ventura): configure 0x8E via Gfx9 (26 bytes)
+    // 4a. Gfx9ConvertChipFamilyVegaToRV (Ventura): accept both 0x8D and 0x8E via Gfx9 (26 bytes)
+    // `cmp esi, 0x8d` (81 FE 8D 00 00 00) -> `cmp esi, esi; nop; nop; nop; nop` (39 F6 90 90 90 90)
     static const UInt8 kVDACtx_ConvertFamily_Ventura[] = {
         0x81, 0xFE, 0x8D, 0x00, 0x00, 0x00, 0x0F, 0x85, 0x00, 0x01, 0x00, 0x00,
         0x4C, 0x8D, 0x8F, 0x10, 0x5B, 0x00, 0x00, 0x44, 0x8B, 0x97, 0x18, 0x5B, 0x00, 0x00
@@ -54,7 +57,7 @@ namespace
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
     };
     static const UInt8 kVDAFind_ConvertFamily[]    = {0x81, 0xFE, 0x8D, 0x00, 0x00, 0x00};
-    static const UInt8 kVDAReplace_ConvertFamily[] = {0x81, 0xFE, 0x8E, 0x00, 0x00, 0x00};
+    static const UInt8 kVDAReplace_ConvertFamily[] = {0x39, 0xF6, 0x90, 0x90, 0x90, 0x90};
 
     // 4b. Gfx9ConvertChipFamilyVegaToRV (Modern): configure 0x8E via Gfx9 (22 bytes)
     static const UInt8 kVDACtx_ConvertFamily_Modern[] = {
@@ -175,31 +178,31 @@ namespace
     // Resolver table for macOS 13 (Ventura)
     static const UserPatches::SignaturePatch kVDAResolverSignatures_Ventura[] = {
         {kVDACtx_Identify, kVDAMask_Identify, sizeof(kVDACtx_Identify), 17,
-         kVDAReplace_Identify, sizeof(kVDAReplace_Identify), 0, 1, ~0ULL,
+         kVDAReplace_Identify, sizeof(kVDAReplace_Identify), 0, 2, ~0ULL,
          kVDAFind_Identify, sizeof(kVDAFind_Identify)},
         {kVDACtx_AddrLibInit, kVDAMask_AddrLibInit, sizeof(kVDACtx_AddrLibInit), 9,
-         kVDAReplace_AddrLibInit, sizeof(kVDAReplace_AddrLibInit), 0, 1, ~0ULL,
+         kVDAReplace_AddrLibInit, sizeof(kVDAReplace_AddrLibInit), 0, 2, ~0ULL,
          kVDAFind_AddrLibInit, sizeof(kVDAFind_AddrLibInit)},
         {kVDACtx_AddrLibCreate, kVDAMask_AddrLibCreate, sizeof(kVDACtx_AddrLibCreate), 2,
-         kVDAReplace_AddrLibCreate, sizeof(kVDAReplace_AddrLibCreate), 0, 1, ~0ULL,
+         kVDAReplace_AddrLibCreate, sizeof(kVDAReplace_AddrLibCreate), 0, 5, ~0ULL,
          kVDAFind_AddrLibCreate, sizeof(kVDAFind_AddrLibCreate)},
         {kVDACtx_ConvertFamily_Ventura, kVDAMask_ConvertFamily_Ventura, sizeof(kVDACtx_ConvertFamily_Ventura), 0,
-         kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 1, ~0ULL,
+         kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 5, ~0ULL,
          kVDAFind_ConvertFamily, sizeof(kVDAFind_ConvertFamily)},
         {kVDACtx_EngineAndBlt, kVDAMask_EngineAndBlt, sizeof(kVDACtx_EngineAndBlt), 0,
-         kVDAReplace_EngineAndBlt, sizeof(kVDAReplace_EngineAndBlt), 0, 2, ~0ULL,
+         kVDAReplace_EngineAndBlt, sizeof(kVDAReplace_EngineAndBlt), 0, 4, ~0ULL,
          kVDAFind_EngineAndBlt, sizeof(kVDAFind_EngineAndBlt)},
         {kVDACtx_VideoProcessors, kVDAMask_VideoProcessors, sizeof(kVDACtx_VideoProcessors), 7,
-         kVDAReplace_VideoProcessors, sizeof(kVDAReplace_VideoProcessors), 0, 3, ~0ULL,
+         kVDAReplace_VideoProcessors, sizeof(kVDAReplace_VideoProcessors), 0, 6, ~0ULL,
          kVDAFind_VideoProcessors, sizeof(kVDAFind_VideoProcessors)},
         {kVDACtx_EncFeedbackStride, kVDAMask_EncFeedbackStride, sizeof(kVDACtx_EncFeedbackStride), 4,
-         kVDAReplace_EncFeedbackStride, sizeof(kVDAReplace_EncFeedbackStride), 0, 1, ~0ULL,
+         kVDAReplace_EncFeedbackStride, sizeof(kVDAReplace_EncFeedbackStride), 0, 2, ~0ULL,
          kVDAFind_EncFeedbackStride, sizeof(kVDAFind_EncFeedbackStride)},
         {kVDACtx_StatusStride_Ventura, kVDAMask_StatusStride_Ventura, sizeof(kVDACtx_StatusStride_Ventura), 3,
-         kVDAReplace_StatusStride_Ventura, sizeof(kVDAReplace_StatusStride_Ventura), 0, 2, ~0ULL,
+         kVDAReplace_StatusStride_Ventura, sizeof(kVDAReplace_StatusStride_Ventura), 0, 4, ~0ULL,
          kVDAFind_StatusStride_Ventura, sizeof(kVDAFind_StatusStride_Ventura)},
         {kVDACtx_SourcePitch, kVDAMask_SourcePitch, sizeof(kVDACtx_SourcePitch), 0,
-         kVDAReplace_SourcePitch, sizeof(kVDAReplace_SourcePitch), 0, 1, ~0ULL,
+         kVDAReplace_SourcePitch, sizeof(kVDAReplace_SourcePitch), 0, 4, ~0ULL,
          kVDAFind_SourcePitch, sizeof(kVDAFind_SourcePitch)},
     };
     constexpr size_t kVDAResolverSignatureCount_Ventura = arrsize(kVDAResolverSignatures_Ventura);
@@ -207,34 +210,34 @@ namespace
     // Resolver table for macOS 14 (Sonoma)
     static const UserPatches::SignaturePatch kVDAResolverSignatures_Sonoma[] = {
         {kVDACtx_Identify, kVDAMask_Identify, sizeof(kVDACtx_Identify), 17,
-         kVDAReplace_Identify, sizeof(kVDAReplace_Identify), 0, 1, ~0ULL,
+         kVDAReplace_Identify, sizeof(kVDAReplace_Identify), 0, 2, ~0ULL,
          kVDAFind_Identify, sizeof(kVDAFind_Identify)},
         {kVDACtx_AddrLibInit, kVDAMask_AddrLibInit, sizeof(kVDACtx_AddrLibInit), 9,
-         kVDAReplace_AddrLibInit, sizeof(kVDAReplace_AddrLibInit), 0, 1, ~0ULL,
+         kVDAReplace_AddrLibInit, sizeof(kVDAReplace_AddrLibInit), 0, 2, ~0ULL,
          kVDAFind_AddrLibInit, sizeof(kVDAFind_AddrLibInit)},
         {kVDACtx_AddrLibCreate, kVDAMask_AddrLibCreate, sizeof(kVDACtx_AddrLibCreate), 2,
-         kVDAReplace_AddrLibCreate, sizeof(kVDAReplace_AddrLibCreate), 0, 1, ~0ULL,
+         kVDAReplace_AddrLibCreate, sizeof(kVDAReplace_AddrLibCreate), 0, 5, ~0ULL,
          kVDAFind_AddrLibCreate, sizeof(kVDAFind_AddrLibCreate)},
         {kVDACtx_ConvertFamily_Modern, kVDAMask_ConvertFamily_Modern, sizeof(kVDACtx_ConvertFamily_Modern), 0,
-         kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 1, ~0ULL,
+         kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 5, ~0ULL,
          kVDAFind_ConvertFamily, sizeof(kVDAFind_ConvertFamily)},
         {kVDACtx_ConvertFamily_Ventura, kVDAMask_ConvertFamily_Ventura, sizeof(kVDACtx_ConvertFamily_Ventura), 0,
-         kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 1, ~0ULL,
+         kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 5, ~0ULL,
          kVDAFind_ConvertFamily, sizeof(kVDAFind_ConvertFamily)},
         {kVDACtx_EngineAndBlt, kVDAMask_EngineAndBlt, sizeof(kVDACtx_EngineAndBlt), 0,
-         kVDAReplace_EngineAndBlt, sizeof(kVDAReplace_EngineAndBlt), 0, 2, ~0ULL,
+         kVDAReplace_EngineAndBlt, sizeof(kVDAReplace_EngineAndBlt), 0, 4, ~0ULL,
          kVDAFind_EngineAndBlt, sizeof(kVDAFind_EngineAndBlt)},
         {kVDACtx_VideoProcessors, kVDAMask_VideoProcessors, sizeof(kVDACtx_VideoProcessors), 7,
-         kVDAReplace_VideoProcessors, sizeof(kVDAReplace_VideoProcessors), 0, 3, ~0ULL,
+         kVDAReplace_VideoProcessors, sizeof(kVDAReplace_VideoProcessors), 0, 6, ~0ULL,
          kVDAFind_VideoProcessors, sizeof(kVDAFind_VideoProcessors)},
         {kVDACtx_EncFeedbackStride, kVDAMask_EncFeedbackStride, sizeof(kVDACtx_EncFeedbackStride), 4,
-         kVDAReplace_EncFeedbackStride, sizeof(kVDAReplace_EncFeedbackStride), 0, 1, ~0ULL,
+         kVDAReplace_EncFeedbackStride, sizeof(kVDAReplace_EncFeedbackStride), 0, 2, ~0ULL,
          kVDAFind_EncFeedbackStride, sizeof(kVDAFind_EncFeedbackStride)},
         {kVDACtx_StatusStride_Modern, kVDAMask_StatusStride_Modern, sizeof(kVDACtx_StatusStride_Modern), 3,
-         kVDAReplace_StatusStride_Modern, sizeof(kVDAReplace_StatusStride_Modern), 0, 2, ~0ULL,
+         kVDAReplace_StatusStride_Modern, sizeof(kVDAReplace_StatusStride_Modern), 0, 4, ~0ULL,
          kVDAFind_StatusStride_Modern, sizeof(kVDAFind_StatusStride_Modern)},
         {kVDACtx_SourcePitch, kVDAMask_SourcePitch, sizeof(kVDACtx_SourcePitch), 0,
-         kVDAReplace_SourcePitch, sizeof(kVDAReplace_SourcePitch), 0, 1, ~0ULL,
+         kVDAReplace_SourcePitch, sizeof(kVDAReplace_SourcePitch), 0, 4, ~0ULL,
          kVDAFind_SourcePitch, sizeof(kVDAFind_SourcePitch)},
     };
     constexpr size_t kVDAResolverSignatureCount_Sonoma = arrsize(kVDAResolverSignatures_Sonoma);
@@ -242,34 +245,34 @@ namespace
     // Resolver table for modern macOS (15 Sequoia, 26 Tahoe)
     static const UserPatches::SignaturePatch kVDAResolverSignatures_Modern[] = {
         {kVDACtx_Identify, kVDAMask_Identify, sizeof(kVDACtx_Identify), 17,
-         kVDAReplace_Identify, sizeof(kVDAReplace_Identify), 0, 1, ~0ULL,
+         kVDAReplace_Identify, sizeof(kVDAReplace_Identify), 0, 2, ~0ULL,
          kVDAFind_Identify, sizeof(kVDAFind_Identify)},
         {kVDACtx_AddrLibInit, kVDAMask_AddrLibInit, sizeof(kVDACtx_AddrLibInit), 9,
-         kVDAReplace_AddrLibInit, sizeof(kVDAReplace_AddrLibInit), 0, 1, ~0ULL,
+         kVDAReplace_AddrLibInit, sizeof(kVDAReplace_AddrLibInit), 0, 2, ~0ULL,
          kVDAFind_AddrLibInit, sizeof(kVDAFind_AddrLibInit)},
         {kVDACtx_AddrLibCreate, kVDAMask_AddrLibCreate, sizeof(kVDACtx_AddrLibCreate), 2,
-         kVDAReplace_AddrLibCreate, sizeof(kVDAReplace_AddrLibCreate), 0, 1, ~0ULL,
+         kVDAReplace_AddrLibCreate, sizeof(kVDAReplace_AddrLibCreate), 0, 5, ~0ULL,
          kVDAFind_AddrLibCreate, sizeof(kVDAFind_AddrLibCreate)},
         {kVDACtx_ConvertFamily_Modern, kVDAMask_ConvertFamily_Modern, sizeof(kVDACtx_ConvertFamily_Modern), 0,
-         kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 1, ~0ULL,
+         kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 5, ~0ULL,
          kVDAFind_ConvertFamily, sizeof(kVDAFind_ConvertFamily)},
         {kVDACtx_ConvertFamily_Ventura, kVDAMask_ConvertFamily_Ventura, sizeof(kVDACtx_ConvertFamily_Ventura), 0,
-         kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 1, ~0ULL,
+         kVDAReplace_ConvertFamily, sizeof(kVDAReplace_ConvertFamily), 0, 5, ~0ULL,
          kVDAFind_ConvertFamily, sizeof(kVDAFind_ConvertFamily)},
         {kVDACtx_EngineAndBlt, kVDAMask_EngineAndBlt, sizeof(kVDACtx_EngineAndBlt), 0,
-         kVDAReplace_EngineAndBlt, sizeof(kVDAReplace_EngineAndBlt), 0, 2, ~0ULL,
+         kVDAReplace_EngineAndBlt, sizeof(kVDAReplace_EngineAndBlt), 0, 4, ~0ULL,
          kVDAFind_EngineAndBlt, sizeof(kVDAFind_EngineAndBlt)},
         {kVDACtx_VideoProcessors, kVDAMask_VideoProcessors, sizeof(kVDACtx_VideoProcessors), 7,
-         kVDAReplace_VideoProcessors, sizeof(kVDAReplace_VideoProcessors), 0, 3, ~0ULL,
+         kVDAReplace_VideoProcessors, sizeof(kVDAReplace_VideoProcessors), 0, 6, ~0ULL,
          kVDAFind_VideoProcessors, sizeof(kVDAFind_VideoProcessors)},
         {kVDACtx_EncFeedbackStride, kVDAMask_EncFeedbackStride, sizeof(kVDACtx_EncFeedbackStride), 4,
-         kVDAReplace_EncFeedbackStride, sizeof(kVDAReplace_EncFeedbackStride), 0, 1, ~0ULL,
+         kVDAReplace_EncFeedbackStride, sizeof(kVDAReplace_EncFeedbackStride), 0, 2, ~0ULL,
          kVDAFind_EncFeedbackStride, sizeof(kVDAFind_EncFeedbackStride)},
         {kVDACtx_StatusStride_Modern, kVDAMask_StatusStride_Modern, sizeof(kVDACtx_StatusStride_Modern), 3,
-         kVDAReplace_StatusStride_Modern, sizeof(kVDAReplace_StatusStride_Modern), 0, 2, ~0ULL,
+         kVDAReplace_StatusStride_Modern, sizeof(kVDAReplace_StatusStride_Modern), 0, 4, ~0ULL,
          kVDAFind_StatusStride_Modern, sizeof(kVDAFind_StatusStride_Modern)},
         {kVDACtx_SourcePitch_Modern, kVDAMask_SourcePitch_Modern, sizeof(kVDACtx_SourcePitch_Modern), 0,
-         kVDAReplace_SourcePitch_Modern, sizeof(kVDAReplace_SourcePitch_Modern), 0, 1, ~0ULL,
+         kVDAReplace_SourcePitch_Modern, sizeof(kVDAReplace_SourcePitch_Modern), 0, 4, ~0ULL,
          kVDAFind_SourcePitch_Modern, sizeof(kVDAFind_SourcePitch_Modern)},
     };
     constexpr size_t kVDAResolverSignatureCount_Modern = arrsize(kVDAResolverSignatures_Modern);
