@@ -64,7 +64,6 @@ class VCNBridge
     mach_vm_address_t orgSurfaceCopy{0};
     mach_vm_address_t orgInitHardware{0};
     mach_vm_address_t orgSafeMetaCast{0};
-    mach_vm_address_t orgTaskFreeAllGPUMappings{0};
 
     mach_vm_address_t newVideo6000{0};
     mach_vm_address_t createSML6000{0};
@@ -72,9 +71,6 @@ class VCNBridge
     mach_vm_address_t clientStop5000{0};
     mach_vm_address_t surfaceCopy5000{0};
     mach_vm_address_t notifyGfxAccess{0};
-    mach_vm_address_t vcnIsIdle{0};
-    mach_vm_address_t vcnWaitForIdle{0};
-    void*             vcnEngine{nullptr};
 
     OSMetaClass* engineMC{nullptr};
     OSMetaClass* sharedMC{nullptr};
@@ -116,10 +112,8 @@ private:
     static void*         createSML(UInt32 configuration);
     static bool          clientStart(void* self, void* provider);
     static void          clientStop(void* self, void* provider);
-    static void          taskFreeAllGPUMappings(void* self);
     static UInt64        surfaceCopy(void* self, void* input, UInt64 size, void* event);
     static void          signalWork(void* hardware);
     static bool          initHardware(void* self, UInt32 channel);
-    void                 drainVCN(const char* reason);
     static OSMetaClassBase* safeMetaCast(const OSMetaClassBase* object, const OSMetaClass* target);
 };

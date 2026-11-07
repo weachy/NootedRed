@@ -251,7 +251,6 @@ void* VCNBridge::allocateEngine(void* const hardware)
     this->hardwareHandle = hardware;
     auto* const engine   = this->engineMC->alloc();
     this->engineAllocated = engine != nullptr;
-    this->vcnEngine       = this->engineAllocated ? engine : nullptr;
 
     NRed::singleton().setProp32("NRedVCNEngineAllocated", static_cast<UInt32>(this->engineAllocated));
     NRed::singleton().setProp32("NRedVDAMediaEnabled", static_cast<UInt32>(this->engineAllocated));
@@ -333,8 +332,6 @@ bool VCNBridge::acceleratorStart(void* const self, IOService* const provider)
 void VCNBridge::acceleratorStop(void* const self, IOService* const provider)
 {
     auto& bridge = singleton();
-    bridge.drainVCN("accelerator stop");
-
     FunctionCast(acceleratorStop, bridge.orgAcceleratorStop)(self, provider);
 
     // The accelerator is going away; drop all engine/accelerator state without touching the hardware
@@ -342,7 +339,6 @@ void VCNBridge::acceleratorStop(void* const self, IOService* const provider)
     // allocate a fresh engine.
     bridge.engineAllocated = false;
     bridge.hardwareHandle  = nullptr;
-    bridge.vcnEngine       = nullptr;
 
     NRed::singleton().setProp32("NRedVCNEngineAllocated", 0);
     NRed::singleton().setProp32("NRedVDAMediaEnabled", 0);
@@ -397,65 +393,8 @@ bool VCNBridge::clientStart(void* const self, void* const provider)
 void VCNBridge::clientStop(void* const self, void* const provider)
 {
     auto& bridge = singleton();
-    bridge.drainVCN("client stop");
-
     const auto address = bridge.engineEnabled() ? bridge.clientStop5000 : bridge.orgClientStop;
     reinterpret_cast<void (*)(void*, void*)>(address)(self, provider);
-}
-
-void VCNBridge::taskFreeAllGPUMappings(void* const self)
-{
-    auto& bridge = singleton();
-    bridge.drainVCN("task freeAllGPUMappings");
-
-    FunctionCast(taskFreeAllGPUMappings, bridge.orgTaskFreeAllGPUMappings)(self);
-}
-
-void VCNBridge::drainVCN(const char* const reason)
-{
-    auto& bridge = singleton();
-    if (!bridge.engineEnabled() || bridge.vcnEngine == nullptr) { return; }
-
-    bool idle = false;
-
-    if (bridge.vcnIsIdle != 0) {
-        const auto isIdle = reinterpret_cast<bool (*)(void*)>(bridge.vcnIsIdle);
-
-        // 1. Instant check: 0 overhead if hardware is already idle (covers >90% of normal stops).
-        if (isIdle(bridge.vcnEngine)) {
-            return;
-        }
-
-        // 2. Microsecond adaptive spin: video decoders typically finish the active slice/macroblock
-        // in < 500us. Spin in small chunks without thread sleeping to avoid client watchdog timeouts.
-        constexpr UInt32 kMicroSpinLimitUs = 1000;
-        constexpr UInt32 kMicroStepUs      = 50;
-        for (UInt32 us = 0; us < kMicroSpinLimitUs; us += kMicroStepUs) {
-            IODelay(kMicroStepUs);
-            if (isIdle(bridge.vcnEngine)) {
-                return;
-            }
-        }
-
-        // 3. Millisecond sleep fallback for rare multi-slice or heavy frame teardowns (bounded to 50ms).
-        constexpr UInt32 kDrainTimeoutMs = 50;
-        constexpr UInt32 kDrainStepMs    = 2;
-        UInt32 waited = 0;
-        for (; waited < kDrainTimeoutMs; waited += kDrainStepMs) {
-            IOSleep(kDrainStepMs);
-            if (isIdle(bridge.vcnEngine)) {
-                idle = true;
-                break;
-            }
-        }
-
-        if (!idle) {
-            DBGLOG("VCN", "VCN engine still busy after %u ms at %s; teardown continues", waited, reason);
-        }
-    }
-    else if (bridge.vcnWaitForIdle != 0) {
-        reinterpret_cast<void (*)(void*, UInt32)>(bridge.vcnWaitForIdle)(bridge.vcnEngine, 50);
-    }
 }
 
 UInt64 VCNBridge::surfaceCopy(void* const self, void* const input, const UInt64 size, void* const event)
@@ -621,26 +560,6 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
             return;
         }
 
-        // Teardown protection: drain VCN before AMDRadeonX5000_AMDAccelTask destroys GPU page tables
-        // during process exit or client termination, preventing VM Protection Faults (NACK) on in-flight writes.
-        if (resolve(patcher, id, "__ZN27AMDRadeonX5000_AMDAccelTask18freeAllGPUMappingsEv",
-                    this->orgTaskFreeAllGPUMappings, slide, size)) {
-            KernelPatcher::RouteRequest taskRoute{
-                "__ZN27AMDRadeonX5000_AMDAccelTask18freeAllGPUMappingsEv",
-                taskFreeAllGPUMappings,
-                this->orgTaskFreeAllGPUMappings
-            };
-            if (!patcher.routeMultiple(id, &taskRoute, 1, slide, size)) {
-                patcher.clearError();
-                SYSLOG("VCN", "Failed to route AMDRadeonX5000_AMDAccelTask::freeAllGPUMappings");
-            } else {
-                DBGLOG("VCN", "Routed AMDRadeonX5000_AMDAccelTask::freeAllGPUMappings for VCN teardown drain");
-            }
-        } else {
-            patcher.clearError();
-            SYSLOG("VCN", "AMDRadeonX5000_AMDAccelTask::freeAllGPUMappings not found");
-        }
-
         this->x5000Prepared = true;
         NRed::singleton().setProp32("NRedVCNX5000ABIValidated", 1);
         publishStage(4);
@@ -676,11 +595,6 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
                       this->newVideo6000, slide, size);
         ok &= resolve(patcher, id, "__ZN31AMDRadeonX6000_IAMDSMLInterface18createSMLInterfaceEj",
                       this->createSML6000, slide, size);
-
-        // Teardown drain entry points (best-effort; if not available, drain becomes safe no-op)
-        resolve(patcher, id, "__ZN30AMDRadeonX6000_AMDVCN2HWEngine6isIdleEv", this->vcnIsIdle, slide, size);
-        resolve(patcher, id, "__ZN26AMDRadeonX6000_AMDHWEngine11waitForIdleEj", this->vcnWaitForIdle, slide, size);
-
 
         static const char* const kPairs[] = {
             "__ZN37AMDRadeonX6000_AMDGraphicsAccelerator10gMetaClassE",
