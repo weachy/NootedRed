@@ -59,6 +59,7 @@ class X5000
     mach_vm_address_t              orgPM4SubmitCommandBuffer{0};
     mach_vm_address_t              orgAllocateLargeBlocks{0};
     mach_vm_address_t              orgRTHardwareDidStart{0};
+    mach_vm_address_t              orgTaskFreeAllGPUMappings{0};
     UInt32                         gfxOffSupportedOffset{0x206b8};
     void                           (*notifyGfxAccess)(void*){nullptr};
     UInt64                         (*orgTotalFreeMemory)(void*){nullptr};
@@ -92,6 +93,8 @@ private:
     static void*  wrapObtainAccelChannelGroup1304(void* self, UInt32 priority, void* task);
     static UInt32 wrapHwlConvertChipFamily(void* self, UInt32 family, UInt32 revision);
     static UInt32 computeSubmitCommandBuffer(void* self, void* info);
+    static void   wrapTaskFreeAllGPUMappings(void* self);
+    static void   drainTask(void* task);
     static bool   fixedGetDisplayInfo(AMDRadeonX5000_AMDHWDisplay* self, UInt32 fbIndex, bool isCRTEnabled,
                                       bool ignoreCRTOffsetCheck, IOFramebuffer* fb, FramebufferInfo* fbInfo);
     static void   fixedGetSurfaceInfo(AMDRadeonX5000_AMDHWAlignManager* self, AMD_SURFACE_INFO_STRUCT* pStruct);
