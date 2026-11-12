@@ -163,6 +163,7 @@ private:
     size_t                vdaSignatureApplied[kMaxVDASignatures]{};
     const SignaturePatch* gvaSignature{nullptr};
     size_t                gvaSignatureApplied{0};
+    bool                  mtlHwInfoApplied{false};
     bool                  resolverEnabled{false};
     bool                  resolverOnly{false};
 

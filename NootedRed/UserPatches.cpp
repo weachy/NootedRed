@@ -365,6 +365,7 @@ void UserPatches::selectPatchSet()
         this->signatureCount = kResolverSignatureCount_Ventura;
     }
     for (auto& applied : this->signatureApplied) { applied = 0; }
+    this->mtlHwInfoApplied = false;
 }
 
 void UserPatches::processPatcher(KernelPatcher& patcher)
@@ -583,7 +584,7 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
         return;
     }
 
-    bool allApplied = true;
+    bool allApplied = this->mtlHwInfoApplied;
     for (size_t i = 0; i < this->signatureCount && i < kMaxSignatures; ++i) {
         if (this->signatureApplied[i] < this->signatures[i].count) {
             allApplied = false;
@@ -622,6 +623,36 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
             }
         }
     } else if (isSharedCache) {
+        // Gate 2.5: Metal HwInfo patch in dyld shared cache.
+        // AMDRadeonX5000MTLDriver lives inside dyld shared cache. We must patch
+        // gfx9_HwInfoInitData so numShaderEngines is 1 instead of 4, preventing
+        // VideoToolbox / QuickLook compute wavefront hangs on AMD APUs.
+        if (this->signatureCount > 0 && !this->mtlHwInfoApplied) {
+            const auto& hwSig = this->signatures[0];
+            size_t matchOffset = 0;
+            if (matchSignature(bytes, hwSig, matchOffset)) {
+                if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
+                    // In gfx9_HwInfoInitData, all 3 ASIC branches for Vega (r8d <= 0x13, <= 0x27, <= 0x31)
+                    // lie within this exact same 4KB page. Replace all 3 occurrences of movl $4, 0x78(%rdi)
+                    // with movl $1, 0x78(%rdi).
+                    size_t replacedCount = 0;
+                    for (size_t off = 0; off + sizeof(kGLDriverHwInfoFind) <= kPageSize; ++off) {
+                        if (memcmp(bytes + off, kGLDriverHwInfoFind, sizeof(kGLDriverHwInfoFind)) == 0) {
+                            memcpy(const_cast<UInt8*>(bytes) + off, kGLDriverHwInfoReplace, sizeof(kGLDriverHwInfoReplace));
+                            replacedCount++;
+                        }
+                    }
+                    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+                    this->mtlHwInfoApplied = true;
+                    NRed::singleton().setProp32("NRedMTLHwInfoApplied", static_cast<UInt32>(replacedCount));
+                    SYSLOG("UserPatch", "Resolver patched Metal HwInfo (%zu branches 4->1) at page match 0x%zX",
+                           replacedCount, matchOffset);
+                } else {
+                    SYSLOG("UserPatch", "Resolver: failed to disable kernel write protection (Metal HwInfo)");
+                }
+            }
+        }
+
         // Gate 3: For Metal signatures in dyld shared cache, require co-occurrence of Gate and Allow
         // on the exact same 4KB page, within a sane relative distance (< 0x500 bytes).
         // Signatures index 2 & 3 in all tables (Sonoma, Sequoia, Tahoe) represent the Gate and Allow pair.
