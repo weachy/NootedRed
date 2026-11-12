@@ -306,7 +306,7 @@ X5000::X5000()
             this->hasGetAllClockLimitsField  = 0xBE;
             this->dccDisplayableSupportField = 0xC0;
             this->hwChannelHWInterfaceField  = 0x20;
-            if (currentKernelVersion() >= MACOS_14_4) { this->hwChannelSubmitCommandBuffer = 0x188; }
+            if (currentKernelVersion() >= MACOS_14_4) { this->hwChannelSubmitCommandBuffer = 0x198; }
             else {
                 this->hwChannelSubmitCommandBuffer = 0x190;
             }
@@ -322,7 +322,8 @@ void X5000::processKext(KernelPatcher& patcher, const size_t id, const mach_vm_a
 
     UInt32*           orgChannelTypes;
     mach_vm_address_t orgStartHWEngines;
-    void*             pm4ComputeChannelVT;
+    void*             pm4ComputeChannelVT = nullptr;
+    void*             pm4GfxChannelVT     = nullptr;
 
     PenguinWizardry::PatternSolveRequest solveRequests[] = {
         {currentKernelVersion() <= MACOS_10_15_X ?
@@ -341,6 +342,12 @@ void X5000::processKext(KernelPatcher& patcher, const size_t id, const mach_vm_a
     };
     PANIC_COND(!PenguinWizardry::PatternSolveRequest::solveAll(patcher, id, solveRequests, slide, size), "X5000",
                "Failed to resolve symbols");
+
+    pm4GfxChannelVT = reinterpret_cast<void*>(
+        patcher.solveSymbol(id, "__ZTV32AMDRadeonX5000_AMDGFX9PM4Channel", slide, size));
+    if (pm4GfxChannelVT == nullptr) {
+        patcher.clearError();
+    }
 
     AMDRadeonX5000_AMDHWAlignManager::resolve(patcher, id, slide, size);
     AMDRadeonX5000_AMDHWDisplay::resolve(patcher, id, slide, size);
@@ -435,31 +442,42 @@ void X5000::processKext(KernelPatcher& patcher, const size_t id, const mach_vm_a
                                                           this->notifyGfxAccess};
         PANIC_COND(!solveRequest.solve(patcher, id, slide, size), "X5000", "Failed to resolve notifyGfxAccess");
 
-        bool hooked = false;
-        if (pm4ComputeChannelVT != nullptr && this->orgPM4SubmitCommandBuffer != 0) {
-            auto* vt = reinterpret_cast<mach_vm_address_t*>(pm4ComputeChannelVT);
+        void* const channelVTs[] = {pm4ComputeChannelVT, pm4GfxChannelVT};
+        for (void* const vtPtr : channelVTs) {
+            if (vtPtr == nullptr || this->orgPM4SubmitCommandBuffer == 0) { continue; }
+            bool hooked = false;
+            auto* vt = reinterpret_cast<mach_vm_address_t*>(vtPtr);
             for (size_t idx = (0x170 / sizeof(mach_vm_address_t)); idx <= (0x1B0 / sizeof(mach_vm_address_t)); ++idx) {
                 if (vt[idx] == this->orgPM4SubmitCommandBuffer) {
                     if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
                         vt[idx] = reinterpret_cast<mach_vm_address_t>(computeSubmitCommandBuffer);
                         MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
                         hooked = true;
-                        DBGLOG("X5000", "Successfully hooked computeSubmitCommandBuffer at dynamic vtable offset 0x%lx",
-                               idx * sizeof(mach_vm_address_t));
+                        DBGLOG("X5000", "Successfully hooked submitCommandBuffer at dynamic vtable %p offset 0x%lx",
+                               vtPtr, idx * sizeof(mach_vm_address_t));
                     }
                     break;
                 }
             }
-        }
-        if (!hooked) {
-            if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
-                this->hwChannelSubmitCommandBuffer(pm4ComputeChannelVT) =
-                    reinterpret_cast<mach_vm_address_t>(computeSubmitCommandBuffer);
-                MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-                hooked = true;
-                SYSLOG("X5000", "Fallback hooked computeSubmitCommandBuffer via field offset");
+            if (!hooked) {
+                if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
+                    this->hwChannelSubmitCommandBuffer(vtPtr) =
+                        reinterpret_cast<mach_vm_address_t>(computeSubmitCommandBuffer);
+                    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+                    SYSLOG("X5000", "Fallback hooked submitCommandBuffer on %p via field offset", vtPtr);
+                }
             }
         }
+    }
+
+    PenguinWizardry::PatternRouteRequest taskRoute{
+        "__ZN27AMDRadeonX5000_AMDAccelTask18freeAllGPUMappingsEv",
+        wrapTaskFreeAllGPUMappings, this->orgTaskFreeAllGPUMappings};
+    if (!taskRoute.route(patcher, id, slide, size)) {
+        patcher.clearError();
+        SYSLOG("X5000", "Failed to route AMDRadeonX5000_AMDAccelTask::freeAllGPUMappings");
+    } else {
+        DBGLOG("X5000", "Routed AMDRadeonX5000_AMDAccelTask::freeAllGPUMappings for task teardown drain");
     }
 
     if (currentKernelVersion() >= MACOS_13_4) {
@@ -798,6 +816,88 @@ UInt32 X5000::computeSubmitCommandBuffer(void* const self, void* const info)
 {
     singleton().notifyGfxAccess(singleton().hwChannelHWInterfaceField(self));
     return FunctionCast(computeSubmitCommandBuffer, singleton().orgPM4SubmitCommandBuffer)(self, info);
+}
+
+void X5000::wrapTaskFreeAllGPUMappings(void* const self)
+{
+    drainTask(self);
+    FunctionCast(wrapTaskFreeAllGPUMappings, singleton().orgTaskFreeAllGPUMappings)(self);
+}
+
+extern "C" boolean_t ml_at_interrupt_context(void);
+extern "C" boolean_t ml_get_interrupts_enabled(void);
+
+void X5000::drainTask(void* const task)
+{
+    if (task == nullptr) { return; }
+
+    const auto taskAddr = reinterpret_cast<uintptr_t>(task);
+    if (taskAddr < 0xFFFFFF8000000000ULL) { return; }
+
+    const auto accelAddr = *reinterpret_cast<const uintptr_t*>(taskAddr + 0x10);
+    if (accelAddr < 0xFFFFFF8000000000ULL) { return; }
+
+    const auto hwAddr = *reinterpret_cast<const uintptr_t*>(accelAddr + 0x1a38);
+    if (hwAddr < 0xFFFFFF8000000000ULL) { return; }
+
+    // Inspect all 32 hardware channels (GFX [00], KIQ [01], HIQ [02],
+    // ComputeUQ0..7 [03..10], SDMA0 [11], VCN [12..14], and auxiliary queues).
+    struct BusyHWChannel {
+        uintptr_t channelAddr;
+        UInt32    targetTS;
+        size_t    index;
+    };
+    BusyHWChannel busyChannels[32];
+    size_t        busyCount = 0;
+
+    for (size_t i = 0; i < 32; ++i) {
+        const auto channelAddr = *reinterpret_cast<const uintptr_t*>(hwAddr + 0x410 + i * sizeof(void*));
+        if (channelAddr < 0xFFFFFF8000000000ULL) { continue; }
+
+        const auto* const submittedPtr = reinterpret_cast<const volatile UInt32*>(channelAddr + 0x80);
+        const auto* const completedPtr = reinterpret_cast<const volatile UInt32*>(channelAddr + 0x84);
+
+        if (*submittedPtr != *completedPtr) {
+            busyChannels[busyCount++] = {channelAddr, *submittedPtr, i};
+        }
+    }
+
+    if (busyCount == 0) { return; }
+
+    auto allDrained = [&]() -> bool {
+        for (size_t b = 0; b < busyCount; ++b) {
+            const auto* const completedPtr =
+                reinterpret_cast<const volatile UInt32*>(busyChannels[b].channelAddr + 0x84);
+            if (static_cast<SInt32>(*completedPtr - busyChannels[b].targetTS) < 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // 1. Adaptive microsecond spin: in-flight packets typically finish in < 500us
+    constexpr UInt32 kMicroSpinLimitUs = 2000;
+    constexpr UInt32 kMicroStepUs      = 50;
+    for (UInt32 us = 0; us < kMicroSpinLimitUs; us += kMicroStepUs) {
+        IODelay(kMicroStepUs);
+        if (allDrained()) { return; }
+    }
+
+    // 2. Millisecond bounded sleep fallback: bounded to 50ms total
+    const bool canSleep = !ml_at_interrupt_context() && ml_get_interrupts_enabled();
+    constexpr UInt32 kDrainTimeoutMs = 50;
+    constexpr UInt32 kDrainStepMs    = 2;
+    for (UInt32 ms = 0; ms < kDrainTimeoutMs; ms += kDrainStepMs) {
+        if (canSleep) {
+            IOSleep(kDrainStepMs);
+        } else {
+            IODelay(kDrainStepMs * 1000);
+        }
+        if (allDrained()) { return; }
+    }
+
+    DBGLOG("X5000", "drainTask: %zu HW channel(s) still busy after %ums drain timeout; teardown proceeds",
+           busyCount, kDrainTimeoutMs + (kMicroSpinLimitUs / 1000));
 }
 
 //  -- VRR was introduced on macOS Big Sur. --
