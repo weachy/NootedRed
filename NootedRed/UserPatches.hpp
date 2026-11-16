@@ -24,6 +24,7 @@
 #include <Headers/kern_patcher.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <Headers/kern_user.hpp>
+#include <IOKit/IOLocks.h>
 #include <libkern/OSTypes.h>
 
 // Patches Apple's user-space OpenGL drivers, which is where the Chromium/GL corruption originates.
@@ -154,6 +155,27 @@ private:
     // Maximum amount of signature patches in a patch set.
     static constexpr size_t kMaxSignatures    = 8;
     static constexpr size_t kMaxVDASignatures = 16;
+    static constexpr size_t kMaxCachedSites   = 64;
+
+    enum VnodeKind : UInt8 {
+        kVnodeNone        = 0,
+        kVnodeGLDriver    = 1,
+        kVnodeVADriver    = 2,
+        kVnodeAppleGVA    = 3,
+        kVnodeSharedCache = 4,
+    };
+
+    // Compact metadata for a discovered UBC patch site, allowing O(1) re-application if XNU
+    // evicts the clean file-backed page under memory pressure and re-faults it from disk later.
+    struct CachedPatchSite
+    {
+        UInt64       pageOffset;
+        const UInt8* find;
+        const UInt8* replace;
+        UInt16       inPageOffset;
+        UInt8        size;
+        VnodeKind    vnodeKind;
+    };
 
     const SignaturePatch* signatures{nullptr};
     size_t                signatureCount{0};
@@ -170,6 +192,10 @@ private:
     bool                  enabled{false};
     bool                  vdaEnabled{false};
 
+    CachedPatchSite       cachedSites[kMaxCachedSites]{};
+    SInt32                cachedSiteCount{0};
+    IOSimpleLock*         cacheLock{nullptr};
+
     void selectPatchSet();
     auto currentApuMask() const -> ApuMask;
 
@@ -179,6 +205,9 @@ private:
     mach_vm_address_t orgCsValidateRange{0};
 
     auto installNativePagePatcher(KernelPatcher& patcher) -> bool;
+    void recordCachedSite(VnodeKind vnodeKind, UInt64 pageOffset, size_t inPageOffset, const UInt8* find,
+                          const UInt8* replace, size_t size);
+    void reapplyCachedSites(VnodeKind vnodeKind, UInt64 pageOffset, const UInt8* bytes);
     void patchSignaturePage(const void* data, UInt64 pageOffset, void* vnode);
 
     static void      wrapCsValidatePage(void* vnode, void* pager, UInt64 pageOffset, const void* data, int* validated,
