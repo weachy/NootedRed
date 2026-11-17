@@ -608,7 +608,9 @@ UInt32 X6000FB::wrapControllerPowerUp(void* const self)
 void X6000FB::wrapDpReceiverPowerCtrl(void* const link, const bool powerOn)
 {
     FunctionCast(wrapDpReceiverPowerCtrl, singleton().orgDpReceiverPowerCtrl)(link, powerOn);
-    IOSleep(250);
+    if (powerOn) {
+        IOSleep(250);
+    }
 }
 
 void* X6000FB::wrapCreateObjectInfo(void* const helper, const UInt32 tableOffset)
