@@ -24,6 +24,7 @@
 #include <Headers/kern_patcher.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <Headers/kern_user.hpp>
+#include <MediaPatchPlan.hpp>
 #include <IOKit/IOLocks.h>
 #include <libkern/OSTypes.h>
 
@@ -37,9 +38,9 @@
 //  - macOS 10.15 and older: `lilu.onProcLoad` with `UserPatcher::BinaryModInfo`/`BinaryModPatch`
 //    entries.  No process filter is registered on purpose, so that the patcher never injects the
 //    `__RESTRICT` segment into user processes; page patches are global in Lilu and do not need one.
-//  - macOS 11 and newer: a self-contained `_cs_validate_page`/`_cs_validate_range` hook.  A complete
-//    `kPageSize` page image has to match byte for byte before `find` is replaced with `replace`, so a
-//    patch can never hit an unrelated binary.  See analysis/lilu-userpatch.md for the details.
+//  - macOS 11 and newer: a self-contained `_cs_validate_page`/`_cs_validate_range` hook.
+//    VA/GVA pages require a build-specific manifest, fixed sites and a whole-page SHA-256 with only
+//    those sites masked. GL/Metal use guarded signature contexts. See analysis/lilu-userpatch.md.
 //
 // GLFix is enabled by default (pass -NRedNoGLFix to opt out); VDA hardware video acceleration is also
 // enabled by default (pass -NRedNoHEVC to disable HEVC, or -NRedNoVDA to disable VDA completely).
@@ -151,22 +152,18 @@ public:
     // profile are known (it must run before user processes validate pages).
     void processPatcher(KernelPatcher& patcher);
 
+    // This build has a bounded VA/GVA manifest AND the page hook was installed.
+    // Independent of engine allocation: personality injection precedes accelerator start.
+    bool mediaSupported() const;
+
 private:
-    // Maximum amount of signature patches in a patch set.
-    static constexpr size_t kMaxSignatures    = 8;
-    static constexpr size_t kMaxVDASignatures = 16;
-    static constexpr size_t kMaxCachedSites   = 64;
+    static constexpr size_t kMaxCachedSites = 64;
 
     enum VnodeKind : UInt8 {
         kVnodeNone        = 0,
         kVnodeGLDriver    = 1,
-        kVnodeVADriver    = 2,
-        kVnodeAppleGVA    = 3,
-        kVnodeSharedCache = 4,
+        kVnodeSharedCache = 2,
     };
-
-    // Compact metadata for a discovered UBC patch site, allowing O(1) re-application if XNU
-    // evicts the clean file-backed page under memory pressure and re-faults it from disk later.
     struct CachedPatchSite
     {
         UInt64       pageOffset;
@@ -179,19 +176,17 @@ private:
 
     const SignaturePatch* signatures{nullptr};
     size_t                signatureCount{0};
-    size_t                signatureApplied[kMaxSignatures]{};
-    const SignaturePatch* vdaSignatures{nullptr};
-    size_t                vdaSignatureCount{0};
-    size_t                vdaSignatureApplied[kMaxVDASignatures]{};
-    const SignaturePatch* gvaSignature{nullptr};
-    size_t                gvaSignatureApplied{0};
-    bool                  mtlHwInfoApplied{false};
     bool                  resolverEnabled{false};
     bool                  resolverOnly{false};
+    bool                  traceEnabled{false};
+    volatile SInt32        traceCount{0};
 
     bool                  enabled{false};
     bool                  vdaEnabled{false};
-
+    bool                  nativeBackendReady{false};
+    bool                  kernelIdentityMatches{false};
+    bool                  vp9RegistryEnabled{false};
+    volatile UInt32       vp9RegistryApplied{0};
     CachedPatchSite       cachedSites[kMaxCachedSites]{};
     SInt32                cachedSiteCount{0};
     IOSimpleLock*         cacheLock{nullptr};
@@ -200,6 +195,7 @@ private:
     auto currentApuMask() const -> ApuMask;
 
     SInt32                vdaAppliedCount{0};
+    volatile UInt32       mediaPagesObserved{0};
 
     mach_vm_address_t orgCsValidatePage{0};
     mach_vm_address_t orgCsValidateRange{0};
@@ -208,7 +204,9 @@ private:
     void recordCachedSite(VnodeKind vnodeKind, UInt64 pageOffset, size_t inPageOffset, const UInt8* find,
                           const UInt8* replace, size_t size);
     void reapplyCachedSites(VnodeKind vnodeKind, UInt64 pageOffset, const UInt8* bytes);
+    void tracePatch(const char* kind, size_t signatureIndex, UInt64 pageOffset, size_t matchOffset);
     void patchSignaturePage(const void* data, UInt64 pageOffset, void* vnode);
+    void patchMediaPage(const UInt8* bytes, const MediaPatchPlan::Page& page, size_t pageIndex);
 
     static void      wrapCsValidatePage(void* vnode, void* pager, UInt64 pageOffset, const void* data, int* validated,
                                         int* tainted, int* nx);

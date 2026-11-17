@@ -1,5 +1,6 @@
 #!/bin/bash
-# Safely show/add/remove the -NRedVDA token in the OpenCore NVRAM boot-args.
+# Show/enable/disable default-on VDA in OpenCore boot-args.
+# --enable removes -NRedNoVDA; --disable adds it. --add/--remove are aliases.
 # Usage:
 #   tools/set_vda_bootarg.sh --show
 #   tools/set_vda_bootarg.sh --add
@@ -16,8 +17,8 @@ ACTION="show"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --esp) ESP="${2:-}"; shift 2 ;;
-        --add) ACTION="add"; shift ;;
-        --remove) ACTION="remove"; shift ;;
+        --add|--enable) ACTION="add"; shift ;;
+        --remove|--disable) ACTION="remove"; shift ;;
         --show) ACTION="show"; shift ;;
         -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 1 ;;
@@ -43,26 +44,26 @@ CURRENT="$(${SUDO} /usr/libexec/PlistBuddy -c "Print ${CONFIG_KEY}" "${CONFIG}")
 echo "current boot-args: ${CURRENT}"
 
 if [[ "${ACTION}" == "show" ]]; then
-    if echo "${CURRENT}" | grep -q -- '-NRedVDA'; then
-        echo "-NRedVDA: enabled in OpenCore config"
-        exit 0
+    if echo " ${CURRENT} " | grep -q -- ' -NRedNoVDA '; then
+        echo "VDA: explicitly disabled by -NRedNoVDA"
+        exit 1
     fi
-    echo "-NRedVDA: absent from OpenCore config"
-    exit 1
+    echo "VDA: requested by default (effective support also requires the matching media manifest)"
+    exit 0
 fi
 
 # Normalize the token list, preserving all other arguments and their order.
-NEW="${CURRENT}"
+NEW="$(printf '%s' "${CURRENT}" | sed -E 's/(^| )-NRedVDA( |$)/ /g; s/(^| )-NRedAVC( |$)/ /g')"
 if [[ "${ACTION}" == "add" ]]; then
-    if echo "${NEW}" | grep -q -- '-NRedVDA'; then
-        echo "-NRedVDA already present; nothing to do"
-        exit 0
-    fi
-    NEW="${NEW} -NRedVDA"
+    NEW="$(printf '%s' "${NEW}" | sed -E 's/(^| )-NRedNoVDA( |$)/ /g')"
 else
-    NEW="$(echo "${NEW}" | sed -E 's/(^| )-NRedVDA( |$)/ /g' | tr -s ' ' | sed 's/^ //; s/ $//')"
+    if ! echo " ${NEW} " | grep -q -- ' -NRedNoVDA '; then NEW="${NEW} -NRedNoVDA"; fi
 fi
 NEW="$(echo "${NEW}" | sed 's/  */ /g; s/^ //; s/ $//')"
+if [[ "${NEW}" == "${CURRENT}" ]]; then
+    echo "configuration already matches; nothing to do"
+    exit 0
+fi
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 mkdir -p "${ROOT}/build/efi-backup"

@@ -31,8 +31,8 @@ namespace
     constexpr auto kProfileMaxVersion = MACOS_26_X;
 
     // VCN capability data for every supported APU family.  The engine enablement flag is set for the VCN 2.x
-    // family: 0x1638 is the hardware-validated target and the other VCN 2.x APUs are experimental.  VCN 1.x
-    // carries the data but stays disabled until a VCN 1.x path exists.
+    // family. Tests are specific to a device and Apple build (see analysis/); the profiles remain
+    // experimental. VCN 1.x carries the data but stays disabled until a VCN 1.x path exists.
     //
     // The ring/fence sizes are the allocation sizes the future VCN submission path will request.  They are
     // carried in the profile now so the media path has a single source of truth; nothing allocates them yet.
@@ -47,7 +47,7 @@ namespace
         media.vcnFenceSize  = 0x1000;     // 4 KiB, planning default until the real size is validated
         media.decode.h264   = true;
         media.decode.hevc   = true;
-        media.decode.av1    = false;    // AV1 decode starts with VCN 4.0.
+        media.decode.av1    = false;    // These gfx9 APUs have VCN 1/2 and no AV1 decoder.
         return media;
     }
 
@@ -57,17 +57,16 @@ namespace
 
     // Profiles for the APUs NootedRed supports today.  The VCN 2.x family (Renoir, Renoir/Green Sardine,
     // Cezanne and Barcelo) enables the media engine so the same VDA implementation can be tried on every
-    // VCN 2.x APU; 0x1638 is the hardware-validated target and the others are experimental.  Raven, Raven2
+    // VCN 2.x APU. Revision 7 shares the media policy with the VP9 plugin. Raven, Raven2
     // and Picasso are VCN 1.x, which the X6000 VCN2 bridge cannot serve, so they keep media disabled until
     // a VCN 1.x strategy exists.
     //
     // The table is keyed by device ID only.  The [minVersion, maxVersion] window is metadata for now; the
     // authoritative selector for patch data becomes the identity of the Apple binary being patched
-    // (docs/Compatibility-Architecture.md).  The support level is a coarse per-profile roll-up: the only
-    // hardware-validated combination is the conditional GL/Metal fix on macOS 15.8.1 / 0x1638, but that is a
-    // per-build fact and this entry is version-wide, so no profile is marked kValidated until the generated
-    // manifest can express per-build levels.  Media enablement is limited to VCN 2.x, which also keeps the
-    // roll-up at experimental.
+    // (docs/Compatibility-Architecture.md). The support level is a coarse per-profile roll-up:
+    // validation is per device/build/feature, whereas this entry is version-wide. Historical 0x1638
+    // graphics validation and 0x1636 media validation do not validate every path on either device.
+    // No whole profile is therefore marked kValidated.
     constexpr DeviceProfile::Profile kProfiles[] = {
         {"Renoir", 0x1636, DeviceProfile::kRenoir, DeviceProfile::kExperimental, kProfileMinVersion,
          kProfileMaxVersion, {}, kVcn2MediaVcn0},
@@ -103,6 +102,18 @@ namespace
         return true;
     }
 
+    constexpr auto mediaIPMatchesSharedPolicy() -> bool
+    {
+        for (const auto& profile : kProfiles) {
+            if (static_cast<UInt32>(profile.media.vcnGeneration) !=
+                    static_cast<UInt32>(nredMediaIP(profile.deviceID)) ||
+                profile.media.hasVCN0 != nredMediaUsesVCN2Bridge(profile.deviceID)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     constexpr auto versionRangesValid() -> bool
     {
         for (const auto& profile : kProfiles) {
@@ -126,8 +137,7 @@ namespace
         return !media.hasUVD0 && !media.hasVCE && !media.hasVCN0;
     }
 
-    // Media enablement is limited to VCN 2.x profiles until a VCN 1.x path exists; the validated 0x1638
-    // target must keep it on so a regression there cannot slip through silently.
+    // Media enablement is limited to VCN 2.x profiles until a VCN 1.x path exists.
     template<size_t N>
     constexpr auto onlyVcn2ProfilesEnableMedia(const DeviceProfile::Profile (&profiles)[N]) -> bool
     {
@@ -167,12 +177,13 @@ namespace
 
     static_assert(kProfileCount == 6, "Update the profile tests when adding a device");
     static_assert(uniqueDeviceIDs(), "Device profile device IDs must be unique");
+    static_assert(mediaIPMatchesSharedPolicy(), "Kernel and VP9 plugin media-IP policies must agree");
     static_assert(versionRangesValid(), "Device profile version ranges must be ordered");
     static_assert(graphicsPoliciesEnabled(), "Current profiles must keep the graphics policy enabled");
     static_assert(onlyVcn2ProfilesEnableMedia(kProfiles),
                   "Media enablement is limited to VCN 2.x profiles until a VCN 1.x path exists");
     static_assert(profileEnablesMedia(kProfiles, 0x1638),
-                  "The hardware-validated 0x1638 profile must keep VCN0 enabled");
+                  "The VCN 2.2 0x1638 profile must keep VCN0 enabled");
     static_assert(allVcnDataPresent(kProfiles),
                   "Every profile needs VCN data, H.264/HEVC decode and no AV1 before media can be enabled");
     static_assert(mediaDisabled(kFallbackProfile.media), "The fallback profile must not enable any media engine");

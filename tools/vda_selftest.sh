@@ -1,6 +1,6 @@
 #!/bin/bash
 # VDA hardware decode self-test (read-only).
-# Run after booting with -NRedVDA. Collects kernel/user-space diagnostics and decode checks.
+# Media is enabled by default; -NRedNoVDA disables it. Diagnostics only, not a hardware PASS.
 set -u
 
 echo "== system =="
@@ -34,7 +34,7 @@ echo "== VideoToolbox hardware decode support =="
 if command -v ffmpeg >/dev/null 2>&1; then
   ffmpeg -hide_banner -hwaccels 2>/dev/null | sed -n '1,20p'
   echo
-  echo "ffmpeg available; use: ffmpeg -hwaccel videotoolbox -i <clip> -f null -"
+  echo "Availability alone does not prove hardware selection. Run tools/vda_hwtest.sh for strict validation."
 else
   echo "ffmpeg not installed; use a VideoToolbox client or install ffmpeg for a quick check"
 fi

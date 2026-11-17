@@ -23,20 +23,22 @@
 #pragma once
 #include <Headers/kern_patcher.hpp>
 #include <IOKit/IOService.h>
+#include <IOKit/IOLocks.h>
 #include <libkern/OSTypes.h>
 #include <libkern/c++/OSMetaClass.h>
 
 // Bridges Apple's native AMDRadeonX6000 VCN2 engine into the active AMDRadeonX5000 accelerator.
 //
-// The X5000 accelerator keeps driving the APU.  When the user opts in with -NRedVDA, this module:
+// The X5000 accelerator keeps driving the APU. Enabled by default on a supported build/device, this module:
 //  - force-loads com.apple.kext.AMDRadeonX6000 as a symbol donor from inside the X5000 accelerator start;
-//  - verifies the generated per-build vtable/getter ABI on both drivers before touching anything;
+//  - verifies the generated vtable/getter ABI before enabling cross-driver entry points;
 //  - installs the generated cross-driver call-site patches in the X6000 text with rollback;
 //  - allocates AMDVCN2HWEngine and places it in X5000's PM4 engine array at kAMDHWEngineTypeVCN0;
 //  - bridges the X5000/X6000 metaclasses and video/shared/SML entry points.
 //
-// Every failure path clears readiness so the accelerator stays in its normal graphics-only state.  The
-// module never panics and does nothing unless -NRedVDA is present.
+// Failures stop new media patches/capability publication. Existing objects retain their ABI routing
+// after a late page failure; already patched pages require reboot for a clean rollback.
+// -NRedNoVDA disables the bridge.
 class VCNBridge
 {
     struct ClassPair
@@ -51,6 +53,10 @@ class VCNBridge
     bool loadAttempted{false};
     bool loadCompleted{false};
     bool engineAllocated{false};
+    volatile UInt32 mediaFailure{0};
+    IOLock* acceleratorLock{nullptr};
+    IOService* acceleratorHandle{nullptr};
+    void setAccelerator(IOService* accelerator);
 
     mach_vm_address_t orgAcceleratorStart{0};
     mach_vm_address_t orgAcceleratorStop{0};
@@ -64,6 +70,8 @@ class VCNBridge
     mach_vm_address_t orgSurfaceCopy{0};
     mach_vm_address_t orgInitHardware{0};
     mach_vm_address_t orgSafeMetaCast{0};
+    mach_vm_address_t orgFetchResource{0};
+    volatile UInt32  resourceFailures{0};
 
     mach_vm_address_t newVideo6000{0};
     mach_vm_address_t createSML6000{0};
@@ -82,7 +90,7 @@ class VCNBridge
 public:
     static VCNBridge& singleton();
 
-    // Parses -NRedVDA and registers the X6000 kext-load hook.  Called from NRed::init().
+    // Parses -NRedNoVDA and registers the X6000 kext-load hook. Called from NRed::init().
     void init();
 
     // Handles X5000 and X6000 kext loads.  Best-effort: a failure disables the bridge without panicking.
@@ -98,6 +106,14 @@ public:
     // original accelerator start (engine allocation happens before start() returns), which is required by
     // the video/shared entry points that run inside that start.
     bool engineEnabled() const { return this->loadReady() && this->engineAllocated; }
+
+    // Page hooks need an allocated engine, not a successful first initHardware:
+    // the first userspace session may be what triggers hardware initialization.
+    bool userPatchesAllowed() const { return this->engineEnabled() && !this->hasMediaFailed(); }
+    bool hasMediaFailed() const { return this->mediaFailure != 0; }
+    // Latches off new media work for this boot and withdraws published codec properties.
+    // Existing bridged objects retain their ABI routing until the accelerator stops.
+    void failMedia(UInt32 reason);
 
     // Allocates the X6000 VCN2 engine for X5000::allocateHWEngines().  `hardware` is the X5000
     // AMDHardware object whose capability field is cleared again if the engine later fails to initialise.
@@ -115,5 +131,6 @@ private:
     static UInt64        surfaceCopy(void* self, void* input, UInt64 size, void* event);
     static void          signalWork(void* hardware);
     static bool          initHardware(void* self, UInt32 channel);
+    static bool          fetchResource(void* self, void* parameters, void* resourceInfo);
     static OSMetaClassBase* safeMetaCast(const OSMetaClassBase* object, const OSMetaClass* target);
 };

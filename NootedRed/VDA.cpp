@@ -21,9 +21,14 @@
 // along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowledge/raw/branch/master/LICENSE-v1.md.
 
 #include <DeviceProfile.hpp>
+#include <MediaHardware.h>
 #include <Headers/kern_util.hpp>
 #include <NRed.hpp>
 #include <VDA.hpp>
+#include <UserPatches.hpp>
+#include <VCNBridge.hpp>
+#include <IOKit/IORegistryEntry.h>
+#include <libkern/c++/OSDictionary.h>
 #include <libkern/OSTypes.h>
 
 static VDA moduleInstance;
@@ -35,9 +40,56 @@ namespace
     const char* const kBootArgNoHEVC   = "-NRedNoHEVC";
     const char* const kBootArgNoHEVC10 = "-NRedNoHEVC10";
 
+    const char* const kMediaCapabilities[] = {
+        "IOGVACodec", "IOGVAHEVCDecode", "IOGVAHEVCDecodeCapabilities",
+        "IOGVAHEVCEncode", "IOGVAHEVCEncodeCapabilities", "IOGVAH264EncodeCapabilities",
+    };
+
 }    // namespace
 
 VDA& VDA::singleton() { return moduleInstance; }
+
+bool VDA::isSupported() const
+{
+    const auto* const profile = DeviceProfile::current();
+    return this->enabled && profile != nullptr && profile->media.hasVCN0 &&
+           profile->media.vcnGeneration == DeviceProfile::kVcn2_2 &&
+           nredMediaUsesVCN2Bridge(NRed::singleton().getDeviceID()) &&
+           !NRed::singleton().hasExternalVideo() && UserPatches::singleton().mediaSupported();
+}
+
+bool VDA::canAdvertise() const
+{
+    return this->isSupported() && !VCNBridge::singleton().hasMediaFailed();
+}
+
+bool VDA::shouldStripCapabilities() const
+{
+    return !this->enabled ||
+           (nredMediaUsesVCN2Bridge(NRed::singleton().getDeviceID()) && !this->canAdvertise());
+}
+
+bool VDA::isHEVC10EncodeAllowed() const
+{
+    return this->isHEVC10Allowed() && this->canAdvertise();
+}
+
+bool VDA::isHEVC8KDecodeAllowed() const
+{
+    return this->isHEVCDecodeAllowed() && this->canAdvertise();
+}
+
+void VDA::stripCapabilities(OSDictionary* const dictionary)
+{
+    if (dictionary == nullptr) { return; }
+    for (const auto* key : kMediaCapabilities) { dictionary->removeObject(key); }
+}
+
+void VDA::withdrawCapabilities(IORegistryEntry* const entry)
+{
+    if (entry == nullptr) { return; }
+    for (const auto* key : kMediaCapabilities) { entry->removeProperty(key); }
+}
 
 void VDA::init()
 {
@@ -59,9 +111,9 @@ void VDA::init()
     }
     else {
         if (this->hevc10Allowed) {
-            DBGLOG("VDA", "Hardware video acceleration enabled: AVC + HEVC (8/10-bit decode, 8-bit encode)");
+            DBGLOG("VDA", "Hardware video acceleration requested: AVC + HEVC; Main10 encode requires VCN 2.2 and matching driver patches");
         } else {
-            DBGLOG("VDA", "-NRedNoHEVC10 active: 10-bit HEVC decode disabled");
+            DBGLOG("VDA", "-NRedNoHEVC10 active: 10-bit HEVC encode/decode disabled");
         }
     }
 }

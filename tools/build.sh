@@ -25,6 +25,8 @@ CC=$(xcrun --find clang)
 # hence the silenced deprecation warnings.
 set -x
 "$CC" \
+    -x objective-c \
+    -fobjc-arc \
     -std=c11 \
     -O1 \
     -g \
@@ -36,12 +38,13 @@ set -x
     -mmacosx-version-min=15.0 \
     -framework OpenGL \
     -framework CoreFoundation \
+    -framework AppKit \
     "$SRC" \
     -o "$OUT/gl_blend_probe"
 
 set +x
 echo "built: $OUT/gl_blend_probe"
 echo
-echo "safe check : $OUT/gl_blend_probe --inspect"
+echo "inspect    : $OUT/gl_blend_probe --inspect"
 echo "no-draw    : $OUT/gl_blend_probe --link"
-echo "RISKY      : $OUT/gl_blend_probe --render --yes   # only with Lead approval"
+echo "render     : $OUT/gl_blend_probe --render --yes   # can reproduce a GPU reset"

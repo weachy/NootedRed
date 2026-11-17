@@ -5,7 +5,8 @@
  *
  * This tool is a *harness*, not a fix. It renders into an FBO, reads pixels back
  * and compares them against a CPU reference. It never touches the on-disk driver,
- * never injects code, never opens a window and never takes over the display.
+ * and never takes over the display. An Objective-C build attaches a small,
+ * unordered AppKit window; the C fallback uses a PBuffer.
  *
  * !! SAFETY !!
  * On the target machine (macOS 15.8.1, Renoir 0x1638, NootedRed loaded) a minimal
@@ -64,6 +65,9 @@
 #include <OpenGL/gl3.h>
 
 #include <errno.h>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <mach-o/dyld.h>
 #include <math.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -71,6 +75,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#ifdef __OBJC__
+#import <AppKit/AppKit.h>
+#endif
 
 #define PROBE_WIDTH 64
 #define PROBE_HEIGHT 64
@@ -81,6 +89,8 @@ static bool wantLink = false;
 static bool wantRender = false;
 static bool consentRender = false;
 static unsigned timeoutSeconds = 60;
+static unsigned selectedCase = 0;
+static bool orderedDrawable = false;
 
 static void rawNote(const char* text)
 {
@@ -92,14 +102,19 @@ static void rawNote(const char* text)
 
 static void onFatalSignal(int signo)
 {
+    if (signo == SIGSEGV || signo == SIGBUS || signo == SIGABRT) {
+        // Best-effort diagnostic in this short-lived test process. Symbolizing
+        // is not async-signal-safe; the independent SIGALRM watchdog remains.
+        void* frames[64];
+        int count = backtrace(frames, 64);
+        backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    }
     switch (signo) {
         case SIGSEGV:
-            rawNote("gl_blend_probe: SIGSEGV while talking to the GL driver "
-                    "(known #158 signature: AMDRadeonX5000GLDriver; see analysis/repro-plan.md)\n");
+            rawNote("gl_blend_probe: SIGSEGV; inspect the stack before attributing it to the driver\n");
             _exit(128 + signo);
         case SIGBUS:
-            rawNote("gl_blend_probe: SIGBUS while talking to the GL driver "
-                    "(known #158 signature; see analysis/repro-plan.md)\n");
+            rawNote("gl_blend_probe: SIGBUS; inspect the stack before attributing it to the driver\n");
             _exit(128 + signo);
         case SIGABRT:
             rawNote("gl_blend_probe: SIGABRT (possibly gpusKillClient / driver abort)\n");
@@ -129,7 +144,7 @@ static void installSignalHandlers(void)
 static void usage(const char* argv0)
 {
     fprintf(stderr,
-            "usage: %s [--inspect] [--exts] [--link] [--render --yes] [--timeout SECONDS]\n"
+            "usage: %s [--inspect] [--exts] [--link] [--render --yes] [--timeout SECONDS] [--case 1..4] [--ordered-drawable]\n"
             "\n"
             "  --inspect  (default) context + GL strings/extensions only; no drawing\n"
             "  --exts     print the full GL extension list\n"
@@ -137,6 +152,8 @@ static void usage(const char* argv0)
             "  --render   FBO clear/draw/readback + CPU comparison; REQUIRES --yes\n"
             "  --yes      consent to the risky render path\n"
             "  --timeout  render watchdog in seconds (default 60)\n"
+            "  --case     run one render case in its own process (1=solid, 2=alpha, 3=SRC1_COLOR, 4=SRC1_ALPHA)\n"
+            "  --ordered-drawable  attach a double-buffered NSOpenGLView in a small visible window\n"
             "\n"
             "See tools/README.md and analysis/repro-plan.md before using --render.\n",
             argv0);
@@ -156,6 +173,15 @@ static bool parseArgs(int argc, char** argv)
             wantRender = true;
         } else if (!strcmp(a, "--yes")) {
             consentRender = true;
+        } else if (!strcmp(a, "--ordered-drawable")) {
+            orderedDrawable = true;
+        } else if (!strcmp(a, "--case")) {
+            const char* value = i + 1 < argc ? argv[++i] : NULL;
+            if (value == NULL || strlen(value) != 1 || value[0] < '1' || value[0] > '4') {
+                fprintf(stderr, "--case needs a value from 1 to 4\n");
+                return false;
+            }
+            selectedCase = (unsigned)(value[0] - '0');
         } else if (!strncmp(a, "--timeout", 9)) {
             const char* value = a[9] == '=' ? a + 10 : (i + 1 < argc ? argv[++i] : NULL);
             if (value == NULL) {
@@ -416,8 +442,12 @@ static bool runRenderCases(GLuint solidProgram, GLuint alphaProgram, GLuint dual
 
     ExpectedPixel expSolid = expectedOver(red, blue, opaque);
     ExpectedPixel expAlpha = expectedOver(red, blue, halfFactor);
+    // glBlendFuncSeparate below uses ONE/ZERO for alpha: source alpha replaces
+    // destination alpha, independently of the RGB blend factors.
+    expAlpha.rgba[3] = quantize(0.5);
 
     GLuint vao = 0;
+    printf("[stage] creating VAO and binding framebuffer\n");
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -448,6 +478,9 @@ static bool runRenderCases(GLuint solidProgram, GLuint alphaProgram, GLuint dual
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        if (selectedCase != 0 && selectedCase != i + 1) {
+            continue;
+        }
         if (cases[i].dual && !dualSupported) {
             printf("  SKIP  %-40s (driver does not advertise dual-source blend)\n", cases[i].name);
             continue;
@@ -467,6 +500,7 @@ static bool runRenderCases(GLuint solidProgram, GLuint alphaProgram, GLuint dual
             cases[i].expected.rgba[3] = 255;
         }
 
+        printf("[stage] case %zu clear\n", i + 1);
         glClearColor((GLfloat)blue[0], (GLfloat)blue[1], (GLfloat)blue[2], (GLfloat)blue[3]);
         glClear(GL_COLOR_BUFFER_BIT);
 
@@ -477,9 +511,12 @@ static bool runRenderCases(GLuint solidProgram, GLuint alphaProgram, GLuint dual
             glDisable(GL_BLEND);
         }
         glUseProgram(cases[i].program);
+        printf("[stage] case %zu draw\n", i + 1);
         glDrawArrays(GL_TRIANGLES, 0, 3);
+        printf("[stage] case %zu finish\n", i + 1);
         glFinish();
 
+        printf("[stage] case %zu readback\n", i + 1);
         unsigned char got[4] = {0, 0, 0, 0};
         glReadPixels(PROBE_WIDTH / 2, PROBE_HEIGHT / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, got);
 
@@ -518,6 +555,9 @@ int main(int argc, char** argv)
         return 1;
     }
     installSignalHandlers();
+    setvbuf(stdout, NULL, _IONBF, 0);
+    // Include context/drawable setup in the watchdog, not only glDrawArrays.
+    alarm(timeoutSeconds);
 
     if (wantRender && !consentRender) {
         fprintf(stderr,
@@ -543,7 +583,12 @@ int main(int argc, char** argv)
     attrs[n++] = kCGLPFAAlphaSize;
     attrs[n++] = (CGLPixelFormatAttribute)8;
     if (wantRender) {
+#ifdef __OBJC__
+        if (orderedDrawable) { attrs[n++] = kCGLPFADoubleBuffer; }
+#endif
+#ifndef __OBJC__
         attrs[n++] = kCGLPFAPBuffer;
+#endif
     }
     attrs[n] = (CGLPixelFormatAttribute)0;
 
@@ -602,6 +647,13 @@ int main(int argc, char** argv)
         }
     }
     reportGlError("GL string / extension queries");
+    for (uint32_t imageIndex = 0; imageIndex < _dyld_image_count(); ++imageIndex) {
+        const char* imageName = _dyld_get_image_name(imageIndex);
+        if (imageName != NULL && strstr(imageName, "AMDRadeonX5000GLDriver") != NULL) {
+            printf("GL_DRIVER_IMAGE = %s, base=%p\n", imageName,
+                   (const void*)_dyld_get_image_header(imageIndex));
+        }
+    }
 
     bool dualSupported = (arbDual || extDual) && maxDualSource > 0;
 
@@ -646,7 +698,7 @@ int main(int argc, char** argv)
 
     if (!wantRender) {
         if (wantLink) {
-            printf("\n[link] done: no GPU submission performed.\n");
+            printf("\n[link] done: no clear/draw/readback; context setup may submit initialization work.\n");
         } else {
             printf("\n[inspect] done: no drawing/drawable touched.\n");
         }
@@ -668,8 +720,46 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    // ---------------- render path (risky) ----------------
-    printf("\n[render] RISK PATH: attaching PBuffer drawable before any clear/draw\n");
+    // ---------------- render path ----------------
+#ifdef __OBJC__
+    // An optional, process-local diagnostic library can stop submission before
+    // any drawable/drawing work. Normal builds have no dependency on it.
+    void (*captureArm)(void) = dlsym(RTLD_DEFAULT, "NRedCaptureArm");
+    if (captureArm != NULL) { captureArm(); }
+    printf("\n[render] attaching %s AppKit drawable before clear/draw\n",
+           orderedDrawable ? "an ordered" : "an unordered");
+    [NSApplication sharedApplication];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
+    __attribute__((objc_precise_lifetime)) NSWindow* window =
+        [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, PROBE_WIDTH, PROBE_HEIGHT)
+                                   styleMask:NSWindowStyleMaskBorderless
+                                     backing:NSBackingStoreBuffered
+                                       defer:NO];
+    __attribute__((objc_precise_lifetime)) NSOpenGLPixelFormat* appPixelFormat =
+        [[NSOpenGLPixelFormat alloc] initWithCGLPixelFormatObj:pixelFormat];
+    __attribute__((objc_precise_lifetime)) NSOpenGLView* view =
+        [[NSOpenGLView alloc] initWithFrame:NSMakeRect(0, 0, PROBE_WIDTH, PROBE_HEIGHT)
+                               pixelFormat:appPixelFormat];
+    [window setContentView:view];
+    __attribute__((objc_precise_lifetime)) NSOpenGLContext* drawableContext =
+        [[NSOpenGLContext alloc] initWithCGLContextObj:context];
+    if (window == nil || view == nil || drawableContext == nil) {
+        fprintf(stderr, "AppKit drawable allocation failed; no draw attempted\n");
+        return 11;
+    }
+    [view setOpenGLContext:drawableContext];
+    [drawableContext setView:view];
+    if (orderedDrawable) {
+        [window orderBack:nil];
+        [window displayIfNeeded];
+        printf("[render] ordered NSOpenGLView window=%ld visible=%d double-buffered=1\n",
+               (long)[window windowNumber], (int)[window isVisible]);
+    }
+    [drawableContext makeCurrentContext];
+    [drawableContext update];
+    [view prepareOpenGL];
+#else
+    printf("\n[render] attaching PBuffer drawable before any clear/draw\n");
     CGLPBufferObj pbuffer = NULL;
     error = CGLCreatePBuffer(PROBE_WIDTH, PROBE_HEIGHT, GL_TEXTURE_2D, GL_RGBA, 0, &pbuffer);
     if (error != kCGLNoError || pbuffer == NULL) {
@@ -689,8 +779,9 @@ int main(int argc, char** argv)
         CGLDestroyPixelFormat(pixelFormat);
         return 11;
     }
+#endif
     CGLFlushDrawable(context);
-    reportGlError("PBuffer drawable attach");
+    reportGlError("drawable attach");
 
     GLuint texture = 0;
     glGenTextures(1, &texture);
@@ -708,7 +799,11 @@ int main(int argc, char** argv)
         fprintf(stderr, "FBO incomplete; refusing to draw\n");
         glDeleteFramebuffers(1, &fbo);
         glDeleteTextures(1, &texture);
+#ifdef __OBJC__
+        [drawableContext clearDrawable];
+#else
         CGLDestroyPBuffer(pbuffer);
+#endif
         CGLSetCurrentContext(NULL);
         CGLDestroyContext(context);
         CGLDestroyPixelFormat(pixelFormat);
@@ -735,7 +830,11 @@ int main(int argc, char** argv)
     if (dualAlphaProgram != 0) {
         glDeleteProgram(dualAlphaProgram);
     }
+#ifdef __OBJC__
+    [drawableContext clearDrawable];
+#else
     CGLDestroyPBuffer(pbuffer);
+#endif
     CGLSetCurrentContext(NULL);
     CGLDestroyContext(context);
     CGLDestroyPixelFormat(pixelFormat);

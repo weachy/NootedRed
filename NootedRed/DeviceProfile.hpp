@@ -21,6 +21,7 @@
 // along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowledge/raw/branch/master/LICENSE-v1.md.
 
 #pragma once
+#include <MediaHardware.h>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <libkern/OSTypes.h>
 
@@ -34,8 +35,8 @@
 //
 // Graphics uses this profile to decide whether the Chromium dual-quad policy should be installed.
 // Media describes the VCN/UVD/VDA capabilities of the device (generation, firmware, ring sizes, decode
-// formats).  Engine enablement flags stay false unless the profile is hardware-validated, so populating
-// the media data does not change behaviour or require a second device-selection path.
+// formats). VCN 2.2 profiles may use the bridge when its Apple binary guards pass;
+// this does not mark an untested machine as hardware-validated.
 class DeviceProfile
 {
 public:
@@ -81,9 +82,9 @@ public:
     // VCN IP generation, encoded as major << 8 | minor so it can double as the `ipVersion` handed to the
     // firmware loader.  Raven/Picasso/Raven2 are VCN 1.0-class, Renoir/Cezanne/Barcelo are VCN 2.2.
     enum VcnGeneration : UInt32 {
-        kVcnNone = 0,
-        kVcn1_0 = 0x0100,
-        kVcn2_2 = 0x0202,
+        kVcnNone = NRedMediaIPUnknown,
+        kVcn1_0 = NRedMediaIPVCN1,
+        kVcn2_2 = NRedMediaIPVCN22,
     };
 
     // Formats the VCN generation can decode.  Hardware capabilities, not enablement.
@@ -97,7 +98,8 @@ public:
     struct MediaPolicy
     {
         // Media engine enablement flags.  The VCN 2.x profiles enable VCN0 so the same VDA implementation
-        // can be tried on every VCN 2.x APU (0x1638 is hardware-validated, the others are experimental).
+        // can be tried on every VCN 2.2 APU. Hardware media acceptance was
+        // measured on 0x1636; the other IDs remain experimental.
         // VCN 1.x profiles keep the engine disabled because the X6000 VCN2 bridge cannot serve them.
         bool hasUVD0{false};
         bool hasVCE{false};

@@ -47,6 +47,7 @@
 #include <Regs/NBIO.hpp>
 #include <Regs/SMU.hpp>
 #include <UserPatches.hpp>
+#include <VP9LibraryValidation.hpp>
 #include <VCNBridge.hpp>
 #include <VDA.hpp>
 #include <X5000.hpp>
@@ -73,6 +74,7 @@ void NRed::init()
     this->forceVDA = checkKernelArgument("-NRedForceVDA");
 
     UserPatches::singleton().init();
+    VP9LibraryValidation::init();
 
     VDA::singleton().init();
 
@@ -105,6 +107,7 @@ void NRed::init()
             X5000HWLibs::singleton().processKext(patcher, id, slide, size);
             X5000::singleton().processKext(patcher, id, slide, size);
             VCNBridge::singleton().processKext(patcher, id, slide, size);
+            VP9LibraryValidation::processKext(patcher, id, slide, size);
         },
         nullptr);
 }

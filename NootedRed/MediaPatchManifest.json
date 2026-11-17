@@ -1,0 +1,352 @@
+{
+  "schema": 1,
+  "build": "25G332",
+  "kernel_uuid": "28267FD5-3E1E-3686-8A1C-E73E2466FCFB",
+  "cache_uuid": "21FB8708-FC8E-3765-BE8C-65D612CDF049",
+  "images": [
+    {
+      "path": "/System/Library/Extensions/AMDRadeonVADriver2.bundle/Contents/MacOS/AMDRadeonVADriver2",
+      "uuid": "1181E2CA-31B3-3DF0-90E2-3AE70552D753",
+      "text_start": "0x7ffb10b009e0",
+      "text_size": 551639
+    },
+    {
+      "path": "/System/Library/PrivateFrameworks/AppleGVA.framework/Versions/A/AppleGVA",
+      "uuid": "CC4FCC4C-C670-3359-A682-BCBAEA945214",
+      "text_start": "0x7ffa0c57cf40",
+      "text_size": 806144
+    }
+  ],
+  "pages": [
+    {
+      "file": "dyld_shared_cache_x86_64h.02",
+      "offset": "0xc59f000",
+      "sites": [
+        {
+          "offset": 3557,
+          "find": "0f848c000000",
+          "replace": "0f8478000000",
+          "symbol": "AVDGetGPUAccelerators"
+        }
+      ],
+      "masked_sha256": "7983734e765f718518c3f0df667e5344fd80300b5689ee724c4d14b2d341c179"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.02",
+      "offset": "0xc5d6000",
+      "sites": [
+        {
+          "offset": 2873,
+          "find": "4180be82160100010f855c0e0000488d35c9080800e9ed060000",
+          "replace": "488d5dc86a035e4c89ff535ae8b6b1060084c0eb46e99dfbffff",
+          "symbol": "AVFQTXENC_SetProperty::NumberOfSlices"
+        },
+        {
+          "offset": 2933,
+          "find": "498d9ed8050100be060000004c89ff4889dae874b106004180be82160100017517f20f1003488d35ea060800bf1b000000b001e8bdb6060041c6862a18010001e9e90d0000",
+          "replace": "498d96d80501006a065e4c89ffe879b1060041c6862a18010001e90f0e000074b8498b4650488b80a80300004885c074068378380075a28b03418986680e0100e9e90d0000",
+          "symbol": "AVFQTXENC_SetProperty::SliceContinuation"
+        }
+      ],
+      "masked_sha256": "e476616ee947f52f0175d2b716d71807ff26af5680651738feb2f02b9787bc8e"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b00000",
+      "sites": [
+        {
+          "offset": 3918,
+          "find": "bb0b000000",
+          "replace": "bb05000000",
+          "symbol": "__ZN17VAAcceleratorInfo8identifyEjj"
+        }
+      ],
+      "masked_sha256": "20aa809e0bdcacb3562b8dbc5e7b8e79e55478968a2d58bf4eef243743f81730"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b02000",
+      "sites": [
+        {
+          "offset": 1193,
+          "find": "4181fc8d000000",
+          "replace": "4181fc8e000000",
+          "symbol": "__ZN18VAAddrLibInterface4initEP11VAIOConnectP13sHardwareInfo"
+        },
+        {
+          "offset": 1781,
+          "find": "3d8d000000",
+          "replace": "39c0909090",
+          "symbol": "__ZN4Addr3Lib6CreateEPK18_ADDR_CREATE_INPUTP19_ADDR_CREATE_OUTPUT"
+        },
+        {
+          "offset": 2816,
+          "find": "81fe8d000000",
+          "replace": "39f690909090",
+          "symbol": "__ZN4Addr2V27Gfx9Lib20HwlConvertChipFamilyEjj"
+        }
+      ],
+      "masked_sha256": "eeb1d4b0a947200db8c589c3b6a80493e004b01c36e4693845b339cd4efd2015"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b0d000",
+      "sites": [
+        {
+          "offset": 3935,
+          "find": "8d46ff83f802721f",
+          "replace": "8d46ff83f802eb1f",
+          "symbol": "__ZN9VAFactory29createColourFormatConverterVPEi"
+        }
+      ],
+      "masked_sha256": "a5f7b9abaf3cadeb559172e3ea48ebdf3dc0807dd64870a06f24a712b2af9230"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b0e000",
+      "sites": [
+        {
+          "offset": 33,
+          "find": "8d46ff83f802721f",
+          "replace": "8d46ff83f802eb1f",
+          "symbol": "__ZN9VAFactory17createDitheringVPEi"
+        },
+        {
+          "offset": 163,
+          "find": "8d46ff83f802721f",
+          "replace": "8d46ff83f802eb1f",
+          "symbol": "__ZN9VAFactory17createDeblockerVPEi"
+        },
+        {
+          "offset": 424,
+          "find": "488b86600400008b400c8d48ff83",
+          "replace": "b80200000090909090908d48ff83",
+          "symbol": "__ZN9VAFactory20createGraphicsEngineEP9VAContext"
+        },
+        {
+          "offset": 577,
+          "find": "488b86600400008b400c8d48ff83",
+          "replace": "b80200000090909090908d48ff83",
+          "symbol": "__ZN9VAFactory14createImageBltEP9VAContextj"
+        }
+      ],
+      "masked_sha256": "abbe398454bf4af543630d08aa9bbf61165431e2abade481eb123ad0f7bf1262"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b45000",
+      "sites": [
+        {
+          "offset": 3340,
+          "find": "4c89ee",
+          "replace": "4c89fe",
+          "symbol": "__ZN12VAUveEncoder13EncodePictureEPvP15VAVendorTextureS0_"
+        }
+      ],
+      "masked_sha256": "07c11ae9a0493da7e67ca1455dbe3ea812257d9c80824d018df8f3b17df638da"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b47000",
+      "sites": [
+        {
+          "offset": 1496,
+          "find": "418bb784070000",
+          "replace": "31f69090909090",
+          "symbol": "__ZN23AvdVcn2HevcHeaderEncode17encodeSliceHeaderEPvS0_S0_"
+        },
+        {
+          "offset": 1512,
+          "find": "418bb788070000",
+          "replace": "31f69090909090",
+          "symbol": "__ZN23AvdVcn2HevcHeaderEncode17encodeSliceHeaderEPvS0_S0_"
+        }
+      ],
+      "masked_sha256": "af7d0518251481083089b5f8026c9ea6dea44cb828c00b193fc5ddbfcd81146a"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b49000",
+      "sites": [
+        {
+          "offset": 3151,
+          "find": "8b8a840000008b87240400000fafc105ff0000002500ffffff",
+          "replace": "8b82800000008b8a8400000090909090909090909090909090",
+          "symbol": "__ZN11Vcn2Encoder15setEncodeParamsEPvP15VAVendorTexture"
+        },
+        {
+          "offset": 3425,
+          "find": "8b879c0000003d3032347874293d7230316c74113d626772617523c5fb10058ce20400eb08c5fb100572e20400b001b901000000eb0cc5fa100509e9030031c931c0894dc4894dcc",
+          "replace": "83be8400000002742c8b879c0000003d7230316c74113d626772617521c5fb10058ae20400eb08c5fb100570e2040031c0ffc0eb0b660f76c0660f72d01f31c08945c48945cc9090",
+          "symbol": "__ZN11Vcn2Encoder29setInputAndOutputFormatParamsEP11_UveCmdInfo"
+        }
+      ],
+      "masked_sha256": "deee19f4fa19fc2581e13c448cf697ca8af87bc4f28e27e34058df7528a88d47"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b4a000",
+      "sites": [
+        {
+          "offset": 1772,
+          "find": "488dbbdc000000",
+          "replace": "488dbb80000000",
+          "symbol": "__ZN14Vcn2EncCommandC2Ev"
+        },
+        {
+          "offset": 1801,
+          "find": "bee8040000",
+          "replace": "be44050000",
+          "symbol": "__ZN14Vcn2EncCommandC2Ev"
+        }
+      ],
+      "masked_sha256": "586186650960fe43ce5e3ce22ab822d828306f682a95dea7618ab5b55d01464e"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b4b000",
+      "sites": [
+        {
+          "offset": 212,
+          "find": "b8a40000005dc3",
+          "replace": "b8300000005dc3",
+          "symbol": "__ZN14Vcn2EncCommand15getFeedbackSizeEv"
+        },
+        {
+          "offset": 3277,
+          "find": "e868f6ffff",
+          "replace": "e83f7b0100",
+          "symbol": "VCN2_HEVC_BITSTREAM_CALL"
+        }
+      ],
+      "masked_sha256": "2cf13a4f8e54357c4b72fca53f500120836ccbe9f2d3b8fda6e7ac106b25f3e1"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b4c000",
+      "sites": [
+        {
+          "offset": 1822,
+          "find": "4869c0a4000000",
+          "replace": "4869c030000000",
+          "symbol": "__ZN26AVDVcn2AvcEncDataProcessor19ProcessEncodeStatusEP19_VAEncodeStatusInfoPvP15VAVendorTexture"
+        }
+      ],
+      "masked_sha256": "4e5d21d7134a9f1f745c2985f120d6b26f760461074c45104e79cc0dba7fefcb"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b4d000",
+      "sites": [
+        {
+          "offset": 2276,
+          "find": "4869c0a4000000",
+          "replace": "4869c030000000",
+          "symbol": "__ZN27AVDVcn2HevcEncDataProcessor19ProcessEncodeStatusEP19_VAEncodeStatusInfoPvP15VAVendorTexture"
+        }
+      ],
+      "masked_sha256": "fb8b5282fe33109c06063471ae8109952dfbd2afa56ae2e39f4549c58c887768"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b5d000",
+      "sites": [
+        {
+          "offset": 981,
+          "find": "448bbb14b30000",
+          "replace": "41bf0010000090",
+          "symbol": "__ZN13AvdCapability19checkCapabilityListEPK21AVD_DriverContextInfo"
+        },
+        {
+          "offset": 1147,
+          "find": "448b9b54b30000",
+          "replace": "41bb0010000090",
+          "symbol": "__ZN13AvdCapability19checkCapabilityListEPK21AVD_DriverContextInfo"
+        },
+        {
+          "offset": 1293,
+          "find": "448b9b5cb30000",
+          "replace": "41bb0010000090",
+          "symbol": "__ZN13AvdCapability19checkCapabilityListEPK21AVD_DriverContextInfo"
+        },
+        {
+          "offset": 1509,
+          "find": "8b8320b30000",
+          "replace": "8b8324b30000",
+          "symbol": "__ZN13AvdCapability19checkCapabilityListEPK21AVD_DriverContextInfo"
+        },
+        {
+          "offset": 1540,
+          "find": "8b8328b30000",
+          "replace": "b80011000090",
+          "symbol": "__ZN13AvdCapability19checkCapabilityListEPK21AVD_DriverContextInfo"
+        },
+        {
+          "offset": 1576,
+          "find": "448ba304b30000",
+          "replace": "41bc0000200290",
+          "symbol": "__ZN13AvdCapability19checkCapabilityListEPK21AVD_DriverContextInfo"
+        }
+      ],
+      "masked_sha256": "dcb8355db92c76dc16d28bafa2de99ade9f0910d917481f40c0fc0956e96c21a"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b5f000",
+      "sites": [
+        {
+          "offset": 3252,
+          "find": "000000000000000000000000",
+          "replace": "28833b040000e9170e000000",
+          "symbol": "VCN2_HEVC_BITSTREAM_HELPER_3"
+        }
+      ],
+      "masked_sha256": "316ede8ab07eecbd3ea57a14a12654dee920efa59699e03aecdb37b98c580fcd"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b60000",
+      "sites": [
+        {
+          "offset": 2307,
+          "find": "00000000000000000000000000",
+          "replace": "c0e00250e9a8f3ffff00000000",
+          "symbol": "VCN2_HEVC_BITSTREAM_HELPER_2"
+        },
+        {
+          "offset": 2774,
+          "find": "00000000000000000000",
+          "replace": "e85fa8feffe9066e0000",
+          "symbol": "VCN2_HEVC_BITSTREAM_HELPER_4"
+        }
+      ],
+      "masked_sha256": "16f6d4468dafd158e08dc4471c92f18aa4f42d86e2c0e1178cdcac5d5d5dd15b"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b63000",
+      "sites": [
+        {
+          "offset": 2065,
+          "find": "000000000000000000000000000000",
+          "replace": "80bb3b040000080f94c0e9e3d0ffff",
+          "symbol": "VCN2_HEVC_BITSTREAM_HELPER_1"
+        }
+      ],
+      "masked_sha256": "227f56c7676708c94cfe1ff2a257b45d1ab52603aa75af0007df2e77e11b1a98"
+    },
+    {
+      "file": "dyld_shared_cache_x86_64h.03",
+      "offset": "0x10b67000",
+      "sites": [
+        {
+          "offset": 2278,
+          "find": "00000000000000000000",
+          "replace": "59008b3b040000c30000",
+          "symbol": "VCN2_HEVC_BITSTREAM_HELPER_5"
+        }
+      ],
+      "masked_sha256": "11c560fb63faec4f91e59184fa0ad394edf167cf112d85f8de326f57b1f50990"
+    }
+  ]
+}

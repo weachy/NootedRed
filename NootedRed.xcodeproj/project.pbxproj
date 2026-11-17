@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		EF0410010000000000000001 /* VP9LibraryValidation.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EF0410020000000000000001 /* VP9LibraryValidation.cpp */; };
 		EF0400010000000000000010 /* VDA.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EF0400020000000000000010 /* VDA.cpp */; };
 		EF0400030000000000000010 /* VDA.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000010 /* VDA.hpp */; };
 		EF0400010000000000000011 /* VCNBridge.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EF0400020000000000000011 /* VCNBridge.cpp */; };
@@ -130,6 +131,9 @@
 		EF0400020000000000000002 /* DeviceProfile.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = DeviceProfile.cpp; sourceTree = "<group>"; };
 		EF0400040000000000000002 /* DeviceProfile.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = DeviceProfile.hpp; sourceTree = "<group>"; };
 		EF0400020000000000000001 /* UserPatches.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = UserPatches.cpp; sourceTree = "<group>"; };
+		EF0410020000000000000001 /* VP9LibraryValidation.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = VP9LibraryValidation.cpp; sourceTree = "<group>"; };
+		EF0410020000000000000002 /* VP9LibraryValidation.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = VP9LibraryValidation.hpp; sourceTree = "<group>"; };
+		EF0410020000000000000003 /* VP9PluginAllowlist.inc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = VP9PluginAllowlist.inc; sourceTree = "<group>"; };
 		1C748C271C21952C0024EED2 /* NootedRed.kext */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = NootedRed.kext; sourceTree = BUILT_PRODUCTS_DIR; };
 		1C748C2C1C21952C0024EED2 /* Plugin.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = Plugin.cpp; sourceTree = "<group>"; };
 		1C748C2E1C21952C0024EED2 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -333,6 +337,9 @@
 				407068652E966678004E0761 /* Personalities */,
 				408B3DD62CDFA41A00CAE5D2 /* Regs */,
 				EF0400020000000000000001 /* UserPatches.cpp */,
+				EF0410020000000000000001 /* VP9LibraryValidation.cpp */,
+				EF0410020000000000000002 /* VP9LibraryValidation.hpp */,
+				EF0410020000000000000003 /* VP9PluginAllowlist.inc */,
 				EF0400020000000000000002 /* DeviceProfile.cpp */,
 				EF0400040000000000000002 /* DeviceProfile.hpp */,
 				EF0400020000000000000010 /* VDA.cpp */,
@@ -783,6 +790,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				EF0400010000000000000001 /* UserPatches.cpp in Sources */,
+				EF0410010000000000000001 /* VP9LibraryValidation.cpp in Sources */,
 				EF0400010000000000000002 /* DeviceProfile.cpp in Sources */,
 				EF0400010000000000000010 /* VDA.cpp in Sources */,
 				EF0400010000000000000011 /* VCNBridge.cpp in Sources */,

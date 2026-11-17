@@ -21,12 +21,17 @@
 // along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowledge/raw/branch/master/LICENSE-v1.md.
 
 #include <Headers/kern_api.hpp>
+#include <Headers/kern_crypto.hpp>
 #include <Headers/kern_mach.hpp>
 #include <Headers/kern_util.hpp>
 #include <DeviceProfile.hpp>
+#include <MediaHardware.h>
+#include <GLResourceBudgetPatch.hpp>
 #include <NRed.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <UserPatches.hpp>
+#include <MediaPatchManifest.inc>
+#include <VP9PluginAllowlist.inc>
 #include <VCNBridge.hpp>
 #include <libkern/OSAtomic.h>
 #include <libkern/OSTypes.h>
@@ -36,25 +41,22 @@
 #include <sys/vnode.h>
 
 static UserPatches moduleInstance;
+extern "C" char osversion[];
 
 namespace
 {
 
     const char* const kBootArgNoGLFix          = "-NRedNoGLFix";
     const char* const kBootArgGLFixOff         = "-NRedGLFixOff";
-    const char* const kBootArgGLFixResolve     = "-NRedGLFixResolve";
     const char* const kBootArgGLFixResolveOnly = "-NRedGLFixResolveOnly";
     const char* const kBootArgGLFixResolveOff  = "-NRedGLFixResolveOff";
     const char* const kBootArgGLFixNoResolve   = "-NRedGLFixNoResolve";
     const char* const kBootArgNoVDA            = "-NRedNoVDA";
-    const char* const kBootArgNoHEVC           = "-NRedNoHEVC";
+    const char* const kBootArgUserPatchTrace   = "-NRedUserPatchTrace";
 
     // The patch bytes and page images below are specific to one driver build, and the native backend hooks
     // code signing page validation. Enabled by default; pass -NRedNoGLFix to opt out.
     constexpr bool kGLFixDefaultEnabled = true;
-
-    // Arbitrary non-zero section id for `UserPatcher::BinaryModPatch`; Lilu's ABI treats zero as disabled.
-    constexpr UInt32 kLiluPatchSection = 1;
 
     // Exact patches for
     // `/System/Library/Extensions/AMDRadeonX5000GLDriver.bundle/Contents/MacOS/AMDRadeonX5000GLDriver`.
@@ -187,15 +189,9 @@ namespace
     };
     static_assert(sizeof(kOpenCLDispatchFind_Ventura) == sizeof(kOpenCLDispatchReplace_Ventura), "Ventura OpenCL patch size mismatch");
 
-    #include "VDASignatures.inc"
-
     static const UInt8 kResolverMask32[] = {
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    };
-    static const UInt8 kResolverMask32_RipMasked[] = {
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF,
     };
     static const UInt8 kResolverMaskFF[128] = {
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
@@ -206,6 +202,10 @@ namespace
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+    static const UInt8 kResolverMask32_RipMasked[] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF,
     };
 
     // macOS 14 (Sonoma) resolver contexts.
@@ -373,8 +373,19 @@ namespace
 
 UserPatches& UserPatches::singleton() { return moduleInstance; }
 
+bool UserPatches::mediaSupported() const
+{
+    return this->vdaEnabled && this->nativeBackendReady &&
+           this->kernelIdentityMatches &&
+           (osversion[0] == '\0' || strcmp(osversion, MediaPatchManifest::Build) == 0);
+}
+
 void UserPatches::init()
 {
+    if (this->cacheLock == nullptr) {
+        this->cacheLock = IOSimpleLockAlloc();
+    }
+    this->traceEnabled = checkKernelArgument(kBootArgUserPatchTrace);
     this->enabled = kGLFixDefaultEnabled;
     if (checkKernelArgument(kBootArgNoGLFix) || checkKernelArgument(kBootArgGLFixOff)) {
         this->enabled = false;
@@ -387,14 +398,11 @@ void UserPatches::init()
                             && !checkKernelArgument(kBootArgGLFixNoResolve);
 
     this->vdaEnabled = !checkKernelArgument(kBootArgNoVDA);
+    this->vp9RegistryEnabled = this->vdaEnabled && checkKernelArgument("-NRedVP9");
 
     if (!this->enabled && !this->vdaEnabled) {
         DBGLOG("UserPatch", "User-space driver patches are disabled");
         return;
-    }
-
-    if (this->cacheLock == nullptr) {
-        this->cacheLock = IOSimpleLockAlloc();
     }
 
     if (this->enabled) {
@@ -404,26 +412,7 @@ void UserPatches::init()
         }
     }
     if (this->vdaEnabled) {
-        if (getKernelVersion() == KernelVersion::Ventura) {
-            this->vdaSignatures     = kVDAResolverSignatures_Ventura;
-            this->vdaSignatureCount = kVDAResolverSignatureCount_Ventura;
-            this->gvaSignature      = &kGVAResolverSignature_Ventura;
-        } else if (getKernelVersion() == KernelVersion::Sonoma) {
-            this->vdaSignatures     = kVDAResolverSignatures_Sonoma;
-            this->vdaSignatureCount = kVDAResolverSignatureCount_Sonoma;
-            this->gvaSignature      = &kGVAResolverSignature_Sonoma;
-        } else if (getKernelVersion() >= KernelVersion::Tahoe) {
-            this->vdaSignatures     = kVDAResolverSignatures_Modern;
-            this->vdaSignatureCount = kVDAResolverSignatureCount_Modern;
-            this->gvaSignature      = &kGVAResolverSignature_Tahoe;
-        } else {
-            this->vdaSignatures     = kVDAResolverSignatures_Modern;
-            this->vdaSignatureCount = kVDAResolverSignatureCount_Modern;
-            this->gvaSignature      = &kGVAResolverSignature_Sequoia;
-        }
-        for (auto& applied : this->vdaSignatureApplied) { applied = 0; }
-        this->gvaSignatureApplied = 0;
-        SYSLOG("UserPatch", "Enabling user-space VDA driver patches with dynamic Resolver fallback");
+        SYSLOG("UserPatch", "VA/GVA page manifest requested (validated OS build %s)", MediaPatchManifest::Build);
     }
 }
 
@@ -468,19 +457,16 @@ void UserPatches::selectPatchSet()
         this->signatures     = kResolverSignatures_Ventura;
         this->signatureCount = kResolverSignatureCount_Ventura;
     }
-    for (auto& applied : this->signatureApplied) { applied = 0; }
-    this->mtlHwInfoApplied = false;
 }
 
 void UserPatches::processPatcher(KernelPatcher& patcher)
 {
+    if (this->cacheLock == nullptr) {
+        this->cacheLock = IOSimpleLockAlloc();
+    }
     if (!this->enabled && !this->vdaEnabled) {
         DBGLOG("UserPatch", "User-space driver patches are disabled");
         return;
-    }
-
-    if (this->cacheLock == nullptr) {
-        this->cacheLock = IOSimpleLockAlloc();
     }
 
     const auto* const profile = DeviceProfile::current();
@@ -509,6 +495,13 @@ void UserPatches::processPatcher(KernelPatcher& patcher)
         SYSLOG("UserPatch", "VDA patches requested but this profile does not enable the validated VCN 2.x target");
         this->vdaEnabled = false;
     }
+    this->vp9RegistryEnabled = this->vp9RegistryEnabled && vdaAllowed
+                               && getKernelVersion() == KernelVersion::Tahoe
+                               && nredMediaUsesVCN2Bridge(NRed::singleton().getDeviceID());
+    NRed::singleton().setProp32("NRedVP9RegistryEnabled", this->vp9RegistryEnabled ? 1 : 0);
+    if (this->vp9RegistryEnabled) {
+        SYSLOG("UserPatch", "Optional VP9 registry policy: allowing decoder cdhash %s", VP9PluginAllowlist::CDHash);
+    }
 
     if (currentKernelVersion() >= MACOS_11) {
         if (!glEnabled && !this->vdaEnabled) {
@@ -516,8 +509,23 @@ void UserPatches::processPatcher(KernelPatcher& patcher)
             return;
         }
 
-        SYSLOG_COND(!this->installNativePagePatcher(patcher), "UserPatch",
-                    "Failed to install the dynamic signature patch backend");
+        const auto* const header = reinterpret_cast<const mach_header_64*>(
+            patcher.solveSymbol(KernelPatcher::KernelID, "__mh_execute_header"));
+        if (header != nullptr && header->sizeofcmds <= 0x10000) {
+            this->kernelIdentityMatches = MediaPatchPlan::matchesKernelUUID(
+                reinterpret_cast<const UInt8*>(header), sizeof(*header) + header->sizeofcmds,
+                MediaPatchManifest::KernelUUID);
+        }
+        patcher.clearError();
+        NRed::singleton().setProp32("NRedMediaKernelValidated", this->kernelIdentityMatches ? 1 : 0);
+        this->nativeBackendReady = this->installNativePagePatcher(patcher);
+        if (!this->nativeBackendReady) {
+            SYSLOG("UserPatch", "Failed to install the page backend; hardware media remains disabled");
+        }
+        NRed::singleton().setProp32("NRedMediaPatchSupported", this->mediaSupported() ? 1 : 0);
+        NRed::singleton().setProp32("NRedMediaPatchPagesExpected", arrsize(MediaPatchManifest::Pages));
+        NRed::singleton().setProp32("NRedMediaPatchSitesExpected", MediaPatchManifest::RequiredSites);
+        NRed::singleton().setProp32("NRedMediaPatchComplete", 0);
         return;
     }
 }
@@ -538,8 +546,23 @@ auto UserPatches::installNativePagePatcher(KernelPatcher& patcher) -> bool
         patcher.clearError();
     }
 
-    SYSLOG("UserPatch", "Installed the dynamic signature patch backend");
+    NRed::singleton().setProp32("NRedUserPatchRevision", 9);
+    SYSLOG("UserPatch", "Installed per-page backend (revision 9, VCN 2.2 media policy, HEVC bitstream repair and paired VP9, trace %s)",
+           this->traceEnabled ? "first 128 writes" : "off");
     return true;
+}
+
+void UserPatches::tracePatch(const char* const kind, const size_t signatureIndex,
+                             const UInt64 pageOffset, const size_t matchOffset)
+{
+    if (!this->traceEnabled) { return; }
+    const auto event = OSIncrementAtomic(&this->traceCount);
+    if (event < 128) {
+        SYSLOG("UserPatch", "Write %d: %s signature %zu, file/cache page 0x%llX + 0x%zX",
+               event + 1, kind, signatureIndex, static_cast<unsigned long long>(pageOffset), matchOffset);
+    } else if (event == 128) {
+        SYSLOG("UserPatch", "User patch trace limit reached; patching continues");
+    }
 }
 
 static bool matchSignature(const UInt8* const bytes, const UserPatches::SignaturePatch& sig, size_t& matchOffset, size_t startOffset = 0)
@@ -615,6 +638,12 @@ void UserPatches::recordCachedSite(const VnodeKind vnodeKind, const UInt64 pageO
 
 void UserPatches::reapplyCachedSites(const VnodeKind vnodeKind, const UInt64 pageOffset, const UInt8* const bytes)
 {
+    // Cached offsets are hints, not authority to modify a newly validated page.
+    // In particular, the Metal gate and allow sites must be checked together by
+    // the regular resolver below.
+    if (vnodeKind != kVnodeGLDriver || !this->resolverEnabled || this->signatures == nullptr) {
+        return;
+    }
     const size_t count = static_cast<size_t>(__atomic_load_n(&this->cachedSiteCount, __ATOMIC_ACQUIRE));
     for (size_t i = 0; i < count; ++i) {
         const auto& site = this->cachedSites[i];
@@ -627,6 +656,20 @@ void UserPatches::reapplyCachedSites(const VnodeKind vnodeKind, const UInt64 pag
         if (memcmp(bytes + site.inPageOffset, site.find, site.size) != 0) {
             continue;
         }
+        bool contextMatches = false;
+        for (size_t index = 0; index < 3 && index < this->signatureCount; ++index) {
+            const auto& signature = this->signatures[index];
+            if (signature.find != site.find || signature.replace != site.replace ||
+                signature.replaceSize != site.size ||
+                (signature.pageOffset != ~static_cast<UInt64>(0) && signature.pageOffset != pageOffset)) {
+                continue;
+            }
+            size_t matchOffset = 0;
+            contextMatches = matchSignature(bytes, signature, matchOffset) &&
+                             matchOffset + signature.patchOffset == site.inPageOffset;
+            if (contextMatches) { break; }
+        }
+        if (!contextMatches) { continue; }
 
         if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
             SYSLOG("UserPatch", "Resolver: failed to disable kernel write protection (re-apply)");
@@ -637,6 +680,66 @@ void UserPatches::reapplyCachedSites(const VnodeKind vnodeKind, const UInt64 pag
 
         SYSLOG("UserPatch", "Resolver re-applied cached patch (kind=%u, page=0x%llX, off=0x%X)",
                static_cast<unsigned>(vnodeKind), pageOffset, static_cast<unsigned>(site.inPageOffset));
+    }
+}
+
+void UserPatches::patchMediaPage(const UInt8* const bytes, const MediaPatchPlan::Page& page,
+                                 const size_t pageIndex)
+{
+    auto& bridge = VCNBridge::singleton();
+    if (!this->mediaSupported() || !bridge.userPatchesAllowed()) { return; }
+    auto* const normalized = Buffer::create<UInt8>(kPageSize);
+    if (normalized == nullptr) {
+        bridge.failMedia(20);
+        return;
+    }
+    bool needsWrite = false;
+    bool valid = MediaPatchPlan::normalize(bytes, page, normalized, needsWrite);
+    if (valid) {
+        auto* const digest = Crypto::hash(normalized, kPageSize);
+        if (digest == nullptr) {
+            Buffer::deleter(normalized);
+            bridge.failMedia(20);
+            return;
+        }
+        valid = memcmp(digest, page.maskedSHA256, sizeof(page.maskedSHA256)) == 0;
+        Buffer::deleter(digest);
+    }
+    Buffer::deleter(normalized);
+    if (!valid) {
+        SYSLOG("UserPatch", "Media page rejected: %s:0x%llX; disabling new media work",
+               page.file, static_cast<unsigned long long>(page.offset));
+        bridge.failMedia(21);
+        return;
+    }
+    if (needsWrite) {
+        if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
+            bridge.failMedia(22);
+            return;
+        }
+        // Failure can be published on another thread while this page is being checked.
+        // Do not undo existing pages or change any site until all checks succeeded.
+        if (!bridge.userPatchesAllowed()) {
+            MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+            return;
+        }
+        for (size_t i = 0; i < page.siteCount; ++i) {
+            const auto& site = page.sites[i];
+            memcpy(const_cast<UInt8*>(bytes) + site.offset, site.replace, site.size);
+        }
+        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+        const auto applied = static_cast<UInt32>(OSIncrementAtomic(&this->vdaAppliedCount) + 1);
+        NRed::singleton().setProp32("NRedVCNUserApplied", applied);
+        this->tracePatch("VA/GVA manifest", pageIndex, page.offset, page.sites[0].offset);
+    }
+    // Observed-page coverage is diagnostic only. Never skip a fresh clean page.
+    const auto bit = UInt32{1} << pageIndex;
+    UInt32 old;
+    do { old = this->mediaPagesObserved; }
+    while (!OSCompareAndSwap(old, old | bit, &this->mediaPagesObserved));
+    NRed::singleton().setProp32("NRedMediaPatchPagesObserved", this->mediaPagesObserved);
+    if (this->mediaPagesObserved == MediaPatchManifest::RequiredPageMask) {
+        NRed::singleton().setProp32("NRedMediaPatchComplete", 1);
     }
 }
 
@@ -654,141 +757,99 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
         return;
     }
 
-    const bool isGLDriver    = (strstr(vnodeName, "AMDRadeonX5000GLDriver") != nullptr);
-    const bool isVADriver    = (strstr(vnodeName, "AMDRadeonVADriver") != nullptr);
-    const bool isAppleGVA    = (strstr(vnodeName, "AppleGVA") != nullptr);
-    const bool isSharedCache = (strstr(vnodeName, "dyld_shared_cache") != nullptr) ||
-                               (strstr(vnodeName, "dyld") != nullptr);
+    const bool isGLDriver = strcmp(vnodeName, "AMDRadeonX5000GLDriver") == 0;
+    // Only real Intel cache basenames, not "dyld", substring matches or arbitrary suffixes.
+    const auto cachePrefixSize = sizeof("dyld_shared_cache_x86_64h") - 1;
+    const auto vnodeNameSize = strlen(vnodeName);
+    const bool isSharedCache =
+        (strcmp(vnodeName, "dyld_shared_cache_x86_64h") == 0) ||
+        (vnodeNameSize == cachePrefixSize + 3 &&
+         strncmp(vnodeName, "dyld_shared_cache_x86_64h.", cachePrefixSize + 1) == 0 &&
+         vnodeName[cachePrefixSize + 1] >= '0' && vnodeName[cachePrefixSize + 1] <= '9' &&
+         vnodeName[cachePrefixSize + 2] >= '0' && vnodeName[cachePrefixSize + 2] <= '9');
+    const bool isVP9Cache = strcmp(vnodeName, "dyld_shared_cache_x86_64h") == 0;
+    const MediaPatchPlan::Page* mediaPage = nullptr;
+    size_t mediaPageIndex = 0;
+    if (isSharedCache && this->mediaSupported()) {
+        for (size_t i = 0; i < arrsize(MediaPatchManifest::Pages); ++i) {
+            const auto& page = MediaPatchManifest::Pages[i];
+            if (pageOffset == page.offset && strcmp(vnodeName, page.file) == 0) {
+                mediaPage = &page;
+                mediaPageIndex = i;
+                break;
+            }
+        }
+    }
     vnode_putname(vnodeName);
 
-    VnodeKind vnodeKind = kVnodeNone;
-    if (isGLDriver) {
-        vnodeKind = kVnodeGLDriver;
-    } else if (isVADriver) {
-        vnodeKind = kVnodeVADriver;
-    } else if (isAppleGVA) {
-        vnodeKind = kVnodeAppleGVA;
-    } else if (isSharedCache) {
-        vnodeKind = kVnodeSharedCache;
-    } else {
+    if (isSharedCache && this->kernelIdentityMatches && this->vdaEnabled &&
+        osversion[0] != '\0' && strcmp(osversion, MediaPatchManifest::Build) != 0) {
+        VCNBridge::singleton().failMedia(23);
+    }
+
+    if (!isGLDriver && !isSharedCache) {
         return;
     }
 
     const auto* const bytes = static_cast<const UInt8*>(data);
 
-    // O(1) fast path for previously discovered sites whose clean UBC pages were evicted under
-    // memory pressure and re-faulted from disk. Must run before the `allApplied` early-outs.
-    this->reapplyCachedSites(vnodeKind, pageOffset, bytes);
-
-    // VDA Dynamic Resolver path (AMDRadeonVADriver2: embedded in dyld_shared_cache or loose bundle)
-    // Note: _cs_validate_page is invoked by XNU only once per physical page when the page enters the
-    // global shared-cache vm_object. Do not gate on per-process identity (e.g. WindowServer or BootCache)
-    // or accelerator start timing, as skipping a page during its first fault caches it unpatched globally.
-    if ((isVADriver || isSharedCache) && this->vdaEnabled && this->vdaSignatures != nullptr && this->vdaSignatureCount > 0) {
-        {
-            bool vdaAllApplied = true;
-            for (size_t i = 0; i < this->vdaSignatureCount && i < kMaxVDASignatures; ++i) {
-                if (this->vdaSignatureApplied[i] < this->vdaSignatures[i].count) {
-                    vdaAllApplied = false;
-                    break;
-                }
-            }
-
-            if (!vdaAllApplied) {
-                for (size_t sigIdx = 0; sigIdx < this->vdaSignatureCount; sigIdx++) {
-                    const auto& sig = this->vdaSignatures[sigIdx];
-                    if (sigIdx < kMaxVDASignatures && this->vdaSignatureApplied[sigIdx] >= sig.count) {
-                        continue;
-                    }
-
-                    size_t matchOffset = 0;
-                    size_t searchOffset = 0;
-                    while (sigIdx < kMaxVDASignatures && this->vdaSignatureApplied[sigIdx] < sig.count &&
-                           matchSignature(bytes, sig, matchOffset, searchOffset)) {
-                        // Layer 4: Page boundary verification
-                        if (matchOffset + sig.patchOffset + sig.replaceSize > kPageSize) {
-                            SYSLOG("UserPatch", "Resolver: VDA patch out of page bounds (0x%zX + 0x%zX + 0x%zX)",
-                                   matchOffset, sig.patchOffset, sig.replaceSize);
-                            break;
-                        }
-
-                        if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
-                            SYSLOG("UserPatch", "Resolver: failed to disable kernel write protection (VDA)");
-                            return;
-                        }
-
-                        memcpy(const_cast<UInt8*>(bytes) + matchOffset + sig.patchOffset, sig.replace, sig.replaceSize);
-
-                        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-
-                        this->recordCachedSite(vnodeKind, pageOffset, matchOffset + sig.patchOffset, sig.find,
-                                               sig.replace, sig.replaceSize);
-
-                        SYSLOG("UserPatch", "Resolver patched VDA signature %zu (site %zu/%zu) at page offset 0x%zX",
-                               sigIdx, this->vdaSignatureApplied[sigIdx] + 1, sig.count, matchOffset);
-                        if (sigIdx < kMaxVDASignatures) {
-                            this->vdaSignatureApplied[sigIdx]++;
-                        }
-                        const auto applied = static_cast<UInt32>(OSIncrementAtomic(&this->vdaAppliedCount) + 1);
-                        NRed::singleton().setProp32("NRedVCNUserApplied", applied);
-
-                        searchOffset = matchOffset + 1;
-                    }
-                }
-            }
-        }
-        if (isVADriver && !isSharedCache) {
+    // Optional /Library VP9 plugin support. Keep CoreMedia's original Apple
+    // signature policy and add exactly the paired decoder's cdhash. Unlike a
+    // branch bypass, unrelated third-party plugins still fail validation.
+    // The validated Tahoe cache file, file page, in-page offset and complete
+    // 200-byte original requirement must all match. Reclaimed pages are
+    // rechecked; telemetry never suppresses patching a fresh clean page.
+    if (this->vp9RegistryEnabled && this->mediaSupported() &&
+        VCNBridge::singleton().userPatchesAllowed() && isVP9Cache &&
+        pageOffset == VP9PluginAllowlist::PageOffset &&
+        memcmp(bytes + VP9PluginAllowlist::Offset, VP9PluginAllowlist::Original,
+               sizeof(VP9PluginAllowlist::Original)) == 0) {
+        if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
+            SYSLOG("UserPatch", "Failed to enable writing for the optional VP9 registry policy");
             return;
         }
+        memcpy(const_cast<UInt8*>(bytes) + VP9PluginAllowlist::Offset, VP9PluginAllowlist::Replacement,
+               sizeof(VP9PluginAllowlist::Replacement));
+        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+        const auto applied = static_cast<UInt32>(OSIncrementAtomic(&this->vp9RegistryApplied) + 1);
+        NRed::singleton().setProp32("NRedVP9RegistryApplied", applied);
+        this->tracePatch("VP9 registry policy", 0, pageOffset, VP9PluginAllowlist::Offset);
     }
 
-    // AppleGVA Dynamic Resolver path (embedded in dyld_shared_cache or standalone AppleGVA bundle)
-    if ((isAppleGVA || isSharedCache) && this->vdaEnabled && this->gvaSignature != nullptr &&
-        this->gvaSignatureApplied < this->gvaSignature->count) {
-        {
-            size_t matchOffset = 0;
-            if (matchSignature(bytes, *this->gvaSignature, matchOffset)) {
-                if (matchOffset + this->gvaSignature->patchOffset + this->gvaSignature->replaceSize <= kPageSize) {
-                    if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
-                        memcpy(const_cast<UInt8*>(bytes) + matchOffset + this->gvaSignature->patchOffset,
-                               this->gvaSignature->replace, this->gvaSignature->replaceSize);
-                        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-                        this->recordCachedSite(vnodeKind, pageOffset, matchOffset + this->gvaSignature->patchOffset,
-                                               this->gvaSignature->find, this->gvaSignature->replace,
-                                               this->gvaSignature->replaceSize);
-                        this->gvaSignatureApplied++;
-                        const auto applied = static_cast<UInt32>(OSIncrementAtomic(&this->vdaAppliedCount) + 1);
-                        NRed::singleton().setProp32("NRedVCNUserApplied", applied);
-                        SYSLOG("UserPatch", "Resolver patched AppleGVA signature at page offset 0x%zX", matchOffset);
-                    } else {
-                        SYSLOG("UserPatch", "Resolver: failed to disable kernel write protection (AppleGVA)");
-                    }
-                }
-            }
-        }
-        if (isAppleGVA && !isSharedCache) {
-            return;
-        }
+    if (mediaPage != nullptr) {
+        this->patchMediaPage(bytes, *mediaPage, mediaPageIndex);
+        return;
     }
+
+    // VA/GVA and VP9 pages have their own full-page validation and reapply
+    // on every clean fault. GL cache hits still require a full signature match;
+    // Metal gate/allow pairs are checked together in the regular resolver.
+    this->reapplyCachedSites(isGLDriver ? kVnodeGLDriver : kVnodeSharedCache, pageOffset, bytes);
 
     if (!this->resolverEnabled || this->signatures == nullptr || this->signatureCount == 0) {
         return;
     }
 
-    bool allApplied = this->mtlHwInfoApplied;
-    for (size_t i = 0; i < this->signatureCount && i < kMaxSignatures; ++i) {
-        if (this->signatureApplied[i] < this->signatures[i].count) {
-            allApplied = false;
-            break;
-        }
-    }
-    if (allApplied) { return; }
-
     // Gate 2: GL patches ONLY apply to AMDRadeonX5000GLDriver; Metal patches ONLY apply to dyld shared cache.
     if (isGLDriver) {
+        size_t budgetOffset = 0;
+        if (GLResourceBudgetPatch::find(bytes, kPageSize, budgetOffset)) {
+            if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
+                SYSLOG("UserPatch", "Failed to enable writing for the GL resource budget correction");
+                return;
+            }
+            memcpy(const_cast<UInt8*>(bytes) + budgetOffset, GLResourceBudgetPatch::Replace,
+                   sizeof(GLResourceBudgetPatch::Replace));
+            MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+            this->tracePatch("GL resource budget", 0, pageOffset, budgetOffset);
+            static volatile UInt32 budgetCounter{0};
+            const auto applied = static_cast<UInt32>(OSIncrementAtomic(&budgetCounter) + 1);
+            NRed::singleton().setProp32("NRedGLResourceBudgetApplied", applied);
+        }
         for (size_t signatureIndex = 0; signatureIndex < 3 && signatureIndex < this->signatureCount; signatureIndex++) {
             const auto& signature = this->signatures[signatureIndex];
-            if (signatureIndex < kMaxSignatures && this->signatureApplied[signatureIndex] >= signature.count) {
+            if (signature.count == 0 ||
+                (signature.pageOffset != ~static_cast<UInt64>(0) && signature.pageOffset != pageOffset)) {
                 continue;
             }
 
@@ -804,13 +865,9 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
 
                 MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
 
-                this->recordCachedSite(vnodeKind, pageOffset, matchOffset + signature.patchOffset, signature.find,
-                                       signature.replace, signature.replaceSize);
-
-                SYSLOG("UserPatch", "Resolver patched GL signature %zu at page offset 0x%zX", signatureIndex, matchOffset);
-                if (signatureIndex < kMaxSignatures) {
-                    this->signatureApplied[signatureIndex]++;
-                }
+                this->recordCachedSite(kVnodeGLDriver, pageOffset, matchOffset + signature.patchOffset,
+                                       signature.find, signature.replace, signature.replaceSize);
+                this->tracePatch("GL", signatureIndex, pageOffset, matchOffset + signature.patchOffset);
                 static volatile UInt32 glResolverCounter{0};
                 const auto glCount = static_cast<UInt32>(OSIncrementAtomic(&glResolverCounter) + 1);
                 NRed::singleton().setProp32("NRedGLResolverApplied", glCount);
@@ -821,7 +878,8 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
         // AMDRadeonX5000MTLDriver lives inside dyld shared cache. We must patch
         // gfx9_HwInfoInitData so numShaderEngines is 1 instead of 4, preventing
         // VideoToolbox / QuickLook compute wavefront hangs on AMD APUs.
-        if (this->signatureCount > 0 && !this->mtlHwInfoApplied) {
+        if (this->signatures[0].count > 0 &&
+            (this->signatures[0].pageOffset == ~static_cast<UInt64>(0) || this->signatures[0].pageOffset == pageOffset)) {
             const auto& hwSig = this->signatures[0];
             size_t matchOffset = 0;
             if (matchSignature(bytes, hwSig, matchOffset)) {
@@ -833,16 +891,12 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
                     for (size_t off = 0; off + sizeof(kGLDriverHwInfoFind) <= kPageSize; ++off) {
                         if (memcmp(bytes + off, kGLDriverHwInfoFind, sizeof(kGLDriverHwInfoFind)) == 0) {
                             memcpy(const_cast<UInt8*>(bytes) + off, kGLDriverHwInfoReplace, sizeof(kGLDriverHwInfoReplace));
-                            this->recordCachedSite(vnodeKind, pageOffset, off, kGLDriverHwInfoFind,
-                                                   kGLDriverHwInfoReplace, sizeof(kGLDriverHwInfoReplace));
                             replacedCount++;
                         }
                     }
                     MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-                    this->mtlHwInfoApplied = true;
                     NRed::singleton().setProp32("NRedMTLHwInfoApplied", static_cast<UInt32>(replacedCount));
-                    SYSLOG("UserPatch", "Resolver patched Metal HwInfo (%zu branches 4->1) at page match 0x%zX",
-                           replacedCount, matchOffset);
+                    this->tracePatch("Metal HwInfo", 0, pageOffset, matchOffset + hwSig.patchOffset);
                 } else {
                     SYSLOG("UserPatch", "Resolver: failed to disable kernel write protection (Metal HwInfo)");
                 }
@@ -851,16 +905,13 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
 
         // Gate 3: For Metal signatures in dyld shared cache, require co-occurrence of Gate and Allow
         // on the exact same 4KB page, within a sane relative distance (< 0x500 bytes).
-        // Signatures index 3 & 4 in all tables represent the Gate and Allow pair.
+        // The third GL signature occupies index 2; Metal Gate/Allow are 3/4.
         if (this->signatureCount >= 5) {
             const auto& gateSig = this->signatures[3];
             const auto& allowSig = this->signatures[4];
 
             if (gateSig.pageOffset == ~static_cast<UInt64>(0) && allowSig.pageOffset == ~static_cast<UInt64>(0)) {
-                const bool needGate = (3 >= kMaxSignatures || this->signatureApplied[3] < gateSig.count);
-                const bool needAllow = (4 >= kMaxSignatures || this->signatureApplied[4] < allowSig.count);
-
-                if (needGate && needAllow) {
+                if (gateSig.count > 0 && allowSig.count > 0) {
                     size_t gateMatch = 0;
                     size_t allowMatch = 0;
                     if (matchSignature(bytes, gateSig, gateMatch) && matchSignature(bytes, allowSig, allowMatch)) {
@@ -880,15 +931,8 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
 
                             MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
 
-                            this->recordCachedSite(vnodeKind, pageOffset, gateMatch + gateSig.patchOffset,
-                                                   gateSig.find, gateSig.replace, gateSig.replaceSize);
-                            this->recordCachedSite(vnodeKind, pageOffset, allowMatch + allowSig.patchOffset,
-                                                   allowSig.find, allowSig.replace, allowSig.replaceSize);
-
-                            SYSLOG("UserPatch", "Resolver matched and patched Metal Gate (0x%zX) and Allow (0x%zX) atomically",
-                                   gateMatch, allowMatch);
-                            if (3 < kMaxSignatures) { this->signatureApplied[3]++; }
-                            if (4 < kMaxSignatures) { this->signatureApplied[4]++; }
+                            this->tracePatch("Metal Gate", 3, pageOffset, gateMatch + gateSig.patchOffset);
+                            this->tracePatch("Metal Allow", 4, pageOffset, allowMatch + allowSig.patchOffset);
 
                             static volatile UInt32 blendResolverCounter{0};
                             const auto count = static_cast<UInt32>(OSIncrementAtomic(&blendResolverCounter) + 1);

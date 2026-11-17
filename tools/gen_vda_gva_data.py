@@ -187,13 +187,12 @@ class GeneratorError(RuntimeError):
 
 
 def warn_if_live_patched_cache(cache_dir: Path) -> bool:
-    """Detect reading the running system's cache on a `-NRedVDA`/`-NRedAVC` boot.
+    """Detect reading a live cache while default-on media patching may be active.
 
     The user-space page patcher writes replacement bytes into the dyld cache's
     file-backed page cache, so reads through that cache can return patched bytes
     (or flip between stock and patched as pages are evicted and re-validated).
-    Generation for the running system is only trustworthy on a boot without the
-    VDA boot-args, or against a mounted offline volume.
+    Generation needs a boot with -NRedNoVDA (or NootedRed off), or an offline volume.
 
     Returns True when the cache is a live one and the patches are active this
     boot; callers warn for `--check` but must refuse to generate.
@@ -204,10 +203,10 @@ def warn_if_live_patched_cache(cache_dir: Path) -> bool:
         bootargs = subprocess.check_output(["/usr/sbin/sysctl", "-n", "kern.bootargs"], text=True)
     except (OSError, subprocess.SubprocessError):
         return False
-    if "-NRedVDA" in bootargs or "-NRedAVC" in bootargs:
+    if not ({"-NRedNoVDA", "-NRedOff"} & set(bootargs.split())):
         print(
-            "warning: this boot has the VDA user-space patches active; pages of the live dyld "
-            "cache may read back patched bytes. Regenerate on a boot without -NRedVDA/-NRedAVC "
+            "warning: VDA user-space patches are enabled by default; pages of the live dyld "
+            "cache may read back patched bytes. Regenerate on a boot with -NRedNoVDA/-NRedOff "
             "or against an offline volume if any verification fails unexpectedly.",
             file=sys.stderr,
         )

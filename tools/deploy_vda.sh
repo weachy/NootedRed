@@ -2,10 +2,11 @@
 # Install the current NootedRed release kext on an OpenCore EFI partition.
 # Usage:
 #   tools/deploy_vda.sh --esp /Volumes/EFI            # install (keeps a timestamped backup)
+#   tools/deploy_vda.sh --esp /Volumes/EFI --kext /path/to/NootedRed.kext
 #   tools/deploy_vda.sh --esp /Volumes/EFI --restore  # restore the newest timestamped backup
 #   tools/deploy_vda.sh --list-backups --esp /Volumes/EFI
 #
-# This script never reboots and never edits the OpenCore config/boot-args. Add -NRedVDA yourself (see
+# This script never reboots and never edits the OpenCore config/boot-args. Media is default-on (see
 # docs/VDA-Deployment.md). Run it from the repository root; it needs sudo for the ESP writes.
 set -euo pipefail
 
@@ -13,38 +14,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BACKUP_DIR="${ROOT}/build/efi-backup"
 ESP=""
 ACTION="install"
-
-# Artifacts live under build/branches/<branch>/... after the per-branch build change; keep the old
-# build/macosx path as a fallback for existing checkouts.
-find_kext() {
-    local branch
-    branch="$(git -C "${ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-    if [[ -z "${branch}" || "${branch}" == "HEAD" ]]; then
-        branch="detached-$(git -C "${ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-    fi
-    branch="$(printf '%s' "${branch}" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
-    [[ -n "${branch}" ]] || branch="unknown"
-
-    local main_root
-    main_root="$(cd "$(git -C "${ROOT}" rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd || true)"
-
-    local candidate
-    for candidate in \
-        "${ROOT}/build/branches/${branch}/macosx/x86_64/release/NootedRed.kext" \
-        "${ROOT}/build/branches/shared/macosx/x86_64/release/NootedRed.kext" \
-        "${ROOT}/build/macosx/x86_64/release/NootedRed.kext" \
-        "${main_root}/build/branches/${branch}/macosx/x86_64/release/NootedRed.kext" \
-        "${main_root}/build/branches/shared/macosx/x86_64/release/NootedRed.kext" \
-        "${main_root}/build/artifacts/${branch}/NootedRed.kext"; do
-        if [[ -d "${candidate}" ]]; then
-            printf '%s\n' "${candidate}"
-            return 0
-        fi
-    done
-
-    find "${ROOT}/build" -path '*/macosx/x86_64/release/NootedRed.kext' -type d 2>/dev/null | head -n1
-}
-SRC="$(find_kext)"
+SRC=""
 
 usage() {
     sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
@@ -54,6 +24,9 @@ usage() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --esp) ESP="${2:-}"; shift 2 ;;
+        --kext)
+            [[ $# -ge 2 && -n "$2" ]] || { echo "missing --kext path" >&2; exit 1; }
+            SRC="$2"; shift 2 ;;
         --restore) ACTION="restore"; shift ;;
         --list-backups) ACTION="list"; shift ;;
         -h|--help) usage ;;
@@ -95,9 +68,20 @@ case "${ACTION}" in
         echo "restored; reboot to apply"
         ;;
     install)
-        if [[ -z "${SRC}" || ! -d "${SRC}" ]]; then
-            echo "missing build artifact (looked under build/branches/* and build/macosx)" >&2
-            echo "run: tools/build-branch.sh -m release -y" >&2
+        if [[ -z "${SRC}" ]]; then
+            SRC="$(sh "${ROOT}/tools/release_kext_path.sh")"
+        fi
+        if [[ ! -s "${SRC}/Contents/MacOS/NootedRed" ]]; then
+            echo "missing selected build artifact: ${SRC}" >&2
+            echo "build with the same NRED_BUILD_BRANCH, or pass --kext explicitly" >&2
+            exit 1
+        fi
+        # Resolve symlinks before replacing the destination. An explicit
+        # source inside that destination would otherwise be deleted first.
+        SRC="$(cd "${SRC}" && pwd -P)"
+        DST="$(cd "${ESP}/EFI/OC/Kexts" && pwd -P)/NootedRed.kext"
+        if [[ "${SRC}" == "${DST}" || "${SRC}" == "${DST}/"* ]]; then
+            echo "source kext must be outside the install destination: ${SRC}" >&2
             exit 1
         fi
         NEW_HASH="$(shasum -a 256 "${SRC}/Contents/MacOS/NootedRed" | awk '{print $1}')"
@@ -105,8 +89,12 @@ case "${ACTION}" in
         echo "new kext SHA-256: ${NEW_HASH}"
         if [[ -d "${DST}" ]]; then
             OLD_HASH="$(shasum -a 256 "${DST}/Contents/MacOS/NootedRed" | awk '{print $1}')"
-            STAMP="$(date +%Y%m%d-%H%M%S)"
+            STAMP="$(date +%Y%m%d-%H%M%S)-$$"
             BACKUP="${BACKUP_DIR}/NootedRed-${STAMP}.kext"
+            if [[ -e "${BACKUP}" ]]; then
+                echo "backup already exists; refusing to overwrite it: ${BACKUP}" >&2
+                exit 1
+            fi
             echo "backing up current kext (${OLD_HASH}) -> ${BACKUP}"
             ${SUDO} ditto "${DST}" "${BACKUP}"
         fi
@@ -124,7 +112,7 @@ case "${ACTION}" in
             exit 1
         fi
         echo "verified installed SHA-256: ${INSTALLED_HASH}"
-        echo "installed. Add -NRedVDA to boot-args for the VDA experiment, then reboot."
-        echo "boot once without -NRedVDA first to confirm the default-off path is still green."
+        echo "installed; reboot to apply. Media is enabled by default on the validated build/device."
+        echo "To disable media, use -NRedNoVDA. Run tools/vda_hwtest.sh after boot."
         ;;
 esac

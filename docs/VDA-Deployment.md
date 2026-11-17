@@ -1,146 +1,189 @@
-# VDA Hardware Decode — Deployment and Validation Runbook
+# VCN media deployment and validation
 
-Status: the kernel bridge and the 15.8.1 user-space patch pipeline are implemented in
-`feature/vda-hardware-decode`. Everything is opt-in and default-off; a normal boot without `-NRedVDA` is
-unchanged. This runbook is for the first hardware bring-up on a Renoir `0x1638` test machine
-(macOS 15.8.1 / Darwin 24.6).
+Hardware media is enabled by default. `-NRedNoVDA` disables the bridge and its
+codec properties; `-NRedNoHEVC` keeps AVC only; `-NRedNoHEVC10` disables Main10
+encode and decode through the Main-only policy (which also omits 8-bit Main Still
+Picture decode). The old `-NRedVDA` argument is not required. Optional VP9 still requires
+`-NRedVP9` and the matching plugin cdhash.
 
-> **Safety first:** keep a bootable EFI backup and know how to remove `-NRedVDA` from the OpenCore
-> config/NVRAM before booting with the new kext. If the accelerator hangs during boot, boot with the
-> backup EFI (or `-NRedOff`) and restore the previous kext.
+This fork's hardened VA/GVA path currently has one checked-in manifest:
+macOS 26.7.2 / **25G332**, cache UUID
+`21FB8708-FC8E-3765-BE8C-65D612CDF049`, VA image UUID
+`1181E2CA-31B3-3DF0-90E2-3AE70552D753`, AppleGVA image UUID
+`CC4FCC4C-C670-3359-A682-BCBAEA945214`.
+The early boot identity is kernel UUID `28267FD5-3E1E-3686-8A1C-E73E2466FCFB`.
+Other OS builds use graphics without this media bridge until a reviewed manifest
+is added. Historical Ventura/Sonoma/Sequoia resolver signatures are derivation
+inputs, not permission to patch an unknown image at runtime.
 
-## 1. Build
-
-Use the CommandLineTools toolchain while the default Xcode select is broken on this machine:
-
-```sh
-cd /Volumes/WorkSpace/Projects/Hackintosh/NootedRed
-DEVELOPER_DIR=/Library/Developer/CommandLineTools xmake f -m release -y
-DEVELOPER_DIR=/Library/Developer/CommandLineTools xmake -y
-```
-
-Artifact: `build/branches/<branch>/macosx/x86_64/release/NootedRed.kext`
-(zip: `.../NootedRed-0.9.0-RELEASE.zip`). The supported build wrapper is `tools/build-branch.sh`;
-see [Build-Artifacts.md](Build-Artifacts.md). `tools/deploy_vda.sh` locates the current branch artifact
-automatically (it also accepts the old `build/macosx/...` layout).
-
-Before deploying, run the read-only preflight; it verifies the OS/Darwin, iGPU, dGPU/X6000 state, kernel
-collection, generated data and build artifact:
+## Build and preflight
 
 ```sh
+tools/build-branch.sh -y
 tools/vda_preflight.sh
 ```
 
-## 2. Back up the working EFI kext
+The artifact is
+`build/branches/<branch>/macosx/x86_64/release/NootedRed.kext`.
+`NRED_BUILD_BRANCH` selects the same sanitized branch directory for building,
+preflight and deployment. Preflight and deployment also accept `--kext` for
+an explicit candidate. They do not fall back to another branch or a stale
+shared/legacy build when the selected artifact is missing.
+Preflight checks the current cache and both image UUIDs, all 34 required VA/GVA
+sites, eighteen page fingerprints and the generated manifest. It submits no GPU work.
+
+`tools/media_patch_manifest.py` reads only image metadata, named VA functions,
+AppleGVA's bounded `__text`, and the eighteen target pages. It never scans/maps the
+entire cache. Site windows accept only their declared original or replacement;
+only those windows are zeroed for the page SHA-256. UUIDs are verified in preflight.
+Runtime pins the kernel Mach-O UUID before enabling media. `kern.osversion` can
+still be empty before launchd publishes it; an empty string alone grants nothing.
+Once populated, the build must also match or media is latched off. Runtime checks
+the exact cache basename/file offset, every site's
+bytes and the masked whole-page SHA-256. No filesystem reads occur in pager hooks.
+
+The checked-in fingerprints were derived from live pages on November 16–17, 2026, with
+the old kext active. They describe the observed bytes outside declared patch
+windows; they are **not independent stock-cache evidence**. The generator never
+silently reconstructs unknown bytes. For a new build, generate a candidate to a
+file outside the repository, review the identities/semantic sites and run host
+and post-boot validation before adopting it. Prefer an offline cache or a clean
+`-NRedNoVDA` boot for independent stock comparison.
+
+## Install and rollback
+
+Back up the complete working EFI outside the repository before installing.
+`tools/deploy_vda.sh --esp /Volumes/EFI` also backs up the previous kext under
+ignored `build/efi-backup/` and verifies the installed executable's SHA-256.
+It does not reboot or change boot arguments.
+
+To disable media for troubleshooting, add **`-NRedNoVDA`**, then reboot.
+Removing `-NRedVDA` does not disable the default-on bridge. The helper supports
+`tools/set_vda_bootarg.sh --enable` and `--disable` (with `--esp` as needed).
+Use the backup EFI or `-NRedOff` if graphics cannot start, then restore the
+previous kext. Keep the paired VP9 plugin when restoring a kext that expects
+its exact hash; rebuilding the plugin requires a new paired allowlist.
+
+## Strict post-boot test
 
 ```sh
-# adapt the ESP mount point if needed
-sudo mount -t msdos /dev/diskXsY /Volumes/EFI
-sudo ditto /Volumes/EFI/EFI/OC/Kexts/NootedRed.kext \
-            "build/efi-backup/NootedRed-preVDA.kext"
-shasum -a 256 /Volumes/EFI/EFI/OC/Kexts/NootedRed.kext/Contents/MacOS/NootedRed
+tools/vda_selftest.sh
+VDA_TEST_PYTHON=/path/to/python-with-pyav-and-numpy tools/vda_hwtest.sh
+VDA_TEST_PYTHON=/path/to/python-with-pyav-and-numpy tools/vda_hwtest.sh --square-hevc --require-main10
 ```
 
-## 3. Install the new kext
+The diagnostic script does not report a hardware pass. The strict test compiles
+`vda_codec_probe.m` into a temporary directory, requires hardware in both
+VideoToolbox session specifications and queries both actual `UsingHardware`
+properties. Missing dependencies or disabled media return **77 / incomplete**,
+never PASS.
 
-```sh
-sudo rm -rf /Volumes/EFI/EFI/OC/Kexts/NootedRed.kext
-sudo ditto build/macosx/x86_64/release/NootedRed.kext \
-            /Volumes/EFI/EFI/OC/Kexts/NootedRed.kext
-shasum -a 256 /Volumes/EFI/EFI/OC/Kexts/NootedRed.kext/Contents/MacOS/NootedRed
-```
+The default matrix is 30 frames each:
 
-## 4. Enable the opt-in boot argument
+- H.264 High and HEVC Main 8-bit encode/decode at 1920×1080,
+  1918×1080 and 3840×2160;
+- independent software-encoded H.264 / HEVC Main / HEVC Main10 1080p input
+  with B frames, decoded by hardware;
+- HEVC Main10 encode/decode at all three dimensions when
+  `NRedHEVC10EncodeAdvertised=1`. Use `tools/vda_hwtest.sh --require-main10`
+  to fail before submitting GPU work if this feature is missing after reboot.
 
-Add `-NRedVDA` to the OpenCore `NVRAM/Add/7C436110-AB2A-4BBB-A880-FE41995C9F82/boot-args` value (keep the
-existing arguments, e.g. `-NRedGLFix` if used). Do **not** add `-NRedNoAccel` at the same time.
+The encoder uses its NV12 IOSurface pixel-buffer pool and actual row pitches.
+`--square-hevc` adds 4096×4096 HEVC Main and Main10 encode/decode cases and
+requires the active revision-9 18-page/34-site manifest before submitting any
+square work. The native probe also requires its explicit square-test gate.
+Independent PyAV/FFmpeg software decoding is compared with the hardware output
+over effective NV12/P010 pixels, excluding row padding. B frames are ordered by
+PTS; duplicate timestamps, dropped/missing frames, unexpected dimensions/format
+and any pixel mismatch fail the test. A sampled Y/U/V source reconstruction
+check (minimum 30 dB PSNR on this synthetic pattern) also catches pitch/chroma
+errors that matching decoders of the same bad encode would miss. Main10 source
+samples vary all ten bits; source quality is measured directly in
+`yuv420p10le`, without reducing the result to eight bits first.
 
-The helper script backs up and lint-checks the config before/after the change:
+No generated binaries, media or logs are written into the source checkout.
+`--work-dir` selects an external report directory. `results.json` records which
+cases passed, failed or were skipped and the running kext identity. A failure
+stops the matrix. The test checks engine readiness/resource failures afterward;
+with the new kext it also requires full manifest page coverage.
 
-```sh
-tools/set_vda_bootarg.sh --show     # current state
-tools/set_vda_bootarg.sh --add      # add -NRedVDA (backup in build/efi-backup/)
-tools/set_vda_bootarg.sh --remove   # rollback the boot argument
-```
+This is bounded correctness validation, not 4K60 throughput, real-content
+compression quality, HDR metadata, sleep/wake, concurrent recording/playback or
+long-term stability acceptance. CPU generation/readback/hash work is included in
+the native timings. Do not call those timings codec FPS benchmarks.
 
-For the first experiment, leave `-NRedVDA` out and boot once to confirm the graphics path is unchanged and
-there are no VCN logs beyond the disabled message. Then add `-NRedVDA` and boot again.
+## Readiness and failure behavior
 
-## 5. Post-boot validation (read-only)
+Personality injection requires a supported device, reviewed media manifest,
+installed page backend and no latched failure. It intentionally does not require
+an allocated engine: injection precedes accelerator start. Page writes require
+both prepared drivers, native load completion and engine allocation, but not a
+successful first `initHardware`, which may depend on the first userspace session.
 
-Run [`tools/vda_selftest.sh`](../tools/vda_selftest.sh) after boot (basic diagnostics), then
-[`tools/vda_hwtest.sh`](../tools/vda_hwtest.sh) for the automated decode comparison. They collect:
+Each target page is checked completely before any of its sites is written.
+Reclaimed clean pages are always checked/patched again. Global counters and the
+observed-page mask are telemetry only. All-pages coverage is not an atomic
+transaction across demand-paged images: preflight checks the complete set before
+deployment, runtime validates each page when it arrives and latches off new media
+work on a mismatch. A page not yet faulted cannot be declared runtime validated.
 
-- `uname -r`, `sw_vers`, boot args;
-- `ioreg -l -w0 -r -n IGPU | grep -E 'NRed(VDA|VCN)'` (requested / native load / ABI validated / engine
-  allocated / last hardware init / user patch diagnostics);
-- `log show --last boot --info --debug --predicate 'eventMessage CONTAINS "VCN" OR eventMessage CONTAINS "VDA" OR eventMessage CONTAINS "UserPatch"'`;
-- `ffmpeg -hwaccels` (if ffmpeg is installed);
-- recent `.gpuRestart`/WindowServer watchdog reports.
+On kernel preparation/load/allocation/init failure or a rejected target page,
+`NRedVCNMediaFailure` records the first reason and new media page writes stop.
+Published codec properties are removed from the active accelerator. Existing
+bridged objects keep their ABI routing after a late page failure; disabling an
+advertisement must not reinterpret their object layouts.
 
-Expected progression on a successful boot with `-NRedVDA`:
+Already patched shared-cache pages and existing clients cannot be made stock or
+forced into software merely by changing a boolean. Exit/recreate sessions and
+reboot with `-NRedNoVDA` or restore the backup to obtain a clean disabled boot.
+This is containment, not a promise that every client can recover without reboot.
 
-```text
-VCN: X5000 VCN entry points prepared
-VCN: X6000 native load status=0x0 prepared5=1 prepared6=1
-VCN: X6000 VCN bridge prepared (N call-site patches)
-VCN: X6000 initHardware channel=... result=1        # when a decoder is created
-X5000: VCN0 media engine enabled from the device profile
-```
+Useful properties:
 
-`NRedVCNX5000Seen=1`, `NRedVCNX6000Seen=1`, `NRedVCNAccelStartSeen=1` show that the kext-load/start hooks
-ran at all; `NRedVCNX5000ABIValidated=1`, `NRedVCNX6000ABIValidated=1`, `NRedVCNNativeLoadReady=1`,
-`NRedVCNEngineAllocated=1` in ioreg are the kernel-side success markers. `NRedVCNUserApplied` counts VDA user-space page write events (VA/AppleGVA); it only increases once the
-bridge is ready. It is a diagnostic, not a count of distinct live pages, and pages already patched in the
-shared-cache page cache stay patched until reboot.
+| Property | Meaning |
+| --- | --- |
+| `NRedUserPatchRevision=9` | shared VCN 2.2 policy, initialized encoder records and square HEVC bitstream repair |
+| `NRedMediaKernelValidated=1` | exact kernel Mach-O UUID matched |
+| `NRedMediaPatchSupported=1` | exact build and page hook available |
+| `NRedMediaPatchPagesExpected=18` | required VA/GVA pages |
+| `NRedMediaPatchSitesExpected=34` | required sites |
+| `NRedHEVC10EncodeAdvertised=1` | Main10 encode published after VCN 2.2 and exact driver/backend checks |
+| `NRedMediaPatchPagesObserved` | bitmask of validated page indices |
+| `NRedMediaPatchComplete=1` | every required page observed at least once |
+| `NRedVCNUserPatchesAllowed=1` | allocated bridge may patch media pages |
+| `NRedVCNMediaFailure` | first failure; absent/zero on a healthy boot |
 
-## 6. Decode test
+Main10 **encode and decode** passed bounded process-local hardware validation on
+Renoir 4750U / PCI `0x1636`, using this manifest's exact instruction replacements.
+The XML retains conservative Main-only encoding defaults. Runtime adds encode
+profile 2 and capability level `"2"` for the four shared VCN 2.2 PCI IDs, the
+matching media backend/build and enabled HEVC/Main10 policy. Hardware validation
+remains specific to PCI `0x1636`; the other devices have policy validation only.
 
-`tools/vda_hwtest.sh` generates small H.264 (720p and the known-adverse 64x64) and HEVC clips, decodes them
-with both VideoToolbox and software, compares the raw output and checks the VDA logs/reset reports. The
-manual equivalent is:
+The encode changes select P010 from the actual source texture's two-byte
+elements, set both input bit depth and packing, and signal zero per-slice chroma
+QP deltas to match the tested VCN2 output. NV12 and P010 share the same internal
+texture enum, so enum-only detection is insufficient. Native GPU source pitch,
+10-bit reference-buffer allocation, bitrate and luma QP logic are retained.
+Independent per-slice chroma QP deltas are not exposed by this compatibility
+path. Main10 support does not imply HDR metadata handling or 4K60 throughput
+acceptance. See `analysis/hevc-main10-20261116.md` for the evidence and test scope.
 
-```sh
-ffmpeg -hwaccel videotoolbox -i sample_h264.mp4 -f null -
-ffmpeg -hwaccel videotoolbox -i sample_hevc.mp4 -f null -
-ffmpeg -i sample_h264.mp4 -f null -            # software reference
-```
+The revision-9 EFI kext and paired VP9 plugin were installed and booted on the
+tested Renoir 4750U. IORegistry confirmed revision 9 and complete 18-page
+coverage. The 14-case public VideoToolbox matrix passed 30 frames per case,
+including square HEVC Main and Main10; 4096×4096 H.264 High encoding also
+passed 30 frames with independent CPU decoding. The square AVC hardware
+decoder remains blocked by the bundled firmware. These observations are
+specific to the tested machine and exact 25G332 cache identities.
 
-Also test a real application path (Safari/Apple TV/Chromium video) and a 64×64 H.264 stream (a known
-adverse case from the community fork). Watch for:
-
-- decoder creation but no frames (VCN0Dec stall);
-- WindowServer watchdog / desktop freeze;
-- `Kernel_*.gpuRestart` reports;
-- system network/audio panics (reported by the fork for Apple TV DRM).
-
-## 7. Validated results (2026-10-19)
-
-The target passed the real-hardware runs on 2026-10-19 (latest loaded kext SHA-256
-`3495df006ca54f4d9cfd4899e23126efeb1009c9a0ea51660b4bf3c27a9121ba`):
-
-- `NRedVCNStage=11`, both ABI guards `=1`, X6000 native load ready, engine allocated, VCN
-  `initHardware=1`; VA/AppleGVA patches applied and `h264_videotoolbox`/`hevc_videotoolbox` encode works;
-- H.264 720p, 64x64 H.264 and HEVC 720p VideoToolbox decodes matched the software output;
-- 5 repeated 1080p H.264 + 5 repeated 1080p HEVC decodes matched and produced no `.gpuRestart`;
-- ffmpeg exposes `videotoolbox_vld` for H.264; AppleGVA logs for HEVC show
-  `useHighPerformanceDecode = 1` and disposed physical/virtual accelerators.
-
-Remaining acceptance: default-off boot of this build, Chromium/real-app playback, DRM/Apple TV, 10-bit HEVC,
-long-duration playback, Hackintool create/destroy and other APUs.
-
-## 8. Failure handling / rollback
-
-1. Boot the backup EFI (or add `-NRedOff` to boot-args) so NootedRed does not load.
-2. Remove `-NRedVDA` from the OpenCore config/NVRAM.
-3. Restore `build/efi-backup/NootedRed-preVDA.kext` over the ESP kext.
-4. Optionally boot with only the graphics fix (`-NRedGLFix`) to confirm the baseline.
-
-The new kernel code has no panic path: ABI mismatch, failed X6000 load, failed engine allocation and
-failed user-space page matching all return safely and stop installing new VDA patches. The user-space
-VA/AppleGVA pages, however, are written into the shared-cache page cache after code-signing validation:
-once applied they are system-wide for the rest of the boot and cannot be reliably rolled back. A failure
-after that point disables further patching but does not make already-patched clients stock again; reboot
-to return to a clean cache. A hang, if any, would be inside Apple's native VCN2 engine/power path, which
-is exactly what the staged validation above is meant to isolate. Keep the backup EFI and rollback steps
-ready.
+Revision 9 retains the initialized native VCN2 encoder rate/quality records
+and repairs the HEVC 4096×4096 output descriptor: the native 128 MiB
+allocation stays intact while the VCN firmware receives a 64 MiB circular
+ring length. The height gate now admits Main and Main10 square frames.
+Process-local hardware trials independently reconstructed both profiles
+and confirmed that 4096×2304 keeps its 72 MiB descriptor. See
+[the square repair report](../analysis/hevc-square-repair-20261117.md).
+AVC 4096×4096 hardware decoding remains blocked by the bundled firmware's
+16-bit macroblock-count overflow; see
+[the firmware proof](../analysis/avc-firmware-limit-20261117.md).

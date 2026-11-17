@@ -1,73 +1,61 @@
 #!/usr/bin/env python3
-"""Host-side check of the version/family patch-set selection rules.
+"""Execute the current GL signature selector, not the removed PatchSet table.
 
-This mirrors the small pure selection loop in UserPatches::selectPatchSet().
-It does not load the kext; it catches table/ordering regressions before a reboot.
+Media enablement has separate exact-build and device gates in test_media_policy
+and test_userpatch_lifecycle. Selecting GL signatures is not media approval.
 """
+from pathlib import Path
+import re
+import subprocess
+import tempfile
 
-from dataclasses import dataclass
-
-RENOIR = 1 << 3
-RENOIR_E = 1 << 4
-GREEN_SARDINE = 1 << 5
-RAVEN = 1 << 0
-RAVEN2 = 1 << 1
-PICASSO = 1 << 2
-ALL = 0x3F
+from test_userpatch_lifecycle import REPO, STUBS, function
 
 
-@dataclass(frozen=True)
-class PatchSet:
-    name: str
-    major: int
-    minor: int
-    apus: int
-
-
-SETS = [
-    PatchSet("15.8.1 / Renoir-family", 24, 6, RENOIR | RENOIR_E | GREEN_SARDINE),
-    PatchSet("15.8.1 / Raven-family", 24, 6, RAVEN | RAVEN2 | PICASSO),
-    PatchSet("15.8.1 / gfx9 APU fallback", 24, 6, ALL),
-    PatchSet("26.7.1 / gfx9 APU", 25, 6, ALL),
-]
-
-
-def select(major: int, minor: int, apus: int) -> str | None:
-    for patch_set in SETS:
-        if (major, minor) < (patch_set.major, patch_set.minor):
-            continue
-        if (major, minor) > (patch_set.major, patch_set.minor):
-            continue
-        if apus == 0:
-            if patch_set.apus != ALL:
-                continue
-        elif patch_set.apus & apus == 0:
-            continue
-        return patch_set.name
-    return None
-
-
-def main() -> None:
-    cases = [
-        (24, 6, RENOIR | GREEN_SARDINE, "15.8.1 / Renoir-family"),
-        (24, 6, RENOIR_E, "15.8.1 / Renoir-family"),
-        (24, 6, RAVEN, "15.8.1 / Raven-family"),
-        (24, 6, RAVEN2, "15.8.1 / Raven-family"),
-        (24, 6, PICASSO, "15.8.1 / Raven-family"),
-        (24, 6, 0, "15.8.1 / gfx9 APU fallback"),
-        (24, 5, RENOIR, None),
-        (24, 7, RENOIR, None),
-        (25, 6, RENOIR, "26.7.1 / gfx9 APU"),
-        (25, 5, RENOIR, None),
-        (23, 6, RENOIR, None),
-    ]
-    for major, minor, apus, expected in cases:
-        got = select(major, minor, apus)
-        status = "ok" if got == expected else "FAIL"
-        print(f"{status}: macOS/Darwin {major}.{minor} apus=0x{apus:02X} -> {got}")
-        if got != expected:
-            raise SystemExit(1)
-    print("all patch-set selection cases passed")
+def main():
+    source = (REPO / "NootedRed/UserPatches.cpp").read_text()
+    header = re.sub(r"^#(?:include|pragma).*$", "",
+                    (REPO / "NootedRed/UserPatches.hpp").read_text(), flags=re.M)
+    header = header.replace("private:", "public:")
+    begin = source.index("namespace\n{")
+    tables = source[begin:source.index("}    // namespace", begin) + 1]
+    selector = function(source, "void UserPatches::selectPatchSet()")
+    plan = re.sub(r"^#(?:include|pragma).*$", "",
+                  (REPO / "NootedRed/MediaPatchPlan.hpp").read_text(), flags=re.M)
+    unit = STUBS + plan + r"""
+namespace KernelVersion {
+    constexpr int Ventura = 22, Sonoma = 23, Sequoia = 24, Tahoe = 25;
+}
+int runningMajor;
+int getKernelVersion() { return runningMajor; }
+""" + header + tables + selector + r"""
+int main() {
+    unsigned checks = 0;
+    for (runningMajor = 19; runningMajor <= 27; ++runningMajor) {
+        UserPatches patches;
+        patches.selectPatchSet();
+        const auto* expected = runningMajor >= 25 ? kResolverSignatures_Tahoe :
+            runningMajor == 24 ? kResolverSignatures :
+            runningMajor == 23 ? kResolverSignatures_Sonoma : kResolverSignatures_Ventura;
+        if (patches.signatures != expected ||
+            patches.signatureCount != (expected ? 5U : 0U)) {
+            std::fprintf(stderr, "FAIL Darwin %d actual GL selector\n", runningMajor);
+            return 1;
+        }
+        ++checks;
+    }
+    std::printf("PASS %u actual GL signature selections; no GPU work\n", checks);
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="nred-selector-") as directory:
+        cpp, binary = Path(directory) / "test.cpp", Path(directory) / "test"
+        cpp.write_text(unit)
+        subprocess.run([
+            "xcrun", "clang++", "-std=c++17", "-O1", "-g",
+            "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+            "-I", str(REPO / "NootedRed"), str(cpp), "-o", str(binary),
+        ], check=True)
+        subprocess.run([str(binary)], check=True)
 
 
 if __name__ == "__main__":

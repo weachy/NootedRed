@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>VP9VCNDecoder</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.droga.videodecoder.vp9.vcn</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>VP9VCNDecoder</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>CMClassImplementations</key>
+	<array>
+		<dict>
+			<key>CMClassID</key>
+			<string>com.apple.videotoolbox.videodecoder</string>
+			<key>CMClassImplementationID</key>
+			<string>com.droga.videodecoder.vp9.vcn</string>
+			<key>CMClassImplementationName</key>
+			<string>AMD VCN VP9 Decoder</string>
+			<key>CMClassImplementationVersion</key>
+			<integer>1</integer>
+			<key>CMExecutableArchitectures</key>
+			<array>
+				<string>x86_64</string>
+			</array>
+			<key>CMFactoryFunction</key>
+			<string>VP9VCN_VTDecoder_CreateInstance</string>
+			<key>CMManufacturer</key>
+			<string>droga</string>
+			<key>CMMatchingInfo</key>
+			<dict>
+				<key>VTCodecType</key>
+				<string>vp09</string>
+				<key>VTIsHardwareAccelerated</key>
+				<true/>
+			</dict>
+		</dict>
+	</array>
+</dict>
+</plist>
