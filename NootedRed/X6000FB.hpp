@@ -77,7 +77,7 @@ private:
     static void                             wrapDpReceiverPowerCtrl(void* link, bool powerOn);
     static UInt32                           wrapControllerPowerUp(void* self);
     static void*                            wrapCreateObjectInfo(void* helper, UInt32 tableOffset);
-    static IoReturn                         wrapReportCapabilitiesLinkInfo(void* self);
+    static IOReturn                         wrapReportCapabilitiesLinkInfo(void* self);
     static AmdAtomVramInfo*                 wrapCreateVramInfo(AmdAtomFwHelper* biosHelper, UInt32 tableOffset);
     static IOReturn wrapGetVendorInfo(const void* self, AGDCVendorInfo_t* vendorInfo, size_t sizeofVendorInfo);
     static size_t   readVfctAtomBiosImage(void* self, UInt8* buffer, size_t bufferSize, bool strict = true);
