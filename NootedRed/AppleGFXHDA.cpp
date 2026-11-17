@@ -159,5 +159,5 @@ void* AppleGFXHDA::wrapCreateAppleHDAWidget(void* devId)
     if (vendorID == AMDVendorID && (deviceID == RavenHDMIDeviceID || deviceID == RenoirHDMIDeviceID)) {
         return singleton().orgWidget1002AAA0->alloc();
     }
-    return FunctionCast(wrapCreateAppleHDAFunctionGroup, singleton().orgCreateAppleHDAFunctionGroup)(devId);
+    return FunctionCast(wrapCreateAppleHDAWidget, singleton().orgCreateAppleHDAWidget)(devId);
 }

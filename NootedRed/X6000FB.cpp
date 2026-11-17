@@ -34,12 +34,14 @@
 #include <Headers/kern_patcher.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOReturn.h>
+#include <IOKit/IOService.h>
 #include <IOKit/IOTypes.h>
 #include <IOKit/acpi/IOACPIPlatformExpert.h>
 #include <Kexts.hpp>
 #include <NRed.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <PenguinWizardry/PatcherPlus.hpp>
+#include <libkern/c++/OSData.h>
 #include <Regs/OSSSYS_4.hpp>
 #include <Regs/SMUIO.hpp>
 #include <X6000FB.hpp>
@@ -272,6 +274,8 @@ void X6000FB::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t s
         {"__ZNK30AMDRadeonX6000_AmdAgdcServices13getVendorInfoEP16AGDCVendorInfo_tm", wrapGetVendorInfo,
          this->orgGetVendorInfo},
         {"__ZN34AMDRadeonX6000_AmdBiosParserHelper12readAtomBiosEv", readAtomBios},
+        {"__ZN35AMDRadeonX6000_AmdRadeonFramebuffer27reportCapabilities_LinkInfoEv", wrapReportCapabilitiesLinkInfo,
+         this->orgReportCapabilitiesLinkInfo},
     };
     PANIC_COND(!PenguinWizardry::PatternRouteRequest::routeAll(patcher, id, requests, slide, size), "X6000FB",
                "Failed to route symbols");
@@ -609,6 +613,40 @@ void X6000FB::wrapDpReceiverPowerCtrl(void* const link, const bool powerOn)
 {
     FunctionCast(wrapDpReceiverPowerCtrl, singleton().orgDpReceiverPowerCtrl)(link, powerOn);
     IOSleep(250);
+}
+
+IOReturn X6000FB::wrapReportCapabilitiesLinkInfo(void* const self)
+{
+    const auto ret = FunctionCast(wrapReportCapabilitiesLinkInfo, singleton().orgReportCapabilitiesLinkInfo)(self);
+
+    auto* const svc = OSDynamicCast(IOService, static_cast<OSMetaClassBase*>(self));
+    if (svc == nullptr) { return ret; }
+    auto* const prop = OSDynamicCast(OSData, svc->getProperty("audio-codec-info"));
+    if (prop == nullptr || prop->getLength() != 4) { return ret; }
+    const auto* const bytes = static_cast<const UInt8*>(prop->getBytesNoCopy());
+    if (bytes == nullptr || bytes[1] != 0x01) { return ret; }
+
+    // Read the actual Azalia endpoint index (0..5) that Display Core routed to the active DIG encoder
+    // via mmDIGx_AFMT_AUDIO_SRC_CONTROL (DCN_BASE_2 + 0x20AD + 0x100 * digIdx, bits 2:0)
+    // and report its corresponding HDA Pin NID (3 + 2 * ep) to AppleGFXHDA via audio-codec-info.
+    for (UInt32 digIdx = 0; digIdx < 4; digIdx++) {
+        const UInt32 digBase = DCN_BASE_2 + (0x100 * digIdx);
+        const UInt32 digBe   = NRed::singleton().readReg32(digBase + 0x20B0);
+        // Bit 24 of mmDIGx_BE_CNTL = DIG_ENABLE; bits 10:8 = DIG_MODE (0 = DP, 2 = TMDS/DVI, 3 = HDMI)
+        if ((digBe & (1U << 24)) != 0 || digBe != 0) {
+            const UInt32 activeEp  = NRed::singleton().readReg32(digBase + 0x20AD) & 0x7U;
+            const UInt8  actualPin = static_cast<UInt8>(3 + (2 * activeEp));
+            if (activeEp < 6 && actualPin != bytes[2]) {
+                UInt8 newInfo[4] = {bytes[0], bytes[1], actualPin, bytes[3]};
+                svc->setProperty("audio-codec-info", newInfo, sizeof(newInfo));
+                SYSLOG("X6000FB", "Synced audio-codec-info Pin NID from 0x%02X to Display Core DIG%u endpoint %u (Pin NID 0x%02X)",
+                       bytes[2], digIdx, activeEp, actualPin);
+            }
+            break;
+        }
+    }
+
+    return ret;
 }
 
 void* X6000FB::wrapCreateObjectInfo(void* const helper, const UInt32 tableOffset)
