@@ -37,41 +37,40 @@ Segment layout of the image (cache addresses; `__TEXT` file offset is the offset
 | `__DATA` | `0x7FFB4346D690` | `0x22745690` |
 | `__LINKEDIT` | `0x7FFB80000000` | `0x239D4000` |
 
-## 2. Generated page images
+## 2. Generated page images (and live `VDASignatures.inc` targets)
 
-`_cs_validate_page`/`_cs_validate_range` hand `UserPatches` the exact 4 KiB page of the cache file
-being validated, so the header stores whole cache-file pages. All five pages happen to live in
-`dyld_shared_cache_x86_64h.03` at `__TEXT` fileoff `0x8606000 + page*0x1000`; the generator checks the
-mapping-derived file offset against the Mach-O `__TEXT` fileoff. **[F]**
+> **Sync Note (v1.2.6):** The driver has migrated from static page images (`VDAVAData.hpp`) to dynamic context signatures in `NootedRed/VDASignatures.inc` (`kVDAResolverSignatures_Modern`), enabled by default. On macOS 15.8.1 (`24H32`), all 9 target pages below live in `dyld_shared_cache_x86_64h.03` at `__TEXT` fileoff `0x8606000 + page`. **[F]**
 
-| array | image offset | cache file page offset | SHA-256 of the page image |
+| index | image offset | cache file page offset | target symbol(s) |
 | --- | --- | --- | --- |
-| `Page0` | `0x0` | `0x8606000` | `58227f0f836b98e3e24191db7110064f4024c1f8f229037107615c577b960587` |
-| `Page1` | `0x2000` | `0x8608000` | `6acb60fb0caab7fe00de586e4f3441d5fe2dbd221638b1d234b29d75d8838e67` |
-| `Page2` | `0x9000` | `0x860F000` | `09b4a70e6cd00e0e77ec27dcaf7fa3230fa8b7bf9169c1ec2e679961e6e76596` |
-| `Page3` | `0x61000` | `0x8667000` | `5351b93af20527ac2780c40542279df97b317fa7abe9c3b69303749aa4726cbc` |
-| `Page4` | `0x77000` | `0x867D000` | `b242266010b00955744898f4f50da6dbf11791cced75da983cfbbe0a0ecca38f` |
+| `Page0` | `0x000000` | `0x8606000` | `VAAcceleratorInfo::identify` |
+| `Page1` | `0x002000` | `0x8608000` | `VAAddrLibInterface::init` |
+| `Page2` | `0x009000` | `0x860F000` | `VAFactory::create*VP`, `createGraphicsEngine`, `createImageBlt` |
+| `Page3` | `0x046000` | `0x864C000` | `Vcn2Encoder::setEncodeParams` (`Vcn2EncoderSourcePitch`) |
+| `Page4` | `0x047000` | `0x864D000` | `Vcn2EncCommand::getFeedbackSize` |
+| `Page5` | `0x049000` | `0x864F000` | `AVDVcn2AvcEncDataProcessor::ProcessEncodeStatus` |
+| `Page6` | `0x04A000` | `0x8650000` | `AVDVcn2HevcEncDataProcessor::ProcessEncodeStatus` |
+| `Page7` | `0x061000` | `0x8667000` | `Addr::Lib::Create` |
+| `Page8` | `0x077000` | `0x867D000` | `Addr::V2::Gfx9Lib::HwlConvertChipFamily` |
 
 ## 3. Patch inventory
 
-`skip`/`count` are the occurrence selector inside the page image; the generator proves that the page
-contains exactly `skip + count` occurrences of each find and that the expected sites are the matched
-ones. All find sequences are unique per page with the selectors below. **[F]**
+`skip`/`count` are the occurrence selector inside the page image; in `VDASignatures.inc`, `Addr::Lib::Create` and `HwlConvertChipFamily` use non-destructive wildcard instructions (`cmp eax, eax` / `cmp esi, esi`) so both Metal (`0x8D`) and VA (`0x8E`) drivers in `dyld_shared_cache` pass simultaneously. **[F]**
 
-| # | table name (semantics) | function (symbol) | function address | site / find offset | page / page offset | find → replace | conf. |
+| # | table name (semantics) | function (symbol) | function address | site / find offset | page / page offset | find → replace (live `VDASignatures.inc`) | conf. |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0 | `IdentifyForceFamily5` | `VAAcceleratorInfo::identify(unsigned, unsigned)` | `0x7FFB086069E0` | `0x7FFB08606B96` (+0x1B6) | `Page0` / `0xB96` | `BB 0B 00 00 00 E9 91 FE FF FF` → `BB 05 00 00 00 E9 91 FE FF FF` | high |
-| 1 | `AddrLibInitVegaToRV` | `VAAddrLibInterface::init(VAIOConnect*, sHardwareInfo*)` | `0x7FFB086083BE` | `0x7FFB08608449` (+0x8B) | `Page1` / `0x449` | `41 81 FC 8D 00 00 00` → `41 81 FC 8E 00 00 00` | high |
-| 2 | `ForceGfx9VideoProcessors` (3 sites) | `VAFactory::createColourFormatConverterVPEi`, `createDitheringVPEi`, `createDeblockerVPEi` | `0x7FFB0860F980`, `0x7FFB0860FA42`, `0x7FFB0860FAC4` | +0x7 each: `0xF987`, `0xFA49`, `0xFACB` | `Page2` / `0x987`, `0xA49`, `0xACB` | `8D 46 FF 83 F8 02 72 1F` → `8D 46 FF 83 F8 02 EB 1F` | high |
-| 3 | `ForceGfx9EngineAndBlt` (2 sites) | `VAFactory::createGraphicsEngine(VAContext*)`, `createImageBlt(VAContext*, unsigned)` | `0x7FFB0860FBC6`, `0x7FFB0860FC5E` | +0xA / +0xB: `0xFBD0`, `0xFC69` | `Page2` / `0xBD0`, `0xC69` | `48 8B 86 60 04 00 00 8B 40 0C 8D 48 FF 83` → `B8 02 00 00 00 90 90 90 90 90 8D 48 FF 83` | high |
-| 4 | `AddrLibCreateVegaToRV` | `Addr::Lib::Create(_ADDR_CREATE_INPUT const*, _ADDR_CREATE_OUTPUT*)` | `0x7FFB08667BB0` | `0x7FFB08667C65` (+0xB5) | `Page6` / `0xC65` | `3D 8D 00 00 00 0F 85` → `3D 8E 00 00 00 0F 85` | high |
-| 5 | `Gfx9ConvertChipFamilyVegaToRV` | `Addr::V2::Gfx9Lib::HwlConvertChipFamily(unsigned, unsigned)` | `0x7FFB0867D770` | +0x0 | `Page7` / `0x770` | `81 FE 8D 00 00 00 0F 85 88 00 00 00` → `81 FE 8E 00 00 00 0F 85 88 00 00 00` | medium |
-| 6 | `Vcn2EncCommandFeedbackStride` | `Vcn2EncCommand::getFeedbackSize()` | `0x7FFB0864DF84` | `0x7FFB0864DF88` (+0x4) | `Page3` / `0xF88` | `B8 A4 00 00 00 5D C3` → `B8 30 00 00 00 5D C3` | high (encode follow-up) |
-| 7 | `Vcn2AvcProcessEncodeStatusStride` | `AVDVcn2AvcEncDataProcessor::ProcessEncodeStatus(...)` | `0x7FFB0864F5FC` | `0x7FFB0864F626` (+0x2A) | `Page4` / `0x626` | `48 69 C0 A4 00 00 00` → `48 69 C0 30 00 00 00` | high (encode follow-up) |
-| 8 | `Vcn2HevcProcessEncodeStatusStride` | `AVDVcn2HevcEncDataProcessor::ProcessEncodeStatus(...)` | `0x7FFB08650802` | `0x7FFB0865082C` (+0x2A) | `Page5` / `0x82C` | `48 69 C0 A4 00 00 00` → `48 69 C0 30 00 00 00` | high (encode follow-up) |
+| 0 | `IdentifyForceFamily5` | `VAAcceleratorInfo::identify(unsigned, unsigned)` | `0x7FFB086069E0` | `0x7FFB08606B96` (+0x1B6) | `Page0` (`0x000000`) / `0xB96` | `BB 0B 00 00 00` → `BB 05 00 00 00` | high |
+| 1 | `AddrLibInitVegaToRV` | `VAAddrLibInterface::init(VAIOConnect*, sHardwareInfo*)` | `0x7FFB086083BE` | `0x7FFB08608449` (+0x8B) | `Page1` (`0x002000`) / `0x449` | `41 81 FC 8D 00 00 00` → `41 81 FC 8E 00 00 00` | high |
+| 2 | `ForceGfx9VideoProcessors` (3 sites) | `VAFactory::createColourFormatConverterVPEi`, `createDitheringVPEi`, `createDeblockerVPEi` | `0x7FFB0860F980`, `0x7FFB0860FA42`, `0x7FFB0860FAC4` | +0x7 each: `0xF987`, `0xFA49`, `0xFACB` | `Page2` (`0x009000`) / `0x987`, `0xA49`, `0xACB` | `8D 46 FF 83 F8 02 72 1F` → `8D 46 FF 83 F8 02 EB 1F` | high |
+| 3 | `ForceGfx9EngineAndBlt` (2 sites) | `VAFactory::createGraphicsEngine(VAContext*)`, `createImageBlt(VAContext*, unsigned)` | `0x7FFB0860FBC6`, `0x7FFB0860FC5E` | +0xA / +0xB: `0xFBD0`, `0xFC69` | `Page2` (`0x009000`) / `0xBD0`, `0xC69` | `48 8B 86 60 04 00 00 8B 40 0C 8D 48 FF 83` → `B8 02 00 00 00 90 90 90 90 90 8D 48 FF 83` | high |
+| 4 | `Vcn2EncoderSourcePitch` | `Vcn2Encoder::setEncodeParams(void*, VAVendorTexture*)` | `0x7FFB0864CABA` | `0x7FFB0864CAEE` (+0x34) | `Page3` (`0x046000`) / `0xAEE` | `8B 8A 84 00 00 00 ... 25 00 FF FF FF` (25B) → `8B 82 80 00 00 00 8B 8A 84 00 00 00 90...` | high (encode follow-up) |
+| 5 | `Vcn2EncCommandFeedbackStride` | `Vcn2EncCommand::getFeedbackSize()` | `0x7FFB0864DF84` | `0x7FFB0864DF88` (+0x4) | `Page4` (`0x047000`) / `0xF88` | `B8 A4 00 00 00 5D C3` → `B8 30 00 00 00 5D C3` | high (encode follow-up) |
+| 6 | `Vcn2AvcProcessEncodeStatusStride` | `AVDVcn2AvcEncDataProcessor::ProcessEncodeStatus(...)` | `0x7FFB0864F5FC` | `0x7FFB0864F626` (+0x2A) | `Page5` (`0x049000`) / `0x626` | `48 69 C0 A4 00 00 00` → `48 69 C0 30 00 00 00` | high (encode follow-up) |
+| 7 | `Vcn2HevcProcessEncodeStatusStride` | `AVDVcn2HevcEncDataProcessor::ProcessEncodeStatus(...)` | `0x7FFB08650802` | `0x7FFB0865082C` (+0x2A) | `Page6` (`0x04A000`) / `0x82C` | `48 69 C0 A4 00 00 00` → `48 69 C0 30 00 00 00` | high (encode follow-up) |
+| 8 | `AddrLibCreateVegaToRV` | `Addr::Lib::Create(_ADDR_CREATE_INPUT const*, _ADDR_CREATE_OUTPUT*)` | `0x7FFB08667BB0` | `0x7FFB08667C65` (+0xB5) | `Page7` (`0x061000`) / `0xC65` | `3D 8D 00 00 00` → `39 C0 90 90 90` (`cmp eax, eax`) | high |
+| 9 | `Gfx9ConvertChipFamilyVegaToRV` | `Addr::V2::Gfx9Lib::HwlConvertChipFamily(unsigned, unsigned)` | `0x7FFB0867D770` | +0x0 | `Page8` (`0x077000`) / `0x770` | `81 FE 8D 00 00 00` → `39 F6 90 90 90 90` (`cmp esi, esi`) | medium |
 
-Totals after the follow-up encode patches: **9 patch records**, **8 page images**, **12 patched byte sites** (the original 6 records/5 pages/9 sites plus three encode feedback-stride records on three new pages), longest find 14 bytes. The encode records are generated from the same 15.8.1 image and are listed separately in the generator.
-`UserPatches` must support at least 8 pages, 5 sites on one page and 14-byte find/replace for the VA table; combined with the AppleGVA and GL tables the native backend is configured for 12 pages / 16 sites / 32 bytes.
+Totals after the encode pitch follow-up: **10 patch records**, **9 page images**, **13 patched byte sites** (`Page0`–`Page8` at `0x000000`, `0x002000`, `0x009000`, `0x046000`, `0x047000`, `0x049000`, `0x04A000`, `0x061000`, `0x077000`). Note that `0x008000` is **not** patched.
 
 ## 4. Per-patch evidence
 
@@ -280,9 +279,11 @@ family value. Likewise `VAFactory::createDecoder` selects `VAUvdDecoder` when `_
 ### 5.3 Encode-only patches
 
 The fork's hardware-encode fixes (`Vcn2EncCommand::getFeedbackSize` `0xA4→0x30`,
-`AVDVcn2AvcEncDataProcessor::ProcessEncodeStatus`/HEVC `imul 0xA4→0x30`,
-`Vcn2Encoder::setEncodeParams` pitch) are out of scope for VDA decode and are not emitted. The legacy
-VCN1 command translations are also irrelevant: this table drives native VCN2 hardware. **[F]**
+`AVDVcn2AvcEncDataProcessor::ProcessEncodeStatus`/HEVC `imul 0xA4→0x30`, and
+`Vcn2Encoder::setEncodeParams` source pitch) were initially out of scope for decode-only bring-up,
+but have since been integrated into `NootedRed/VDASignatures.inc` (rows 4–7 above, covering pages
+`0x046000`, `0x047000`, `0x049000`, `0x04A000`). The legacy VCN1 command translations remain
+irrelevant: this table drives native VCN2 hardware. **[F]**
 
 ## 6. Integration contract and safety
 
