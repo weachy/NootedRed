@@ -117,6 +117,8 @@
 		CE8DA0832517C41A008C44E8 /* libkmod.a in Frameworks */ = {isa = PBXBuildFile; fileRef = CE8DA0822517C41A008C44E8 /* libkmod.a */; };
 		CEA03B5E20EE825A00BA842F /* NRed.cpp in Sources */ = {isa = PBXBuildFile; fileRef = CEA03B5C20EE825A00BA842F /* NRed.cpp */; };
 		CEA03B5F20EE825A00BA842F /* NRed.hpp in Headers */ = {isa = PBXBuildFile; fileRef = CEA03B5D20EE825A00BA842F /* NRed.hpp */; };
+		CEA03B6020EE825A00BA842F /* NRedAudio.cpp in Sources */ = {isa = PBXBuildFile; fileRef = CEA03B6220EE825A00BA842F /* NRedAudio.cpp */; };
+		CEA03B6120EE825A00BA842F /* NRedAudio.hpp in Headers */ = {isa = PBXBuildFile; fileRef = CEA03B6320EE825A00BA842F /* NRedAudio.hpp */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -290,6 +292,8 @@
 		CE8DA0822517C41A008C44E8 /* libkmod.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libkmod.a; path = MacKernelSDK/Library/x86_64/libkmod.a; sourceTree = SOURCE_ROOT; };
 		CEA03B5C20EE825A00BA842F /* NRed.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NRed.cpp; sourceTree = "<group>"; };
 		CEA03B5D20EE825A00BA842F /* NRed.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = NRed.hpp; sourceTree = "<group>"; };
+		CEA03B6220EE825A00BA842F /* NRedAudio.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NRedAudio.cpp; sourceTree = "<group>"; };
+		CEA03B6320EE825A00BA842F /* NRedAudio.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = NRedAudio.hpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -352,6 +356,8 @@
 				4030EB372E3818D90070E610 /* AMDGFX9DCNDisplay.cpp */,
 				6C1B36652A407C6100B184DD /* AppleGFXHDA.hpp */,
 				6C1B36642A407C6100B184DD /* AppleGFXHDA.cpp */,
+				CEA03B6320EE825A00BA842F /* NRedAudio.hpp */,
+				CEA03B6220EE825A00BA842F /* NRedAudio.cpp */,
 				409127632CE2F2D2004DBDB5 /* ASICCaps.hpp */,
 				40F39FDB2CDD6087007AE975 /* Backlight.hpp */,
 				40F39FDD2CDD60A3007AE975 /* Backlight.cpp */,
@@ -670,6 +676,7 @@
 				408B3DEC2CDFB7DE00CAE5D2 /* HWBlock.hpp in Headers */,
 				401B4A022CF43589002B75A6 /* DebugEnabler.hpp in Headers */,
 				6C1B36672A407C6200B184DD /* AppleGFXHDA.hpp in Headers */,
+				CEA03B6120EE825A00BA842F /* NRedAudio.hpp in Headers */,
 				40B037E12E951D2B0060EAD4 /* Attributes.hpp in Headers */,
 				4068C6792E78A72300E57DE7 /* IsFunction.hpp in Headers */,
 				40F46B1B2E6DF50A00B0E9CE /* AMDGFX9DCN2Display.hpp in Headers */,
@@ -803,6 +810,7 @@
 				4054608C2CDBDF8C007865E5 /* AGDP.cpp in Sources */,
 				40FC5FDD29BF996900367F9D /* HWLibs.cpp in Sources */,
 				6C1B36662A407C6100B184DD /* AppleGFXHDA.cpp in Sources */,
+				CEA03B6020EE825A00BA842F /* NRedAudio.cpp in Sources */,
 				40FC5FD529BF995000367F9D /* X6000FB.cpp in Sources */,
 				4030EB382E3818E10070E610 /* AMDGFX9DCNDisplay.cpp in Sources */,
 				405430992E6DF75B000AEB46 /* AMDGFX9DCN1Display.cpp in Sources */,
@@ -1035,7 +1043,7 @@
 				MODULE_NAME = org.ChefKiss.NootedRed;
 				MODULE_START = "$(PRODUCT_NAME)_kern_start";
 				MODULE_STOP = "$(PRODUCT_NAME)_kern_stop";
-				MODULE_VERSION = 1.2.5;
+				MODULE_VERSION = 1.2.7;
 				OTHER_LDFLAGS = "-static";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(MODULE_NAME)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1056,7 +1064,7 @@
 				MODULE_NAME = org.ChefKiss.NootedRed;
 				MODULE_START = "$(PRODUCT_NAME)_kern_start";
 				MODULE_STOP = "$(PRODUCT_NAME)_kern_stop";
-				MODULE_VERSION = 1.2.5;
+				MODULE_VERSION = 1.2.7;
 				OTHER_LDFLAGS = "-static";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(MODULE_NAME)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1180,7 +1188,7 @@
 				MODULE_NAME = org.ChefKiss.NootedRed;
 				MODULE_START = "$(PRODUCT_NAME)_kern_start";
 				MODULE_STOP = "$(PRODUCT_NAME)_kern_stop";
-				MODULE_VERSION = 1.2.5;
+				MODULE_VERSION = 1.2.7;
 				OTHER_LDFLAGS = "-static";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(MODULE_NAME)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1296,7 +1304,7 @@
 				MODULE_NAME = org.ChefKiss.NootedRed;
 				MODULE_START = "$(PRODUCT_NAME)_kern_start";
 				MODULE_STOP = "$(PRODUCT_NAME)_kern_stop";
-				MODULE_VERSION = 1.2.5;
+				MODULE_VERSION = 1.2.7;
 				OTHER_LDFLAGS = "-static";
 				PRODUCT_BUNDLE_IDENTIFIER = "$(MODULE_NAME)";
 				PRODUCT_NAME = "$(TARGET_NAME)";

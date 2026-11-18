@@ -23,6 +23,7 @@
 #include <AMDGFX9DCN1Display.hpp>
 #include <AMDGFX9DCN2Display.hpp>
 #include <AMDGFX9DCNDisplay.hpp>
+#include <Backlight.hpp>
 #include <GPUDriversAMD/Accel/HWDisplay.hpp>
 #include <GPUDriversAMD/Accel/HWEngine.hpp>
 #include <GPUDriversAMD/AddrLib.hpp>
@@ -959,9 +960,10 @@ bool X5000::fixedGetDisplayInfo(AMDRadeonX5000_AMDHWDisplay* const self, const U
     // Fallback guard for early-boot race conditions:
     // If the kernel and WindowServer start quickly (e.g. SetApfsTrimTimeout=0, fast NVMe, non-verbose boot),
     // WindowServer queries display status while asynchronous DCN/eDP link training is still settling.
-    // When CRT is enabled for the primary built-in display (fbIndex == 0), guarantee online status
+    // Intentionally cover both LVDS and eDP embedded panels, but not external-only configurations.
+    // When CRT is enabled for the primary built-in display (fbIndex == 0 && hasEmbeddedPanel()), guarantee online status
     // to prevent CoreDisplay from logging "Setting offline display 0x00000000 main" and aborting WindowServer.
-    if (!online && isCRTEnabled && fbIndex == 0) {
+    if (!online && isCRTEnabled && fbIndex == 0 && Backlight::singleton().hasEmbeddedPanel()) {
         online = true;
     }
 
@@ -985,11 +987,6 @@ bool X5000::fixedGetDisplayInfo(AMDRadeonX5000_AMDHWDisplay* const self, const U
             if (bytesPerPixel != 0) { fbInfo->pitch = displayState.pixelInfo.bytesPerRow / bytesPerPixel; }
             fbInfo->rect.width  = displayState.pixelInfo.activeWidth;
             fbInfo->rect.height = displayState.pixelInfo.activeHeight;
-
-            // If this framebuffer is actively driving a display mode with valid geometry, ensure it is marked online.
-            if (isCRTEnabled && fbInfo->rect.width > 0 && fbInfo->rect.height > 0) {
-                fbInfo->isOnline = true;
-            }
         }
 
         IODisplayModeInformation modeInfo;

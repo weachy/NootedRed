@@ -72,7 +72,7 @@ void DriverInjector::processPatcher(KernelPatcher& patcher)
 
 bool DriverInjector::wrapAddDrivers(void* const self, OSArray* const array, const bool doNubMatching)
 {
-    UInt32 driverCount = array->getCount();
+	UInt32 driverCount = array->getCount();
 	int ok=0;
 	vnode_t vnode = NULLVP;
 	vfs_context_t ctxt = vfs_context_create(nullptr);
@@ -83,7 +83,6 @@ bool DriverInjector::wrapAddDrivers(void* const self, OSArray* const array, cons
 	
 	
 	if (ok) { //dont run on mac os installer
-		
 		for (UInt32 driverIndex = 0; driverIndex < driverCount; driverIndex += 1) {
 			OSObject* object = array->getObject(driverIndex);
 			if (object == nullptr) { continue; }

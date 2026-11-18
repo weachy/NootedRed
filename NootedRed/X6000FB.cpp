@@ -38,6 +38,7 @@
 #include <IOKit/acpi/IOACPIPlatformExpert.h>
 #include <Kexts.hpp>
 #include <NRed.hpp>
+#include <NRedAudio.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <PenguinWizardry/PatcherPlus.hpp>
 #include <Regs/OSSSYS_4.hpp>
@@ -275,6 +276,16 @@ void X6000FB::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t s
     };
     PANIC_COND(!PenguinWizardry::PatternRouteRequest::routeAll(patcher, id, requests, slide, size), "X6000FB",
                "Failed to route symbols");
+
+    KernelPatcher::RouteRequest linkInfoReq{
+        "__ZN35AMDRadeonX6000_AmdRadeonFramebuffer27reportCapabilities_LinkInfoEv",
+        wrapReportCapabilitiesLinkInfo,
+        this->orgReportCapabilitiesLinkInfo,
+    };
+    if (!patcher.routeMultiple(id, &linkInfoReq, 1, slide, size)) {
+        patcher.clearError();
+        SYSLOG("X6000FB", "Optional route reportCapabilities_LinkInfo unavailable; continuing");
+    }
 
     PenguinWizardry::JumpPatternRouteRequest atombiosRequests[] = {
         {"__ZN15AmdAtomVramInfo14createVramInfoEP15AmdAtomFwHelperj", wrapCreateVramInfo, this->orgCreateVramInfo,
@@ -602,13 +613,23 @@ UInt32 X6000FB::wrapControllerPowerUp(void* const self)
     m_flags       |= 4;    // All framebuffers enabled
     auto ret       = FunctionCast(wrapControllerPowerUp, singleton().orgControllerPowerUp)(self);
     if (send) { singleton().orgMessageAccelerator(self, IOFBRequestControllerEnabled, nullptr, nullptr, nullptr); }
+    NRedAudio::singleton().onControllerPowerUp();
+    return ret;
+}
+
+IOReturn X6000FB::wrapReportCapabilitiesLinkInfo(void* const self)
+{
+    const auto ret = FunctionCast(wrapReportCapabilitiesLinkInfo, singleton().orgReportCapabilitiesLinkInfo)(self);
+    NRedAudio::singleton().onLinkCapabilitiesReported();
     return ret;
 }
 
 void X6000FB::wrapDpReceiverPowerCtrl(void* const link, const bool powerOn)
 {
     FunctionCast(wrapDpReceiverPowerCtrl, singleton().orgDpReceiverPowerCtrl)(link, powerOn);
-    IOSleep(250);
+    if (powerOn) {
+        IOSleep(250);
+    }
 }
 
 void* X6000FB::wrapCreateObjectInfo(void* const helper, const UInt32 tableOffset)
