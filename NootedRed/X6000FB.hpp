@@ -54,6 +54,7 @@ class X6000FB
     readBiosImage_t*       readPciAtomBiosImage{nullptr};
     validateBiosImage_t*   validateAtomBiosImage{nullptr};
     mach_vm_address_t      orgCreatePspDirectory{0};
+    mach_vm_address_t      orgReportCapabilitiesLinkInfo{0};
 
 public:
     static X6000FB& singleton();
@@ -75,6 +76,7 @@ private:
     static IOReturn                         getTriageHardwareDataRN(void* self, UInt32 fbIndex, void* triageData);
     static void                             wrapDpReceiverPowerCtrl(void* link, bool powerOn);
     static UInt32                           wrapControllerPowerUp(void* self);
+    static IOReturn                         wrapReportCapabilitiesLinkInfo(void* self);
     static void*                            wrapCreateObjectInfo(void* helper, UInt32 tableOffset);
     static AmdAtomVramInfo*                 wrapCreateVramInfo(AmdAtomFwHelper* biosHelper, UInt32 tableOffset);
     static IOReturn wrapGetVendorInfo(const void* self, AGDCVendorInfo_t* vendorInfo, size_t sizeofVendorInfo);
