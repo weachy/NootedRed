@@ -65,6 +65,8 @@ class X5000
     bool                           (*orgAllocate)(void*, void*, UInt64, UInt64, UInt32, bool, UInt32, UInt32){nullptr};
     bool                           (*orgAllocateNonContiguous)(void*, void*, UInt64, UInt64, UInt32, bool, bool, UInt64,
                                                                UInt32, UInt32){nullptr};
+    bool                           allocatorTraceEnabled{false};
+    volatile SInt32                allocatorTraceCount{0};
 
 public:
     static X5000& singleton();

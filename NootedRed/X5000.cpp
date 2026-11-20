@@ -40,6 +40,8 @@
 #include <DeviceProfile.hpp>
 #include <VCNBridge.hpp>
 #include <VDA.hpp>
+#include <VideoCommandPatch.hpp>
+#include <libkern/OSAtomic.h>
 #include <libkern/OSTypes.h>
 #include <libkern/c++/OSObject.h>
 #include <mach/i386/vm_param.h>
@@ -139,56 +141,6 @@ namespace
                 }
                 return;
             }
-        }
-    }
-
-    // Fixes AMDAccelVideoContext::processCommand jumping to the loop-completion
-    // success block (`this->0x644 = 0`) instead of the error epilogue (`this->0x644 = -6`)
-    // when `fetchResource()` fails to prepare a video buffer.
-    void patchVideoProcessCommand(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide,
-                                  const size_t size, const char* const procCmdSym, const char* const fetchResSym)
-    {
-        const auto procCmd  = patcher.solveSymbol(id, procCmdSym, slide, size);
-        const auto fetchRes = patcher.solveSymbol(id, fetchResSym, slide, size);
-        if (procCmd == 0 || fetchRes == 0) {
-            patcher.clearError();
-            return;
-        }
-
-        auto* const fnBytes = reinterpret_cast<UInt8*>(procCmd);
-        for (size_t i = 0; i < 0x280; ++i) {
-            if (fnBytes[i] != 0xE8) { continue; }
-            SInt32 callRel = 0;
-            memcpy(&callRel, fnBytes + i + 1, sizeof(callRel));
-            if (procCmd + i + 5 + static_cast<mach_vm_address_t>(static_cast<SInt64>(callRel)) != fetchRes) {
-                continue;
-            }
-
-            for (size_t j = i + 5; j < i + 20; ++j) {
-                if (fnBytes[j] == 0x0F && fnBytes[j + 1] == 0x84) {
-                    SInt32 jeRel = 0;
-                    memcpy(&jeRel, fnBytes + j + 2, sizeof(jeRel));
-                    const ptrdiff_t jeTargetOff = static_cast<ptrdiff_t>(j) + 6 + jeRel;
-                    if (jeTargetOff <= 0 || jeTargetOff >= 0x580) { return; }
-
-                    for (size_t m = static_cast<size_t>(jeTargetOff); m < static_cast<size_t>(jeTargetOff) + 0x30;
-                         ++m) {
-                        if (fnBytes[m] == 0x48 && fnBytes[m + 1] == 0x81 && fnBytes[m + 2] == 0xC4) {
-                            const auto newRel = static_cast<SInt32>(m - (j + 6));
-                            if (newRel != jeRel &&
-                                MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
-                                memcpy(fnBytes + j + 2, &newRel, sizeof(newRel));
-                                MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-                                SYSLOG("X5000",
-                                       "Patched AMDAccelVideoContext::processCommand fetchResource failure exit");
-                            }
-                            return;
-                        }
-                    }
-                    return;
-                }
-            }
-            return;
         }
     }
 
@@ -375,8 +327,11 @@ void X5000::processKext(KernelPatcher& patcher, const size_t id, const mach_vm_a
         slide, size));
     this->orgAllocateNonContiguous = reinterpret_cast<decltype(this->orgAllocateNonContiguous)>(patcher.solveSymbol(
         id,
-        "__ZN26AMDRadeonX5000_AMDHWMemory21allocateNonContiguousEP16AMDMemoryElementyyyybby15_eOP_ORIGINATOR9_eOP_TYPE",
+        // Match the allocation-TYPE overload declared by the function pointer. The yyyy overload
+        // takes a range start and length instead, adding an argument and shifting the stack arguments.
+        "__ZN26AMDRadeonX5000_AMDHWMemory21allocateNonContiguousEP16AMDMemoryElementyy28_eAMD_MEMORY_ALLOCATION_TYPEbby15_eOP_ORIGINATOR9_eOP_TYPE",
         slide, size));
+    this->allocatorTraceEnabled = checkKernelArgument("-NRedAllocTrace");
 
     if (this->orgTotalFreeMemory != nullptr && this->orgAllocate != nullptr && this->orgAllocateNonContiguous != nullptr) {
         PenguinWizardry::PatternRouteRequest allocLargeReq{
@@ -385,13 +340,16 @@ void X5000::processKext(KernelPatcher& patcher, const size_t id, const mach_vm_a
         if (!allocLargeReq.route(patcher, id, slide, size)) {
             patcher.clearError();
             SYSLOG("X5000", "Failed to route AMDHWMemory::allocateLargeBlocks");
+        } else {
+            NRed::singleton().setProp32("NRedVRAMAllocatorRevision", 2);
         }
     }
     patchIOAccelAllocPages(patcher, id, slide, size);
-    patchVideoProcessCommand(
+    VideoCommandPatch::install(
         patcher, id, slide, size,
         "__ZN35AMDRadeonX5000_AMDAccelVideoContext14processCommandEPj16VideoCommandTypeS0_j",
-        "__ZN35AMDRadeonX5000_AMDAccelVideoContext13fetchResourceEP22_AMDVideoResourceParamP21_AMDVideoResourceInfo");
+        "__ZN35AMDRadeonX5000_AMDAccelVideoContext13fetchResourceEP22_AMDVideoResourceParamP21_AMDVideoResourceInfo",
+        "NRedX5000VideoCommandGuarded");
     patchSWSchedulerAdvance(patcher, id, slide, size);
 
     const auto isGfxOffSupported =
@@ -673,7 +631,26 @@ bool X5000::wrapAllocateLargeBlocks(void* const self, void* const elem, const UI
     // 2. Contiguous attempt in Visible range [reservedNdrvEnd, 256MB] (allocType = 0) if allowed
     if (!onlyNonVisible && inst.orgAllocate(self, elem, size, align, 0, false, orig, opType)) { return true; }
 
+    auto tryNonContiguous = [&](const UInt64 requestSize, const UInt64 requestAlign, const UInt32 allocType,
+                                const UInt64 chunkSize) -> bool {
+        if (onlyNonVisible && allocType != 1) { return false; }
+        const auto result = inst.orgAllocateNonContiguous(self, elem, requestSize, requestAlign, allocType, false,
+                                                          false, chunkSize, orig, opType);
+        if (inst.allocatorTraceEnabled) {
+            const auto event = OSIncrementAtomic(&inst.allocatorTraceCount);
+            if (event < 64) {
+                SYSLOG("X5000",
+                       "Non-contiguous allocation %s: size=0x%llX align=0x%llX type=%u chunk=0x%llX min=0x%llX",
+                       result ? "succeeded" : "failed", requestSize, requestAlign, allocType, chunkSize, minBlockSize);
+            } else if (event == 64) {
+                SYSLOG("X5000", "Allocator trace limit reached; allocation continues");
+            }
+        }
+        return result;
+    };
+
     auto tryNonContiguousRange = [&](const UInt32 allocType) -> bool {
+        if (onlyNonVisible && allocType != 1) { return false; }
         if (roundedSize > blockGranularity &&
             (inst.orgTotalFreeMemory == nullptr || inst.orgTotalFreeMemory(self) >= roundedSize)) {
             UInt64 chunkSize = 1;
@@ -684,21 +661,16 @@ bool X5000::wrapAllocateLargeBlocks(void* const self, void* const elem, const UI
             }
             if (tmp == 1) { chunkSize >>= 1; }
 
-            if (chunkSize >= blockGranularity &&
-                inst.orgAllocateNonContiguous(self, elem, roundedSize, align, allocType, false, false, chunkSize, orig,
-                                              opType)) {
+            if (chunkSize >= blockGranularity && tryNonContiguous(roundedSize, align, allocType, chunkSize)) {
                 return true;
             }
             if (chunkSize > blockGranularity) {
                 const UInt64 halfChunk = chunkSize >> 1;
-                if (halfChunk >= blockGranularity &&
-                    inst.orgAllocateNonContiguous(self, elem, roundedSize, align, allocType, false, false, halfChunk,
-                                                  orig, opType)) {
+                if (halfChunk >= blockGranularity && tryNonContiguous(roundedSize, align, allocType, halfChunk)) {
                     return true;
                 }
                 if (halfChunk > blockGranularity &&
-                    inst.orgAllocateNonContiguous(self, elem, roundedSize, align, allocType, false, false,
-                                                  blockGranularity, orig, opType)) {
+                    tryNonContiguous(roundedSize, align, allocType, blockGranularity)) {
                     return true;
                 }
             }
@@ -712,29 +684,23 @@ bool X5000::wrapAllocateLargeBlocks(void* const self, void* const elem, const UI
     // 4. Fallback to Full UMA VRAM range [reservedNdrvEnd, totalVRAMSize] (allocType = 2):
     //    On AMD APUs, BAR0-visible and non-visible UMA are backed by identical system RAM,
     //    and totalFreeMemory() includes free space in [reservedNdrvEnd, 256MB].
-    if (inst.orgAllocate(self, elem, size, align, 2, false, orig, opType)) { return true; }
+    if (!onlyNonVisible && inst.orgAllocate(self, elem, size, align, 2, false, orig, opType)) { return true; }
     if (tryNonContiguousRange(2)) { return true; }
 
     // 5. Fine-grained non-contiguous fallback (16KB -> 4KB segment lengths with 64KB+ start alignment)
     //    when VRAM is heavily fragmented:
-    if (pageAlignedSize > 0x4000ULL) {
+    if (pageAlignedSize > 0x4000ULL && minBlockSize <= 0x4000ULL) {
         const UInt64 align16K = (pageAlignedSize + 0x3FFFULL) & ~0x3FFFULL;
         if (inst.orgTotalFreeMemory == nullptr || inst.orgTotalFreeMemory(self) >= align16K) {
-            if (inst.orgAllocateNonContiguous(self, elem, align16K, safeAlign, 1, false, false, 0x4000ULL, orig,
-                                              opType) ||
-                inst.orgAllocateNonContiguous(self, elem, align16K, safeAlign, 2, false, false, 0x4000ULL, orig,
-                                              opType)) {
+            if (tryNonContiguous(align16K, safeAlign, 1, 0x4000ULL) ||
+                tryNonContiguous(align16K, safeAlign, 2, 0x4000ULL)) {
                 return true;
             }
         }
     }
-    if (pageAlignedSize > PAGE_SIZE) {
-        if (inst.orgAllocateNonContiguous(self, elem, pageAlignedSize, safeAlign, 1, false, false, PAGE_SIZE, orig,
-                                          opType) ||
-            inst.orgAllocateNonContiguous(self, elem, pageAlignedSize, safeAlign, 2, false, false, PAGE_SIZE, orig,
-                                          opType) ||
-            inst.orgAllocateNonContiguous(self, elem, pageAlignedSize, PAGE_SIZE, 2, false, false, PAGE_SIZE, orig,
-                                          opType)) {
+    if (pageAlignedSize > PAGE_SIZE && minBlockSize <= PAGE_SIZE) {
+        if (tryNonContiguous(pageAlignedSize, safeAlign, 1, PAGE_SIZE) ||
+            tryNonContiguous(pageAlignedSize, safeAlign, 2, PAGE_SIZE)) {
             return true;
         }
     }
