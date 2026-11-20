@@ -24,6 +24,7 @@
 #include <Headers/kern_mach.hpp>
 #include <Headers/kern_util.hpp>
 #include <DeviceProfile.hpp>
+#include <GLResourceBudgetPatch.hpp>
 #include <NRed.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <UserPatches.hpp>
@@ -469,7 +470,8 @@ void UserPatches::selectPatchSet()
         this->signatureCount = kResolverSignatureCount_Ventura;
     }
     for (auto& applied : this->signatureApplied) { applied = 0; }
-    this->mtlHwInfoApplied = false;
+    this->mtlHwInfoApplied        = false;
+    this->glResourceBudgetApplied = false;
 }
 
 void UserPatches::processPatcher(KernelPatcher& patcher)
@@ -516,7 +518,8 @@ void UserPatches::processPatcher(KernelPatcher& patcher)
             return;
         }
 
-        SYSLOG_COND(!this->installNativePagePatcher(patcher), "UserPatch",
+        this->nativeBackendReady = this->installNativePagePatcher(patcher);
+        SYSLOG_COND(!this->nativeBackendReady, "UserPatch",
                     "Failed to install the dynamic signature patch backend");
         return;
     }
@@ -775,7 +778,7 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
         return;
     }
 
-    bool allApplied = this->mtlHwInfoApplied;
+    bool allApplied = this->mtlHwInfoApplied && this->glResourceBudgetApplied;
     for (size_t i = 0; i < this->signatureCount && i < kMaxSignatures; ++i) {
         if (this->signatureApplied[i] < this->signatures[i].count) {
             allApplied = false;
@@ -786,6 +789,24 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
 
     // Gate 2: GL patches ONLY apply to AMDRadeonX5000GLDriver; Metal patches ONLY apply to dyld shared cache.
     if (isGLDriver) {
+        if (!this->glResourceBudgetApplied) {
+            size_t budgetOffset = 0;
+            if (GLResourceBudgetPatch::find(bytes, kPageSize, budgetOffset)) {
+                if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
+                    SYSLOG("UserPatch", "Resolver: failed to disable kernel write protection (GL budget)");
+                    return;
+                }
+                memcpy(const_cast<UInt8*>(bytes) + budgetOffset, GLResourceBudgetPatch::Replace,
+                       sizeof(GLResourceBudgetPatch::Replace));
+                MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+
+                this->recordCachedSite(vnodeKind, pageOffset, budgetOffset, GLResourceBudgetPatch::Find,
+                                       GLResourceBudgetPatch::Replace, sizeof(GLResourceBudgetPatch::Replace));
+                this->glResourceBudgetApplied = true;
+                NRed::singleton().setProp32("NRedGLResourceBudgetApplied", 1);
+                SYSLOG("UserPatch", "Resolver patched GL resource budget at page offset 0x%zX", budgetOffset);
+            }
+        }
         for (size_t signatureIndex = 0; signatureIndex < 3 && signatureIndex < this->signatureCount; signatureIndex++) {
             const auto& signature = this->signatures[signatureIndex];
             if (signatureIndex < kMaxSignatures && this->signatureApplied[signatureIndex] >= signature.count) {

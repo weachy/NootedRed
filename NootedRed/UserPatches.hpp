@@ -151,10 +151,13 @@ public:
     // profile are known (it must run before user processes validate pages).
     void processPatcher(KernelPatcher& patcher);
 
+    // True when VDA user-space patches are enabled and the page hook is installed.
+    bool mediaSupported() const { return this->vdaEnabled && this->nativeBackendReady; }
+
 private:
     // Maximum amount of signature patches in a patch set.
     static constexpr size_t kMaxSignatures    = 8;
-    static constexpr size_t kMaxVDASignatures = 16;
+    static constexpr size_t kMaxVDASignatures = 24;
     static constexpr size_t kMaxCachedSites   = 64;
 
     enum VnodeKind : UInt8 {
@@ -186,11 +189,13 @@ private:
     const SignaturePatch* gvaSignature{nullptr};
     size_t                gvaSignatureApplied{0};
     bool                  mtlHwInfoApplied{false};
+    bool                  glResourceBudgetApplied{false};
     bool                  resolverEnabled{false};
     bool                  resolverOnly{false};
 
     bool                  enabled{false};
     bool                  vdaEnabled{false};
+    bool                  nativeBackendReady{false};
 
     CachedPatchSite       cachedSites[kMaxCachedSites]{};
     SInt32                cachedSiteCount{0};
