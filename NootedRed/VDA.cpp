@@ -31,6 +31,9 @@
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/OSTypes.h>
 
+extern "C" char osversion[];
+extern "C" const char version[];
+
 static VDA moduleInstance;
 
 namespace
@@ -39,6 +42,8 @@ namespace
     const char* const kBootArgNoVDA    = "-NRedNoVDA";
     const char* const kBootArgNoHEVC   = "-NRedNoHEVC";
     const char* const kBootArgNoHEVC10 = "-NRedNoHEVC10";
+    constexpr char kRaven2OSBuild[]    = "23J631";
+    constexpr char kRaven2KernelBuild[] = "root:xnu-10063.141.1.713.39~1/RELEASE_X86_64";
 
     const char* const kMediaCapabilities[] = {
         "IOGVACodec",         "IOGVAHEVCDecode",           "IOGVAHEVCDecodeCapabilities",
@@ -53,8 +58,9 @@ VDA& VDA::singleton() { return moduleInstance; }
 bool VDA::isSupported() const
 {
     const auto* const profile = DeviceProfile::current();
-    return this->enabled && profile != nullptr && profile->media.hasVCN0 &&
-           profile->media.vcnGeneration == DeviceProfile::kVcn2_2 &&
+    const bool vcn2 = profile != nullptr && profile->media.hasVCN0 &&
+                      profile->media.vcnGeneration == DeviceProfile::kVcn2_2;
+    return this->enabled && (vcn2 || this->isVcn1DecodeRequested()) &&
            !NRed::singleton().hasExternalVideo() && UserPatches::singleton().mediaSupported();
 }
 
@@ -66,18 +72,21 @@ bool VDA::canAdvertise() const
 bool VDA::shouldStripCapabilities() const
 {
     const auto* const profile = DeviceProfile::current();
-    return !this->enabled ||
-           (profile != nullptr && profile->media.vcnGeneration == DeviceProfile::kVcn2_2 && !this->canAdvertise());
+    const bool bridgeDevice = NRed::singleton().getDeviceID() == 0x15D8 ||
+                              (profile != nullptr && profile->media.vcnGeneration == DeviceProfile::kVcn2_2);
+    return !this->enabled || (bridgeDevice && !this->canAdvertise());
 }
 
 bool VDA::isHEVC10EncodeAllowed() const
 {
-    return this->isHEVC10Allowed() && this->canAdvertise() && currentKernelVersion() >= KernelVersion::Sequoia;
+    return !this->isVcn1DecodeRequested() && this->isHEVC10Allowed() && this->canAdvertise() &&
+           currentKernelVersion() >= KernelVersion::Sequoia;
 }
 
 bool VDA::isHEVC8KDecodeAllowed() const
 {
-    return this->isHEVCDecodeAllowed() && this->canAdvertise() && currentKernelVersion() >= KernelVersion::Sequoia;
+    return !this->isVcn1DecodeRequested() && this->isHEVCDecodeAllowed() && this->canAdvertise() &&
+           currentKernelVersion() >= KernelVersion::Sequoia;
 }
 
 void VDA::stripCapabilities(OSDictionary* const dictionary)
@@ -101,6 +110,9 @@ void VDA::init()
     this->enabled       = !noVda;
     this->hevcAllowed   = this->enabled && !noHevc;
     this->hevc10Allowed = this->hevcAllowed && !noHevc10;
+    this->raven2Requested = this->enabled && checkKernelArgument("-NRedRaven2Decode");
+    this->raven2HEVCRequested = this->raven2Requested && checkKernelArgument("-NRedRaven2HEVC");
+    this->picassoRequested = this->enabled && checkKernelArgument("-NRedPicassoDecodeTest");
 
     if (!this->enabled) {
         DBGLOG("VDA", "-NRedNoVDA active: all hardware video acceleration disabled (AVC + HEVC)");
@@ -127,6 +139,43 @@ void VDA::processPatcher()
     const auto& media         = profile->media;
     const auto  vcnGeneration = static_cast<UInt32>(media.vcnGeneration);
 
+    auto& nred = NRed::singleton();
+    if (nred.getDeviceID() == 0x15D8) {
+        nred.setProp32("NRedRaven2DecodeOptIn", static_cast<UInt32>(this->raven2Requested));
+        if (this->raven2Requested || this->picassoRequested) {
+            // The kernel version is available even if the OS build string has not been set at patcher load.
+            const bool osBuildAvailable = osversion[0] != '\0';
+            const bool buildMatches = osBuildAvailable ? strcmp(osversion, kRaven2OSBuild) == 0 :
+                                                        strstr(version, kRaven2KernelBuild) != nullptr;
+            nred.setProp32("NRedRaven2DecodeOSBuildAvailable", static_cast<UInt32>(osBuildAvailable));
+            nred.setProp32("NRedRaven2DecodeBuildMatched", static_cast<UInt32>(buildMatches));
+            nred.setProp32("NRedRaven2DecodeExternalAMD", static_cast<UInt32>(nred.hasDetectedExternalVideo()));
+            if (buildMatches && !nred.hasDetectedExternalVideo()) {
+                nred.hwLateInit();
+                nred.setProp32("NRedRaven2DecodeStrapRevision", nred.getDevRevision());
+                const auto& attributes = nred.getAttributes();
+                this->raven2Decode = this->raven2Requested && attributes.isRaven2();
+                // 0x15D8 starts with the Picasso attribute. The MMIO strap can also mark it as Raven2.
+                this->picassoDecode = this->picassoRequested && attributes.isPicasso() && !attributes.isRaven2();
+                if (this->raven2Decode) {
+                    this->raven2AVCEncodeTest = checkKernelArgument("-NRedRaven2AVCEncodeTest");
+                    nred.setProp32("NRedRaven2AVCEncodeTest", static_cast<UInt32>(this->raven2AVCEncodeTest));
+                    this->hevcAllowed = this->hevcAllowed && this->raven2HEVCRequested;
+                    this->hevc10Allowed = this->hevc10Allowed && this->hevcAllowed
+                        && checkKernelArgument("-NRedRaven2HEVC10");
+                    this->raven2HEVCEncodeTest = this->hevcAllowed
+                        && checkKernelArgument("-NRedRaven2HEVCEncodeTest");
+                    nred.setProp32("NRedRaven2DecodeRequested", 1);
+                }
+                if (this->picassoDecode) {
+                    this->hevcAllowed = false;
+                    this->hevc10Allowed = false;
+                    nred.setProp32("NRedPicassoDecodeRequested", 1);
+                }
+            }
+        }
+    }
+
     DBGLOG("VDA", "%s: VCN %u.%u, firmware %s, ring 0x%X, fence 0x%X, H.264=%u HEVC=%u AV1=%u", profile->name,
            vcnGeneration >> 8, vcnGeneration & 0xFF, media.vcnFirmware != nullptr ? media.vcnFirmware : "none",
            media.vcnRingSize, media.vcnFenceSize, static_cast<UInt32>(media.decode.h264),
@@ -143,8 +192,7 @@ void VDA::processPatcher()
     }
 
     const char* modeName = this->hevcAllowed ?
-        (this->hevc10Allowed ? "default (AVC + HEVC 8/10-bit)" : "default (AVC + 8-bit HEVC)") :
-        "-NRedNoHEVC (AVC only)";
+        (this->hevc10Allowed ? "AVC + HEVC 8/10-bit" : "AVC + 8-bit HEVC") : "AVC only";
 
     // The bridge reports its own readiness under the VCN tag; VDA only publishes the requested profile and
     // generation here.  If the bridge fails, software decode stays in use.
@@ -153,7 +201,7 @@ void VDA::processPatcher()
 
     NRed::singleton().setProp32("NRedVDARequested", 1);
     NRed::singleton().setProp32("NRedVDAAVCOnly", static_cast<UInt32>(!this->hevcAllowed));
-    NRed::singleton().setProp32("NRedVDAHEVCEncodeAllowed", static_cast<UInt32>(this->hevcAllowed));
+    NRed::singleton().setProp32("NRedVDAHEVCEncodeAllowed", static_cast<UInt32>(this->isHEVCEncodeAllowed()));
     NRed::singleton().setProp32("NRedVDAHEVCDecodeAllowed", static_cast<UInt32>(this->hevcAllowed));
     NRed::singleton().setProp32("NRedVDAHEVC10Allowed", static_cast<UInt32>(this->hevc10Allowed));
     // The VCN bridge owns the effective enablement and updates this property after engine allocation.

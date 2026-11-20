@@ -150,6 +150,8 @@ public:
     // Installs the dynamic signature patch backend. Called from `NRed::processPatcher` once the device ID and
     // profile are known (it must run before user processes validate pages).
     void processPatcher(KernelPatcher& patcher);
+    bool raven2EncoderPagesReady(bool hevc) const;
+    bool raven2DecoderPatchFailed() const;
 
     // True when VDA user-space patches are enabled and the page hook is installed.
     bool mediaSupported() const { return this->vdaEnabled && this->nativeBackendReady; }
@@ -205,6 +207,9 @@ private:
     auto currentApuMask() const -> ApuMask;
 
     SInt32                vdaAppliedCount{0};
+    UInt32                raven2AppliedSites{0};
+    UInt32                raven2MediaPatchState{0};
+    void recordRaven2MediaPage(UInt32 page, bool applied);
 
     mach_vm_address_t orgCsValidatePage{0};
     mach_vm_address_t orgCsValidateRange{0};
@@ -213,6 +218,7 @@ private:
     void recordCachedSite(VnodeKind vnodeKind, UInt64 pageOffset, size_t inPageOffset, const UInt8* find,
                           const UInt8* replace, size_t size);
     void reapplyCachedSites(VnodeKind vnodeKind, UInt64 pageOffset, const UInt8* bytes);
+    void patchRaven2DecodePage(const UInt8* bytes, UInt64 pageOffset, bool vaCache, bool gvaCache);
     void patchSignaturePage(const void* data, UInt64 pageOffset, void* vnode);
 
     static void      wrapCsValidatePage(void* vnode, void* pager, UInt64 pageOffset, const void* data, int* validated,

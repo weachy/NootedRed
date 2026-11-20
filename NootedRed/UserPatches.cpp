@@ -28,6 +28,7 @@
 #include <NRed.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <UserPatches.hpp>
+#include <VDA.hpp>
 #include <VCNBridge.hpp>
 #include <libkern/OSAtomic.h>
 #include <libkern/OSTypes.h>
@@ -504,14 +505,15 @@ void UserPatches::processPatcher(KernelPatcher& patcher)
         this->signatureCount  = 0;
     }
 
-    const auto vdaAllowed = this->vdaEnabled && profile != nullptr && profile->media.hasVCN0
-                            && profile->media.vcnGeneration == DeviceProfile::kVcn2_2
+    const auto vcn1Decode = VDA::singleton().isVcn1DecodeRequested();
+    const auto vcn2 = profile != nullptr && profile->media.hasVCN0
+                      && profile->media.vcnGeneration == DeviceProfile::kVcn2_2;
+    const auto vdaAllowed = this->vdaEnabled && (vcn2 || vcn1Decode)
                             && !NRed::singleton().hasExternalVideo();
     if (this->vdaEnabled && !vdaAllowed) {
-        SYSLOG("UserPatch", "VDA patches requested but this profile does not enable the validated VCN 2.x target");
+        SYSLOG("UserPatch", "VDA patches requested but this device is outside the supported media policy");
         this->vdaEnabled = false;
     }
-
     if (currentKernelVersion() >= MACOS_11) {
         if (!glEnabled && !this->vdaEnabled) {
             SYSLOG("UserPatch", "No user-space driver patches are configured, not installing any hooks");
@@ -643,6 +645,312 @@ void UserPatches::reapplyCachedSites(const VnodeKind vnodeKind, const UInt64 pag
     }
 }
 
+// On 23J631 all five Vcn2DecCommand register writers occupy this single VA driver cache page.
+// Validate the complete group before rewriting any members. VCN1 uses the absolute SOC15 register
+// index (Raven2 segment 1 at 0x7E00 plus the VCN1 register offset).
+static bool patchRaven2DecodeRegisters(const UInt8* const bytes)
+{
+    static constexpr struct RegisterPatch
+    {
+        size_t instructionOffset;
+        UInt16 vcn2Index;
+        UInt16 raven2Index;
+    } patches[] = {
+        {0xD5F, 0x0504, 0x81C4}, // writeUvdGpcomVcpuData0
+        {0xD89, 0x0505, 0x81C5}, // writeUvdGpcomVcpuData1
+        {0xDB3, 0x0503, 0x81C3}, // writeUvdGpcomVcpuCmd
+        {0xDDC, 0x0506, 0x81C6}, // writeUvdEngineStart
+        {0xE08, 0x053F, 0x81FF}, // writeUvdNoOp
+    };
+    bool alreadyApplied = true;
+    for (const auto& patch : patches) {
+        const auto* const instruction = bytes + patch.instructionOffset;
+        if (instruction[-3] != 0x48 || instruction[-2] != 0x8B || instruction[-1] != 0x07
+            || instruction[0] != 0xBE
+            || instruction[3] != 0 || instruction[4] != 0
+            || instruction[5] != 0xFF || instruction[6] != 0x50 || instruction[7] != 0x20) {
+            return false;
+        }
+        const UInt16 index = instruction[1] | (static_cast<UInt16>(instruction[2]) << 8);
+        if (index == patch.vcn2Index) {
+            alreadyApplied = false;
+        } else if (index != patch.raven2Index) {
+            return false;
+        }
+    }
+
+    if (alreadyApplied) { return true; }
+    if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return false; }
+    for (const auto& patch : patches) {
+        auto* const immediate = const_cast<UInt8*>(bytes) + patch.instructionOffset + 1;
+        immediate[0] = static_cast<UInt8>(patch.raven2Index);
+        immediate[1] = static_cast<UInt8>(patch.raven2Index >> 8);
+    }
+    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+    return true;
+}
+
+static constexpr UInt64 kRaven2EncoderPitchPage = 0x33E4000;
+static constexpr UInt64 kRaven2EncoderPacketPage = 0x33E5000;
+static constexpr UInt64 kRaven2EncoderAvcStatusPage = 0x33E7000;
+static constexpr UInt64 kRaven2EncoderHevcPacketPage = 0x33E6000;
+static constexpr UInt64 kRaven2EncoderHevcStatusPage = 0x33E8000;
+static constexpr UInt32 kRaven2EncoderPitchApplied = 1U << 0;
+static constexpr UInt32 kRaven2EncoderPacketsApplied = 1U << 1;
+static constexpr UInt32 kRaven2EncoderHevcPacketsApplied = 1U << 2;
+static constexpr UInt32 kRaven2EncoderAvcStatus = 1U << 3;
+static constexpr UInt32 kRaven2EncoderHevcStatus = 1U << 4;
+static constexpr UInt32 kRaven2DecoderRegisters = 1U << 5;
+static constexpr UInt32 kRaven2DecoderDispatch = 1U << 6;
+static constexpr UInt32 kRaven2EncoderCommonPages = kRaven2EncoderPitchApplied | kRaven2EncoderPacketsApplied;
+// The upper half records failures for the current boot. Keep both results in one atomic snapshot.
+static constexpr unsigned kRaven2MediaFailureShift = 16;
+
+static bool patchRaven2EncoderInputOutput(const UInt8* const bytes)
+{
+    // Vcn2Encoder::setEncodeParams on 23J631. Use the imported texture's
+    // byte pitch before the existing code derives both plane pitches.
+    static_assert(sizeof(kVDAFind_SourcePitch) == sizeof(kVDAReplace_SourcePitch));
+    auto* const pitch = const_cast<UInt8*>(bytes) + 0x526;
+
+    // Vcn2Encoder::setBitstreamBufParams initializes the mode and first
+    // address word with one store. VCN1 Mesa uses linear bitstream output.
+    static constexpr UInt8 circular[] = {0x48, 0xC7, 0x02, 0x01, 0x00, 0x00, 0x00};
+    static constexpr UInt8 linear[] = {0x48, 0xC7, 0x02, 0x00, 0x00, 0x00, 0x00};
+    auto* const bitstreamMode = const_cast<UInt8*>(bytes) + 0x40A;
+    const bool pitchApplied = memcmp(pitch, kVDAReplace_SourcePitch, sizeof(kVDAReplace_SourcePitch)) == 0;
+    const bool modeApplied = memcmp(bitstreamMode, linear, sizeof(linear)) == 0;
+    if ((!pitchApplied && memcmp(pitch, kVDAFind_SourcePitch, sizeof(kVDAFind_SourcePitch)) != 0)
+        || (!modeApplied && memcmp(bitstreamMode, circular, sizeof(circular)) != 0)) { return false; }
+    if (pitchApplied && modeApplied) { return true; }
+    if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return false; }
+    memcpy(pitch, kVDAReplace_SourcePitch, sizeof(kVDAReplace_SourcePitch));
+    memcpy(bitstreamMode, linear, sizeof(linear));
+    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+    return true;
+}
+
+struct Raven2EncoderPacketSite
+{
+    UInt16 offset;
+    UInt8 size;
+    UInt8 original[10];
+    UInt8 replacement[10];
+};
+
+template <size_t N>
+static bool patchRaven2EncoderSites(const UInt8* const bytes, const Raven2EncoderPacketSite (&sites)[N])
+{
+    bool alreadyApplied = true;
+    for (const auto& site : sites) {
+        const auto* const target = bytes + site.offset;
+        if (memcmp(target, site.original, site.size) == 0) {
+            alreadyApplied = false;
+        }
+        else if (memcmp(target, site.replacement, site.size) != 0) {
+            return false;
+        }
+    }
+    if (alreadyApplied) { return true; }
+    if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return false; }
+    for (const auto& site : sites) {
+        memcpy(const_cast<UInt8*>(bytes) + site.offset, site.replacement, site.size);
+    }
+    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+    return true;
+}
+
+static bool patchRaven2EncoderPackets(const UInt8* const bytes)
+{
+    // Sonoma 23J631 VA cache .03, page 0x33E5000. Keep the native
+    // RENCODE session operations. The Raven firmware also handles the
+    // legacy ring-test operations in a separate parser.
+    static constexpr Raven2EncoderPacketSite sites[] = {
+        {0xA8B, 10, {0xBE, 0x0B, 0x00, 0x00, 0x00, 0xBA, 0xC0, 0x00, 0x00, 0x00}, {0xBE, 0x0A, 0x00, 0x00, 0x00, 0xBA, 0xC0, 0x00, 0x00, 0x00}}, // addSliceHeaderPacket
+        {0xB2B, 10, {0xBE, 0x10, 0x00, 0x00, 0x00, 0xBA, 0x0C, 0x00, 0x00, 0x00}, {0xBE, 0x0C, 0x00, 0x00, 0x00, 0xBA, 0x0C, 0x00, 0x00, 0x00}}, // addIntraRefreshPacket
+        {0xB70, 10, {0xBE, 0x11, 0x00, 0x00, 0x00, 0xBA, 0x58, 0x02, 0x00, 0x00}, {0xBE, 0x0D, 0x00, 0x00, 0x00, 0xBA, 0x4C, 0x02, 0x00, 0x00}}, // addContextBufferPacket
+        {0xCFD, 10, {0xBE, 0x0F, 0x00, 0x00, 0x00, 0xBA, 0x2C, 0x00, 0x00, 0x00}, {0xBE, 0x0B, 0x00, 0x00, 0x00, 0xBA, 0x2C, 0x00, 0x00, 0x00}}, // addEncodePacket
+        {0xC2A, 10, {0xBE, 0x15, 0x00, 0x00, 0x00, 0xBA, 0x14, 0x00, 0x00, 0x00}, {0xBE, 0x10, 0x00, 0x00, 0x00, 0xBA, 0x14, 0x00, 0x00, 0x00}}, // addFeedbackBufferPacket
+        {0xC90, 10, {0xBE, 0x12, 0x00, 0x00, 0x00, 0xBA, 0x14, 0x00, 0x00, 0x00}, {0xBE, 0x0E, 0x00, 0x00, 0x00, 0xBA, 0x14, 0x00, 0x00, 0x00}}, // addBitstreamBufferPacket
+        {0xA9C,  3, {0x55, 0x48, 0x89}, {0x31, 0xC0, 0xC3}}, // addInputFormatPacket
+        {0xAB8,  3, {0x55, 0x48, 0x89}, {0x31, 0xC0, 0xC3}}, // addOutputFormatPacket
+        // The optional VCN2 EFC packet collides with VCN1's bitstream buffer ID.
+        {0xAD4,  8, {0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x30}, {0x31, 0xC0, 0xC3, 0xE5, 0x48, 0x83, 0xEC, 0x30}}, // addEfcPacket
+    };
+    return patchRaven2EncoderSites(bytes, sites);
+}
+
+static bool patchRaven2EncoderHevcPackets(const UInt8* const bytes)
+{
+    // VCN1 uses the first six deblock words. Skip the Apple HW-specific
+    // instruction packet in both the inlined and standalone writers.
+    static constexpr Raven2EncoderPacketSite sites[] = {
+        {0x4A2, 10, {0x41, 0x80, 0x7E, 0x1A, 0x00, 0x74, 0x1C, 0x48, 0x8D, 0x8B},
+                    {0x41, 0x80, 0x7E, 0x1A, 0x00, 0xEB, 0x1C, 0x48, 0x8D, 0x8B}},
+        {0x4D6, 10, {0xBE, 0x03, 0x00, 0x10, 0x00, 0xBA, 0x1C, 0x00, 0x00, 0x00},
+                    {0xBE, 0x03, 0x00, 0x10, 0x00, 0xBA, 0x18, 0x00, 0x00, 0x00}},
+        {0x6BC, 10, {0x55, 0x48, 0x89, 0xE5, 0x48, 0x8D, 0x8F, 0xD4, 0x08, 0x00},
+                    {0x31, 0xC0, 0xC3, 0xE5, 0x48, 0x8D, 0x8F, 0xD4, 0x08, 0x00}},
+        {0x6E3, 10, {0xBE, 0x03, 0x00, 0x10, 0x00, 0xBA, 0x1C, 0x00, 0x00, 0x00},
+                    {0xBE, 0x03, 0x00, 0x10, 0x00, 0xBA, 0x18, 0x00, 0x00, 0x00}},
+    };
+    return patchRaven2EncoderSites(bytes, sites);
+}
+
+static bool patchRaven2EncoderStatus(const UInt8* const bytes, const size_t offset)
+{
+    // AVDVcn2AvcEncDataProcessor and AVDVcn2HevcEncDataProcessor use the same
+    // feedback indexing sequence in ProcessEncodeStatus on Sonoma 23J631.
+    // Index the feedback ring using the same 48-byte record size sent in
+    // setFeedbackBufParams. Keep the larger host allocation as padding.
+    constexpr auto& original = kVDACtx_StatusStride_Modern;
+    constexpr auto& replacement = kVDAReplace_StatusStride_Modern;
+    constexpr size_t strideOffset = 3;
+    constexpr size_t afterStride = strideOffset + sizeof(replacement);
+    constexpr size_t suffixSize = sizeof(original) - afterStride;
+    auto* const site = const_cast<UInt8*>(bytes) + offset;
+    auto* const stride = site + strideOffset;
+    if (memcmp(site, original, strideOffset) != 0
+        || memcmp(site + afterStride, original + afterStride, suffixSize) != 0) { return false; }
+    if (memcmp(stride, replacement, sizeof(replacement)) == 0) { return true; }
+    if (memcmp(stride, original + strideOffset, sizeof(replacement)) != 0
+        || MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return false; }
+    memcpy(stride, replacement, sizeof(replacement));
+    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+    return true;
+}
+
+bool UserPatches::raven2EncoderPagesReady(const bool hevc) const
+{
+    const UInt32 required = kRaven2EncoderCommonPages | (hevc ? kRaven2EncoderHevcPacketsApplied : 0U);
+    // The feedback handler can first page in after the first encode completes.
+    const UInt32 failureMask = (required | (hevc ? kRaven2EncoderHevcStatus : kRaven2EncoderAvcStatus))
+                               << kRaven2MediaFailureShift;
+    const auto state = __atomic_load_n(&this->raven2MediaPatchState, __ATOMIC_ACQUIRE);
+    return (state & (required | failureMask)) == required;
+}
+
+bool UserPatches::raven2DecoderPatchFailed() const
+{
+    constexpr UInt32 failures = (kRaven2DecoderRegisters | kRaven2DecoderDispatch) << kRaven2MediaFailureShift;
+    return (__atomic_load_n(&this->raven2MediaPatchState, __ATOMIC_ACQUIRE) & failures) != 0;
+}
+
+void UserPatches::recordRaven2MediaPage(const UInt32 page, const bool applied)
+{
+    const auto state = __atomic_or_fetch(&this->raven2MediaPatchState,
+                                       applied ? page : page << kRaven2MediaFailureShift, __ATOMIC_ACQ_REL);
+    if (!applied) {
+        NRed::singleton().setProp32("NRedRaven2MediaPatchFailures", state >> kRaven2MediaFailureShift);
+    }
+}
+
+void UserPatches::patchRaven2DecodePage(const UInt8* const bytes, const UInt64 pageOffset,
+                                      const bool vaCache, const bool gvaCache)
+{
+    // File offsets from the installed 23J631 x86_64h subcaches. All sites on one page
+    // must match before any writes to that page. Repeat verification after each page-in.
+    static constexpr struct Site
+    {
+        UInt64                 fileOffset;
+        const SignaturePatch* signature;
+    } sites[] = {
+        {0x2A2D3C, &kGVAResolverSignature_Sonoma},
+        {0x339D546, &kVDAResolverSignatures_Sonoma[0]}, // VA accelerator family
+        {0x339ED9C, &kVDAResolverSignatures_Sonoma[1]}, // AddrLib interface
+        {0x33A64C7, &kVDAResolverSignatures_Sonoma[6]}, // GFX9 video processors
+        {0x33A6589, &kVDAResolverSignatures_Sonoma[6]},
+        {0x33A660B, &kVDAResolverSignatures_Sonoma[6]},
+        {0x33A6710, &kVDAResolverSignatures_Sonoma[5]}, // GFX9 graphics engine and blit
+        {0x33A67A9, &kVDAResolverSignatures_Sonoma[5]},
+        {0x33FFC15, &kVDAResolverSignatures_Sonoma[2]}, // AddrLib creation
+        {0x34154F0, &kVDAResolverSignatures_Sonoma[3]}, // GFX9 chip family
+    };
+    static_assert(arrsize(sites) <= 32);
+
+    if (vaCache && pageOffset == 0x33E3000) {
+        const bool applied = patchRaven2DecodeRegisters(bytes);
+        this->recordRaven2MediaPage(kRaven2DecoderRegisters, applied);
+        if (applied) { NRed::singleton().setProp32("NRedRaven2DecodeRegistersPatched", 1); }
+        return;
+    }
+    if (vaCache) {
+        const auto& vda = VDA::singleton();
+        const bool avc = vda.isRaven2AVCEncodeTestRequested();
+        const bool hevc = vda.isRaven2HEVCEncodeTestRequested();
+        // Status pages can first fault when processing a completed frame.
+        if (avc && pageOffset == kRaven2EncoderAvcStatusPage) {
+            const bool applied = patchRaven2EncoderStatus(bytes, 0xA1);
+            this->recordRaven2MediaPage(kRaven2EncoderAvcStatus, applied);
+            if (applied) {
+                NRed::singleton().setProp32("NRedRaven2AvcFeedbackStride", 0x30);
+            }
+            return;
+        }
+        if (hevc && pageOffset == kRaven2EncoderHevcStatusPage) {
+            const bool applied = patchRaven2EncoderStatus(bytes, 0x279);
+            this->recordRaven2MediaPage(kRaven2EncoderHevcStatus, applied);
+            if (applied) {
+                NRed::singleton().setProp32("NRedRaven2HevcFeedbackStride", 0x30);
+            }
+            return;
+        }
+        if (hevc && pageOffset == kRaven2EncoderHevcPacketPage) {
+            this->recordRaven2MediaPage(kRaven2EncoderHevcPacketsApplied, patchRaven2EncoderHevcPackets(bytes));
+            return;
+        }
+        if ((avc || hevc) && (pageOffset == kRaven2EncoderPitchPage || pageOffset == kRaven2EncoderPacketPage)) {
+            const bool pitchPage = pageOffset == kRaven2EncoderPitchPage;
+            const bool applied = pitchPage ? patchRaven2EncoderInputOutput(bytes) : patchRaven2EncoderPackets(bytes);
+            this->recordRaven2MediaPage(pitchPage ? kRaven2EncoderPitchApplied : kRaven2EncoderPacketsApplied, applied);
+            constexpr UInt32 commonMask = kRaven2EncoderCommonPages
+                                          | (kRaven2EncoderCommonPages << kRaven2MediaFailureShift);
+            const auto state = __atomic_load_n(&this->raven2MediaPatchState, __ATOMIC_ACQUIRE);
+            if (applied && (state & commonMask) == kRaven2EncoderCommonPages) {
+                NRed::singleton().setProp32("NRedRaven2EncodePageApplied", 1);
+            }
+            return;
+        }
+    }
+    if (!vaCache && !gvaCache) { return; }
+
+    UInt32 pending = 0;
+    for (size_t i = 0; i < arrsize(sites); ++i) {
+        const auto& site = sites[i];
+        const auto offset = site.fileOffset % kPageSize;
+        const bool matchingCache = site.signature == &kGVAResolverSignature_Sonoma ? gvaCache : vaCache;
+        if (!matchingCache || site.fileOffset - offset != pageOffset) {
+            continue;
+        }
+
+        const auto& sig = *site.signature;
+        const auto* const target = bytes + offset;
+        if (memcmp(target, sig.replace, sig.replaceSize) == 0) { continue; }
+        size_t matchOffset = 0;
+        const auto contextOffset = offset - sig.patchOffset;
+        if (!matchSignature(bytes, sig, matchOffset, contextOffset) || matchOffset != contextOffset) {
+            this->recordRaven2MediaPage(kRaven2DecoderDispatch, false);
+            return;
+        }
+        pending |= UInt32{1} << i;
+    }
+    if (pending == 0) { return; }
+    if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
+        this->recordRaven2MediaPage(kRaven2DecoderDispatch, false);
+        return;
+    }
+    for (size_t i = 0; i < arrsize(sites); ++i) {
+        if ((pending & (UInt32{1} << i)) == 0) { continue; }
+        const auto& site = sites[i];
+        memcpy(const_cast<UInt8*>(bytes) + site.fileOffset % kPageSize,
+               site.signature->replace, site.signature->replaceSize);
+    }
+    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+
+    const auto applied = __atomic_or_fetch(&this->raven2AppliedSites, pending, __ATOMIC_RELAXED);
+    NRed::singleton().setProp32("NRedVCNUserApplied", static_cast<UInt32>(__builtin_popcount(applied)));
+}
+
 void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOffset, void* const vnode)
 {
     if (data == nullptr || vnode == nullptr) {
@@ -662,6 +970,8 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     const bool isAppleGVA    = (strstr(vnodeName, "AppleGVA") != nullptr);
     const bool isSharedCache = (strstr(vnodeName, "dyld_shared_cache") != nullptr) ||
                                (strstr(vnodeName, "dyld") != nullptr);
+    const bool isRaven2VACache  = strcmp(vnodeName, "dyld_shared_cache_x86_64h.03") == 0;
+    const bool isRaven2GVACache = strcmp(vnodeName, "dyld_shared_cache_x86_64h.02") == 0;
     vnode_putname(vnodeName);
 
     VnodeKind vnodeKind = kVnodeNone;
@@ -678,6 +988,10 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     }
 
     const auto* const bytes = static_cast<const UInt8*>(data);
+    const bool vcn1Decode = VDA::singleton().isVcn1DecodeRequested();
+    if (this->vdaEnabled && vcn1Decode) {
+        this->patchRaven2DecodePage(bytes, pageOffset, isRaven2VACache, isRaven2GVACache);
+    }
 
     // O(1) fast path for previously discovered sites whose clean UBC pages were evicted under
     // memory pressure and re-faulted from disk. Must run before the `allApplied` early-outs.
@@ -687,7 +1001,8 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     // Note: _cs_validate_page is invoked by XNU only once per physical page when the page enters the
     // global shared-cache vm_object. Do not gate on per-process identity (e.g. WindowServer or BootCache)
     // or accelerator start timing, as skipping a page during its first fault caches it unpatched globally.
-    if ((isVADriver || isSharedCache) && this->vdaEnabled && this->vdaSignatures != nullptr && this->vdaSignatureCount > 0) {
+    if ((isVADriver || isSharedCache) && this->vdaEnabled && !vcn1Decode && this->vdaSignatures != nullptr &&
+        this->vdaSignatureCount > 0) {
         {
             bool vdaAllApplied = true;
             for (size_t i = 0; i < this->vdaSignatureCount && i < kMaxVDASignatures; ++i) {
@@ -746,7 +1061,7 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     }
 
     // AppleGVA Dynamic Resolver path (embedded in dyld_shared_cache or standalone AppleGVA bundle)
-    if ((isAppleGVA || isSharedCache) && this->vdaEnabled && this->gvaSignature != nullptr &&
+    if ((isAppleGVA || isSharedCache) && this->vdaEnabled && !vcn1Decode && this->gvaSignature != nullptr &&
         this->gvaSignatureApplied < this->gvaSignature->count) {
         {
             size_t matchOffset = 0;
@@ -928,8 +1243,10 @@ void UserPatches::wrapCsValidatePage(void* const vnode, void* const pager, const
     FunctionCast(wrapCsValidatePage, singleton().orgCsValidatePage)(vnode, pager, pageOffset, data, validated, tainted,
                                                                     nx);
 
-    // Only patch pages that passed validation, so that a rejected page is never turned into a valid-looking one.
-    if (validated != nullptr && *validated != 0) { singleton().patchSignaturePage(data, pageOffset, vnode); }
+    if (validated == nullptr || *validated == 0) { return; }
+    if (VDA::singleton().isVcn1DecodeRequested() &&
+        (tainted == nullptr || *tainted != 0 || nx == nullptr || *nx != 0)) { return; }
+    singleton().patchSignaturePage(data, pageOffset, vnode);
 }
 
 boolean_t UserPatches::wrapCsValidateRange(void* const vnode, void* const pager, const UInt64 pageOffset,
@@ -939,6 +1256,7 @@ boolean_t UserPatches::wrapCsValidateRange(void* const vnode, void* const pager,
                                                                                           data, dataSize, tainted);
 
     if (result == 0 || data == nullptr) { return result; }
+    if (VDA::singleton().isVcn1DecodeRequested() && (tainted == nullptr || *tainted != 0)) { return result; }
 
     const auto* const bytes = static_cast<const UInt8*>(data);
     for (size_t offset = 0; offset + kPageSize <= dataSize; offset += kPageSize) {
