@@ -19,6 +19,66 @@ run_timeout() {
     perl -e 'alarm shift; exec @ARGV' "$@"
 }
 
+raven2_smoke() {
+    local clip="$1" work="$2" status=0
+    mkdir -m 700 "$work" || return 1
+    echo "Raven2 smoke-test artifacts: $work"
+
+    ioreg -l -w0 -r -n IGPU >"$work/before.ioreg" || return 1
+    if ! grep -Eq '"NRed(Raven2|Picasso)DecodeRequested" = 1' "$work/before.ioreg" ||
+       ! grep -q '"NRedVCNEngineAllocated" = 1' "$work/before.ioreg"; then
+        echo 'Raven2 experiment is not active or its engine was not allocated.' >&2
+        return 1
+    fi
+    if ! run_timeout 15 ffmpeg -nostdin -hide_banner -loglevel error -i "$clip" \
+        -frames:v 1 -vf format=nv12 -f rawvideo "$work/software.nv12" >"$work/software.log" 2>&1 ||
+        [[ ! -s "$work/software.nv12" ]]; then
+        echo 'Software reference frame failed. See software.log.' >&2
+        return 1
+    fi
+
+    echo 'Requesting one hardware-decoded output frame from VideoToolbox.'
+    sync
+    run_timeout 15 ffmpeg -nostdin -hide_banner -loglevel verbose -hwaccel videotoolbox \
+        -hwaccel_output_format videotoolbox_vld -i "$clip" -frames:v 1 \
+        -vf hwdownload,format=nv12 -f rawvideo "$work/hardware.nv12" >"$work/hardware.log" 2>&1 || status=$?
+    ioreg -l -w0 -r -n IGPU >"$work/after.ioreg"
+    run_timeout 15 log show --last boot --style compact \
+        --predicate 'eventMessage CONTAINS "Raven2 first decode IB commit" OR eventMessage CONTAINS "VCN2 initHardware"' \
+        >"$work/bridge.log" 2>"$work/bridge-log-error.txt" || true
+    local before after
+    before="$(vcn_completions "$work/before.ioreg")"
+    after="$(vcn_completions "$work/after.ioreg")"
+    echo "VCN0Dec completion high-water mark: ${before:-unavailable} -> ${after:-unavailable}"
+    if [[ $status -ne 0 || ! -s "$work/hardware.nv12" ]]; then
+        echo "Hardware decode failed (exit $status). See hardware.log." >&2
+        return 1
+    fi
+    if ! cmp -s "$work/software.nv12" "$work/hardware.nv12"; then
+        echo 'Hardware frame differs from the software reference.' >&2
+        return 1
+    fi
+    if [[ -z "$before" || -z "$after" || "$after" -le "$before" ]]; then
+        echo 'The frames match, but VCN completion counter advancement was not observed.' >&2
+        return 1
+    fi
+    echo 'Hardware frame matches the software reference and the VCN0Dec completion counter advanced.'
+}
+
+vcn_completions() {
+    grep -oE 'HWChannel VCN0Dec \| Commands Completed"=[0-9]+' "$1" |
+        cut -d= -f2 | sort -n | tail -n 1
+}
+
+if [[ $# -ne 0 ]]; then
+    if [[ $# -ne 3 || $1 != --raven2-smoke ]]; then
+        echo "Usage: $0 [--raven2-smoke <8-bit-h264-or-hevc-file> <new-output-directory>]" >&2
+        exit 2
+    fi
+    raven2_smoke "$2" "$3"
+    exit $?
+fi
+
 echo "== VDA hardware test =="
 echo "work dir: ${WORK}"
 BOOTARGS="$(sysctl -n kern.bootargs 2>/dev/null || true)"

@@ -75,6 +75,7 @@ public:
     auto  getEnumRevision() const { return enumRevision; }      // TODO: Remove!
     auto  getFbOffset() const { return fbOffset; }              // TODO: Remove!
     bool  hasExternalVideo() const { return externalVideo && !forceVDA; }    // VDA safety check
+    bool  hasDetectedExternalVideo() const { return externalVideo; }
 
     void init();
     void hwLateInit();        // TODO: Remove!

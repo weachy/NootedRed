@@ -69,6 +69,7 @@ class VCNBridge
     mach_vm_address_t orgClientStop{0};
     mach_vm_address_t orgSurfaceCopy{0};
     mach_vm_address_t orgInitHardware{0};
+    mach_vm_address_t orgInitVCNContext{0};
     mach_vm_address_t orgSafeMetaCast{0};
     mach_vm_address_t orgFetchResource{0};
     volatile UInt32   resourceFailures{0};
@@ -128,5 +129,6 @@ private:
     static void          signalWork(void* hardware);
     static bool          initHardware(void* self, UInt32 channel);
     static bool          fetchResource(void* self, void* parameters, void* resourceInfo);
+    static bool          initVCNContext(void* self, void* accelerator, void* context, void* createInfo);
     static OSMetaClassBase* safeMetaCast(const OSMetaClassBase* object, const OSMetaClass* target);
 };
