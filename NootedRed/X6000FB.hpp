@@ -47,6 +47,8 @@ class X6000FB
     mach_vm_address_t      orgDpReceiverPowerCtrl{0};
     messageAccelerator_t*  orgMessageAccelerator{nullptr};
     mach_vm_address_t      orgControllerPowerUp{0};
+    mach_vm_address_t      orgDoPowerStateChange{0};
+    void*                  cachedController{nullptr};
     mach_vm_address_t      orgCreateObjectInfo{0};
     mach_vm_address_t      orgCreateVramInfo{0};
     mach_vm_address_t      orgGetVendorInfo{0};
@@ -76,6 +78,7 @@ private:
     static IOReturn                         getTriageHardwareDataRN(void* self, UInt32 fbIndex, void* triageData);
     static void                             wrapDpReceiverPowerCtrl(void* link, bool powerOn);
     static UInt32                           wrapControllerPowerUp(void* self);
+    static UInt32                           wrapDoPowerStateChange(void* self, UInt32 state);
     static IOReturn                         wrapReportCapabilitiesLinkInfo(void* self);
     static void*                            wrapCreateObjectInfo(void* helper, UInt32 tableOffset);
     static AmdAtomVramInfo*                 wrapCreateVramInfo(AmdAtomFwHelper* biosHelper, UInt32 tableOffset);

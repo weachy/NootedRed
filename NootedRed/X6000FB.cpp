@@ -255,6 +255,19 @@ void X6000FB::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t s
                                             this->orgControllerPowerUp};
         PANIC_COND(!patcher.routeMultiple(id, &request, 1, slide, size), "X6000FB", "Failed to route powerUp");
 
+        // Resume hook on the framebuffer power-state transition. On macOS 15.x the controller class no
+        // longer overrides powerStateDidChangeTo, so a controller-level route for that symbol never
+        // attaches. doPowerStateChange is the framebuffer internal transition that runs on both suspend
+        // and resume; its low/off -> On edge is used to re-power the panel exactly once. Non-fatal if the
+        // symbol is missing, so unsupported OS versions keep working as before.
+        KernelPatcher::RouteRequest fbPowerRequest{
+            "__ZN35AMDRadeonX6000_AmdRadeonFramebuffer18doPowerStateChangeENS_15AmdFbPowerStateE",
+            wrapDoPowerStateChange, this->orgDoPowerStateChange};
+        if (!patcher.routeMultiple(id, &fbPowerRequest, 1, slide, size)) {
+            patcher.clearError();
+            SYSLOG("X6000FB", "Failed to route doPowerStateChange (non-fatal)");
+        }
+
         const PenguinWizardry::MaskedLookupPatch patches[] = {
             {&kextRadeonX6000Framebuffer, kControllerPowerUpOriginal, kControllerPowerUpOriginalMask,
              kControllerPowerUpReplace, kControllerPowerUpReplaceMask, 1},
@@ -608,12 +621,43 @@ IOReturn X6000FB::getTriageHardwareDataRN(void*, const UInt32 fbIndex, void* con
 
 UInt32 X6000FB::wrapControllerPowerUp(void* const self)
 {
+    // Cache the controller instance on the first (boot) power-up so the framebuffer wake hook can
+    // re-power the very same object without walking the parent tree.
+    if (singleton().cachedController == nullptr) { singleton().cachedController = self; }
     auto& m_flags  = getMember<UInt8>(self, 0x5F18);
     auto  send     = (m_flags & 2) == 0;
     m_flags       |= 4;    // All framebuffers enabled
     auto ret       = FunctionCast(wrapControllerPowerUp, singleton().orgControllerPowerUp)(self);
     if (send) { singleton().orgMessageAccelerator(self, IOFBRequestControllerEnabled, nullptr, nullptr, nullptr); }
     NRedAudio::singleton().onControllerPowerUp();
+    return ret;
+}
+
+UInt32 X6000FB::wrapDoPowerStateChange(void* const self, const UInt32 state)
+{
+    const auto ret = FunctionCast(wrapDoPowerStateChange, singleton().orgDoPowerStateChange)(self, state);
+
+    // AMDRadeonX6000_AmdFbPowerState: 0 = Off, 1 = Low, 2 = On.
+    static constexpr UInt32 fbPowerOn = 2;
+    static UInt32           lastState = 0xFF; // unknown before the first transition
+    static bool             armed     = false;
+
+    if (state == fbPowerOn) {
+        if (!armed) {
+            // First On during boot: arm wake-edge detection, do not re-power here.
+            armed = true;
+        }
+        else if (lastState != fbPowerOn && singleton().cachedController != nullptr) {
+            // Resume edge: Low/Off -> On. The controller does not re-run createLinks on resume, so the
+            // embedded dc_link captured at boot is reused across sleep and must not be dropped here
+            // (resetLink() would leave it null with no re-capture path, which is why manual backlight
+            // writes stop reaching the panel after wake). Re-power the cached controller once; repeated
+            // powerUp() calls detach the GPU from the PCI bus and hang the system, so never retry.
+            wrapControllerPowerUp(singleton().cachedController);
+        }
+    }
+
+    lastState = state;
     return ret;
 }
 
