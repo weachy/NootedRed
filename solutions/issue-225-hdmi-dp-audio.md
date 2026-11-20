@@ -36,12 +36,12 @@ On AMD Vega APUs (Raven / Picasso / Renoir / Cezanne, etc.) running macOS, exter
 
 1. **Event-Driven Dynamic Topology Resolution (No Polling Thread, No Hardcoded Indices)**:
    - Hooked `X6000FB::wrapControllerPowerUp` and optional `X6000FB::wrapReportCapabilitiesLinkInfo` (graceful fallback with `clearError()` if unavailable).
-   - Dynamically enumerates `IOFramebuffer` instances, distinguishes internal panels (`connector-type == 2`) from external HDMI (`2048`) / DP (`1024`) outputs, handles both **laptops (internal eDP + external)** and **desktops / AIOs / Mini PCs (no internal panel)**, derives the target Azalia endpoint from `audio-codec-info`, and reads the true `IOFBCurrentPixelClock`, active `DIG`, and `OTG`.
+   - Dynamically enumerates `IOFramebuffer` instances, distinguishes internal panels (`connector-type == 2`) from external HDMI (`2048`) / DP (`1024`) outputs, handles both **laptops (internal eDP + external)** and **desktops / AIOs / Mini PCs (no internal panel)**, derives the target Azalia endpoint from `audio-codec-info` (supporting `ep = 0..4` on DCN 2.1, e.g., Pin NID `0x0B` -> Endpoint 4), and matches the active `DIG`'s `DP_SEC_CNTL` state to the corresponding framebuffer when both HDMI and DP are connected.
 2. **Multi-Generation DCN Register Dispatch (`DcnIpBlock`)**:
-   - Dispatches register offsets from `DeviceProfile::current()->family` across **DCN 1.0** (Raven / Raven2 / Picasso, `OTG_MASTER_EN = 0x1B5F`) and **DCN 2.1** (Renoir / Cezanne / Barcelo, `OTG_MASTER_EN = 0x1B5C`), sharing `DCN_BASE_2` (`0x34C0`) and `DCCG` (`0x00C0`).
-3. **Dual-Path Audio Bring-Up & Hotplug Confirmation**:
+   - Dispatches register offsets from `DeviceProfile::current()->family` across **DCN 1.0** (Raven / Raven2 / Picasso, `OTG_MASTER_EN = 0x1B5F`, `maxDig = 4`, `maxAzEp = 4`) and **DCN 2.1** (Renoir / Cezanne / Barcelo, `OTG_MASTER_EN = 0x1B5C`, `maxDig = 5`, `maxAzEp = 5`), sharing `DCN_BASE_2` (`0x34C0`) and `DCCG` (`0x00C0`).
+3. **Dual-Path Audio Bring-Up, Refresh-Rate DTO Sync & Hotplug Confirmation**:
    - Configures the target Azalia endpoint's `SPEAKER_ALLOCATION` (`HDMI_CONNECTION` vs `DP_CONNECTION`), 2ch LPCM `AUDIO_DESCRIPTOR0`, and `AUDIO_ENABLED`;
-   - Programs `DCCG_AUDIO_DTO`, aligns `AFMT_AUDIO_SRC_SELECT` and `AFMT_AUDIO_CHANNEL_ENABLE`, and enables `DP_SEC_CNTL` sequentially for DisplayPort;
+   - Programs `DCCG_AUDIO_DTO` (and refreshes it whenever `IOFBCurrentPixelClock` changes, e.g., switching between 60 Hz and 120 Hz), aligns `AFMT_AUDIO_SRC_SELECT` and `AFMT_AUDIO_CHANNEL_ENABLE`, and enables `DP_SEC_CNTL` sequentially for DisplayPort;
    - Schedules a `+2000ms` post-link-training confirmation pass (`postLinkPassDone`) to pulse `AFMT_AUDIO_INFO_UPDATE` and `DP_SEC_CNTL` when `AFMT_STATUS` is not yet active, resolving DP hotplug silence.
 4. **`AppleGFXHDA.cpp` Typo Fix**:
    - Fixed `wrapCreateAppleHDAWidget` fallback to call `orgCreateAppleHDAWidget`.
@@ -54,4 +54,5 @@ On AMD Vega APUs (Raven / Picasso / Renoir / Cezanne, etc.) running macOS, exter
 ## 4. Hardware Verification
 
 - **DCN 2.1 Laptop** (AMD Renoir 7730U + internal eDP, macOS 15): Both external HDMI and USB-C DP audio work cleanly, including repeated HDMI/DP hotplugging with either auto-switched or manually switched audio output.
+- **DCN 2.1 High-Refresh DP (`ep = 4`, Pin NID `0x0B`)** (macOS 26.7.3, 4K@120Hz Thunderbolt/DP): Verified DP audio works cleanly once `maxAzEp` was raised to `5` for DCN 2.1.
 - **DCN 1.0 All-in-One** (HP All-in-One Raven2/Picasso Ryzen 3 3250U, no internal panel): Verified by PR #11's author on `v1.2.7` test build—HDMI audio works out of the box.

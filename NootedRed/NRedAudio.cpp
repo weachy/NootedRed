@@ -218,6 +218,7 @@ auto NRedAudio::resolveDcnIpBlock() -> DcnIpBlock
             blk.dcnBase           = DCN_BASE_2;
             blk.otgMasterEnOffset = kDcn10OtgMasterEn;
             blk.maxDig            = 4;
+            blk.maxAzEp           = 4;
             break;
         case DeviceProfile::kRenoir:
         case DeviceProfile::kRenoirE:
@@ -229,6 +230,7 @@ auto NRedAudio::resolveDcnIpBlock() -> DcnIpBlock
             blk.dcnBase           = DCN_BASE_2;
             blk.otgMasterEnOffset = kDcn21OtgMasterEn;
             blk.maxDig            = 5;
+            blk.maxAzEp           = 5;
             break;
         default:
             break;
@@ -286,13 +288,20 @@ bool NRedAudio::configureAudio(const bool pulseDpSec)
     const auto  blk  = resolveDcnIpBlock();
     if (blk.gen == DcnGen::kUnknown || !nred.isMmioReady()) { return true; }
 
-    // Discover active external IOFramebuffer (DP or HDMI) and whether an internal panel is present.
-    bool   hasInternalPanel = false;
-    bool   haveExtConn      = false;
-    UInt32 extConnType      = 0;
-    UInt32 extPixClk        = 0;
-    UInt32 extEp            = 0;
-    bool   haveExtFb        = false;
+    // Discover active external IOFramebuffers (DP / HDMI) and whether an internal panel is present.
+    struct ExtFbInfo
+    {
+        UInt32 connType{0};
+        UInt32 pixClk{0};
+        UInt32 ep{0};
+        bool   valid{false};
+    };
+
+    bool      hasInternalPanel = false;
+    bool      haveExtConn      = false;
+    ExtFbInfo firstExtFb;
+    ExtFbInfo dpExtFb;
+    ExtFbInfo hdmiExtFb;
 
     if (auto* const match = IOService::serviceMatching("IOFramebuffer")) {
         if (auto* const iter = IOService::getMatchingServices(match)) {
@@ -306,7 +315,7 @@ bool NRedAudio::configureAudio(const bool pulseDpSec)
                 if (connType == kConnectorDisplayPort || connType == kConnectorHDMI) {
                     haveExtConn = true;
                 }
-                if ((connType == kConnectorDisplayPort || connType == kConnectorHDMI) && pixClk != 0 && !haveExtFb) {
+                if ((connType == kConnectorDisplayPort || connType == kConnectorHDMI) && pixClk != 0) {
                     UInt32 ep = 0;
                     if (auto* const codecData = OSDynamicCast(OSData, fb->getProperty("audio-codec-info"))) {
                         if (codecData->getLength() == 4) {
@@ -316,18 +325,17 @@ bool NRedAudio::configureAudio(const bool pulseDpSec)
                             }
                         }
                     }
-                    extConnType = connType;
-                    extPixClk   = pixClk;
-                    extEp       = ep;
-                    haveExtFb   = true;
+                    const ExtFbInfo info{connType, pixClk, ep, true};
+                    if (!firstExtFb.valid) { firstExtFb = info; }
+                    if (connType == kConnectorDisplayPort && !dpExtFb.valid) { dpExtFb = info; }
+                    if (connType == kConnectorHDMI && !hdmiExtFb.valid) { hdmiExtFb = info; }
                 }
             }
             iter->release();
         }
     }
 
-    if (!haveExtFb) { return !haveExtConn; }
-    if (extEp >= blk.maxAzEp) { return true; }
+    if (!firstExtFb.valid) { return !haveExtConn; }
 
     // Find the first enabled external DIG (skip DIG0 when internal panel is active).
     UInt32 extDig = 0xFFFFFFFFU;
@@ -341,6 +349,23 @@ bool NRedAudio::configureAudio(const bool pulseDpSec)
     }
     if (extDig == 0xFFFFFFFFU) { return false; }
 
+    // Match the active DIG's protocol (DP_SEC_CNTL != 0 indicates DP stream) to the corresponding framebuffer
+    // when multiple external displays are connected.
+    const UInt32 digOff = extDig * blk.digStride;
+    ExtFbInfo    chosen = firstExtFb;
+    if (dpExtFb.valid && hdmiExtFb.valid) {
+        const UInt32 dpSec = nred.readReg32(blk.dcnBase + kDcn21DpSecCntl + digOff);
+        chosen             = (dpSec != 0) ? dpExtFb : hdmiExtFb;
+    }
+
+    const UInt32 extConnType = chosen.connType;
+    const UInt32 extPixClk   = chosen.pixClk;
+    const UInt32 extEp       = chosen.ep;
+    if (extEp >= blk.maxAzEp) {
+        DBGLOG("NRedAudio", "Skipping out-of-range Azalia endpoint %u (max %u)", extEp, blk.maxAzEp);
+        return true;
+    }
+
     // Find the first enabled external OTG (skip OTG0 when internal panel is active).
     UInt32 extOtg = 0;
     for (UInt32 otg = 0; otg < blk.maxOtg; otg++) {
@@ -351,8 +376,7 @@ bool NRedAudio::configureAudio(const bool pulseDpSec)
         }
     }
 
-    // If AFMT is already enabled and routing the right endpoint (e.g. working HDMI), leave DTO/AFMT intact.
-    const UInt32 digOff     = extDig * blk.digStride;
+    // If AFMT is already enabled and routing the right endpoint, leave AFMT intact and only refresh DTO if clock changed.
     const UInt32 afmtStat   = nred.readReg32(blk.dcnBase + kDcn21AfmtStatus + digOff);
     const UInt32 afmtSrc    = nred.readReg32(blk.dcnBase + kDcn21AfmtSrcCtl + digOff) & 0x7U;
     const bool   afmtActive = (afmtStat & 0x10U) != 0 && (afmtSrc == extEp);
@@ -360,11 +384,19 @@ bool NRedAudio::configureAudio(const bool pulseDpSec)
     const bool isDP = (extConnType == kConnectorDisplayPort);
     configureAzaliaEndpoint(nred, blk, extEp, isDP);
 
+    const UInt32 targetMod = extPixClk / 100U;
+    const UInt32 curMod    = nred.readReg32(blk.dccgBase + kDcn21DccgAudioDto0Module);
+    const UInt32 curPhase  = nred.readReg32(blk.dccgBase + kDcn21DccgAudioDto0Phase);
     if (!afmtActive) {
         programAudioDto(nred, blk, extOtg, extPixClk);
         configureAfmt(nred, blk, extDig, extEp);
-    } else if (isDP && (nred.readReg32(blk.dcnBase + kDcn21AfmtPacketCtl2 + digOff) & 0x0000FF00U) == 0) {
-        configureAfmt(nred, blk, extDig, extEp);
+    } else {
+        if (curMod != targetMod || curPhase != kDtoPhase24MHz) {
+            programAudioDto(nred, blk, extOtg, extPixClk);
+        }
+        if (isDP && (nred.readReg32(blk.dcnBase + kDcn21AfmtPacketCtl2 + digOff) & 0x0000FF00U) == 0) {
+            configureAfmt(nred, blk, extDig, extEp);
+        }
     }
 
     if (isDP) {
