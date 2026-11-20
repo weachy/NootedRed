@@ -22,6 +22,9 @@
 
 #pragma once
 
+class IORegistryEntry;
+class OSDictionary;
+
 // Runtime policy layer for the VDA/VCN hardware video decode work.
 //
 // Hardware video acceleration is enabled by default (AVC + HEVC).
@@ -45,6 +48,12 @@ public:
     // True when hardware video acceleration is enabled (default true, disabled by -NRedNoVDA).
     bool isRequested() const { return this->enabled; }
     bool isEnabled() const { return this->enabled; }
+    bool isSupported() const;
+    bool canAdvertise() const;
+    bool shouldStripCapabilities() const;
+
+    static void stripCapabilities(OSDictionary* dictionary);
+    static void withdrawCapabilities(IORegistryEntry* entry);
 
     // True when only AVC is enabled and HEVC is disabled (-NRedNoHEVC).
     bool isAVCOnly() const { return this->enabled && !this->hevcAllowed; }
@@ -59,4 +68,6 @@ public:
     // Default true: AMD VCN 2.2 fully supports 10-bit HEVC decode via AMDRadeonVADriver2.
     // Can be disabled with -NRedNoHEVC10 if explicitly desired.
     bool isHEVC10Allowed() const { return this->enabled && this->hevcAllowed && this->hevc10Allowed; }
+    bool isHEVC10EncodeAllowed() const;
+    bool isHEVC8KDecodeAllowed() const;
 };

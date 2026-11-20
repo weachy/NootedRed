@@ -22,6 +22,7 @@
 
 #pragma once
 #include <Headers/kern_patcher.hpp>
+#include <IOKit/IOLocks.h>
 #include <IOKit/IOService.h>
 #include <libkern/OSTypes.h>
 #include <libkern/c++/OSMetaClass.h>
@@ -51,6 +52,11 @@ class VCNBridge
     bool loadAttempted{false};
     bool loadCompleted{false};
     bool engineAllocated{false};
+    volatile UInt32 mediaFailure{0};
+    volatile bool   vp9Ready{false};
+    IOLock*         acceleratorLock{nullptr};
+    IOService*      acceleratorHandle{nullptr};
+    void            setAccelerator(IOService* accelerator);
 
     mach_vm_address_t orgAcceleratorStart{0};
     mach_vm_address_t orgAcceleratorStop{0};
@@ -64,6 +70,8 @@ class VCNBridge
     mach_vm_address_t orgSurfaceCopy{0};
     mach_vm_address_t orgInitHardware{0};
     mach_vm_address_t orgSafeMetaCast{0};
+    mach_vm_address_t orgFetchResource{0};
+    volatile UInt32   resourceFailures{0};
 
     mach_vm_address_t newVideo6000{0};
     mach_vm_address_t createSML6000{0};
@@ -98,6 +106,10 @@ public:
     // original accelerator start (engine allocation happens before start() returns), which is required by
     // the video/shared entry points that run inside that start.
     bool engineEnabled() const { return this->loadReady() && this->engineAllocated; }
+    bool userPatchesAllowed() const { return this->engineEnabled() && !this->hasMediaFailed(); }
+    bool hasMediaFailed() const { return this->mediaFailure != 0; }
+    void failMedia(UInt32 reason);
+    void setVP9Ready(bool available);
 
     // Allocates the X6000 VCN2 engine for X5000::allocateHWEngines().  `hardware` is the X5000
     // AMDHardware object whose capability field is cleared again if the engine later fails to initialise.
@@ -115,5 +127,6 @@ private:
     static UInt64        surfaceCopy(void* self, void* input, UInt64 size, void* event);
     static void          signalWork(void* hardware);
     static bool          initHardware(void* self, UInt32 channel);
+    static bool          fetchResource(void* self, void* parameters, void* resourceInfo);
     static OSMetaClassBase* safeMetaCast(const OSMetaClassBase* object, const OSMetaClass* target);
 };

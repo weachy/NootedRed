@@ -37,6 +37,8 @@
 #define NRED_HAS_VCN_TAHOE 1
 #endif
 #include <VDA.hpp>
+#include <VP9Probe.hpp>
+#include <VideoCommandPatch.hpp>
 #include <X5000.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <libkern/OSAtomic.h>
@@ -102,7 +104,7 @@ namespace
         // the engine (0x1638 is validated; the other VCN 2.x APUs are experimental) may use this bridge.  The
         // generated ABI guards and the exact build check remain the hard safety gates.
         const auto* const profile = DeviceProfile::current();
-        return isSupportedBuild() && !NRed::singleton().hasExternalVideo() && profile != nullptr
+        return isSupportedBuild() && VDA::singleton().canAdvertise() && profile != nullptr
                && profile->media.vcnGeneration == DeviceProfile::kVcn2_2 && profile->media.hasVCN0;
     }
 
@@ -208,6 +210,36 @@ namespace
     }
 
 
+    struct VP9ServiceSink
+    {
+        IOService* service;
+        bool       string(const char* key, const char* value) { return this->service->setProperty(key, value); }
+        bool       profiles(const char* key, const char* arrayKey, const UInt32* values, const size_t count)
+        {
+            auto* array = OSArray::withCapacity(static_cast<unsigned int>(count));
+            auto* dict  = OSDictionary::withCapacity(1);
+            bool  ok    = array != nullptr && dict != nullptr;
+            for (size_t i = 0; ok && i < count; ++i) {
+                auto* number = OSNumber::withNumber(values[i], 32);
+                ok           = number != nullptr && array->setObject(number);
+                OSSafeReleaseNULL(number);
+            }
+            ok = ok && dict->setObject(arrayKey, array) && this->service->setProperty(key, dict);
+            OSSafeReleaseNULL(array);
+            OSSafeReleaseNULL(dict);
+            return ok;
+        }
+        void remove(const char* key) { this->service->removeProperty(key); }
+    };
+
+    void publishVP9Probe(IOService* const service, const bool eligible)
+    {
+        if (service == nullptr) { return; }
+        VP9ServiceSink sink{service};
+        const auto     status = VP9Probe::publish(sink, eligible);
+        NRed::singleton().setProp32(VP9Probe::StatusKey, status);
+    }
+
 }    // namespace
 
 VCNBridge& VCNBridge::singleton() { return moduleInstance; }
@@ -227,6 +259,14 @@ void VCNBridge::init()
         return;
     }
 
+    this->acceleratorLock = IOLockAlloc();
+    if (this->acceleratorLock == nullptr) {
+        this->requested    = false;
+        this->mediaFailure = 20;
+        SYSLOG("VCN", "Cannot allocate media state lock; bridge disabled");
+        return;
+    }
+
     // Register the optional X6000 load callback up front.  The kext is only requested from inside the
     // X5000 accelerator start, i.e. after both drivers' load hooks are in place.
     lilu.onKextLoadForce(&kextRadeonX6000);
@@ -239,23 +279,76 @@ bool VCNBridge::loadReady() const
     return this->requested && this->x5000Prepared && this->x6000Prepared && this->loadCompleted;
 }
 
+void VCNBridge::setAccelerator(IOService* const accelerator)
+{
+    if (this->acceleratorLock == nullptr) { return; }
+    if (accelerator != nullptr) { accelerator->retain(); }
+    IOLockLock(this->acceleratorLock);
+    auto* const previous    = this->acceleratorHandle;
+    this->acceleratorHandle = accelerator;
+    IOLockUnlock(this->acceleratorLock);
+    if (previous != nullptr) { previous->release(); }
+}
+
+void VCNBridge::failMedia(const UInt32 reason)
+{
+    if (reason == 0 || !OSCompareAndSwap(0, reason, &this->mediaFailure)) { return; }
+    publishReject(reason);
+    NRed::singleton().setProp32("NRedVCNMediaFailure", reason);
+    NRed::singleton().setProp32("NRedVDAMediaEnabled", 0);
+    NRed::singleton().setProp32("NRedVCNUserPatchesAllowed", 0);
+    IOService* accelerator = nullptr;
+    if (this->acceleratorLock != nullptr) {
+        IOLockLock(this->acceleratorLock);
+        accelerator = this->acceleratorHandle;
+        if (accelerator != nullptr) { accelerator->retain(); }
+        IOLockUnlock(this->acceleratorLock);
+    }
+    if (accelerator != nullptr) {
+        VDA::withdrawCapabilities(accelerator);
+        accelerator->release();
+    }
+    SYSLOG("VCN", "Media bridge failed (%u); new page patches/capabilities disabled until reboot", reason);
+}
+
+void VCNBridge::setVP9Ready(const bool available)
+{
+    if (!this->requested) { return; }
+    const bool previous = __atomic_exchange_n(&this->vp9Ready, available, __ATOMIC_ACQ_REL);
+    if (previous == available) { return; }
+
+    IOService* accelerator = nullptr;
+    if (this->acceleratorLock != nullptr) {
+        IOLockLock(this->acceleratorLock);
+        accelerator = this->acceleratorHandle;
+        if (accelerator != nullptr) { accelerator->retain(); }
+        IOLockUnlock(this->acceleratorLock);
+    }
+    if (accelerator != nullptr) {
+        publishVP9Probe(accelerator, available && this->userPatchesAllowed());
+        accelerator->release();
+    }
+}
+
 void* VCNBridge::allocateEngine(void* const hardware)
 {
     if (!this->requested) { return nullptr; }
 
-    if (!this->loadReady() || this->engineMC == nullptr) {
+    if (!this->loadReady() || this->hasMediaFailed() || !VDA::singleton().canAdvertise() ||
+        this->engineMC == nullptr) {
         NRed::singleton().setProp32("NRedVCNEngineAllocated", 0);
         return nullptr;
     }
 
-    this->hardwareHandle = hardware;
-    auto* const engine   = this->engineMC->alloc();
+    this->hardwareHandle  = hardware;
+    auto* const engine    = this->engineMC->alloc();
     this->engineAllocated = engine != nullptr;
 
     NRed::singleton().setProp32("NRedVCNEngineAllocated", static_cast<UInt32>(this->engineAllocated));
     NRed::singleton().setProp32("NRedVDAMediaEnabled", static_cast<UInt32>(this->engineAllocated));
+    NRed::singleton().setProp32("NRedVCNUserPatchesAllowed", this->userPatchesAllowed() ? 1 : 0);
     if (!this->engineAllocated) {
-        publishReject(7);
+        this->failMedia(7);
         SYSLOG("VCN", "Failed to allocate AMDVCN2HWEngine");
         this->loadCompleted = false;
     }
@@ -269,6 +362,7 @@ void* VCNBridge::allocateEngine(void* const hardware)
 bool VCNBridge::acceleratorStart(void* const self, IOService* const provider)
 {
     auto& bridge = singleton();
+    bridge.setAccelerator(static_cast<IOService*>(self));
     if (bridge.requested) {
 
         if (currentKernelVersion().major() == 22) {
@@ -313,8 +407,6 @@ bool VCNBridge::acceleratorStart(void* const self, IOService* const provider)
     if (result) { publishStage(10); }
     NRed::singleton().setProp32("NRedVCNAcceleratorStarted", static_cast<UInt32>(result));
 
-
-
     if (!result) {
         bridge.loadCompleted   = false;
         bridge.engineAllocated = false;
@@ -325,6 +417,9 @@ bool VCNBridge::acceleratorStart(void* const self, IOService* const provider)
             bridge.hardwareHandle = nullptr;
         }
     }
+
+    publishVP9Probe(static_cast<IOService*>(self),
+                    result && bridge.userPatchesAllowed() && __atomic_load_n(&bridge.vp9Ready, __ATOMIC_ACQUIRE));
 
     return result;
 }
@@ -339,6 +434,7 @@ void VCNBridge::acceleratorStop(void* const self, IOService* const provider)
     // allocate a fresh engine.
     bridge.engineAllocated = false;
     bridge.hardwareHandle  = nullptr;
+    bridge.setAccelerator(nullptr);
 
     NRed::singleton().setProp32("NRedVCNEngineAllocated", 0);
     NRed::singleton().setProp32("NRedVDAMediaEnabled", 0);
@@ -443,6 +539,17 @@ bool VCNBridge::initHardware(void* const self, const UInt32 channel)
     }
 
     return false;
+}
+
+bool VCNBridge::fetchResource(void* const self, void* const parameters, void* const resourceInfo)
+{
+    auto&      bridge = singleton();
+    const bool ok     = FunctionCast(fetchResource, bridge.orgFetchResource)(self, parameters, resourceInfo);
+    if (!ok) {
+        const auto count = OSIncrementAtomic(&bridge.resourceFailures) + 1;
+        NRed::singleton().setProp32("NRedVCNResourceFailures", static_cast<UInt32>(count));
+    }
+    return ok;
 }
 
 OSMetaClassBase* VCNBridge::safeMetaCast(const OSMetaClassBase* const object, const OSMetaClass* const target)
@@ -700,12 +807,29 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
                 SYSLOG("VCN", "Failed to roll back X6000 call-site patches (kernel write lock)");
             }
             this->x6000Prepared = false;
+            this->failMedia(17);
             SYSLOG("VCN", "Failed to route X6000 VCN entry points; patches rolled back");
             return;
         }
 
+        // Route fetchResource independently for failure telemetry; gracefully skip if absent on an OS build.
+        KernelPatcher::RouteRequest fetchRoute{
+            "__ZN35AMDRadeonX6000_AMDAccelVideoContext13fetchResourceEP22_AMDVideoResourceParamP21_AMDVideoResourceInfo",
+            fetchResource, this->orgFetchResource};
+        if (!patcher.routeMultiple(id, &fetchRoute, 1, slide, size)) {
+            patcher.clearError();
+            SYSLOG("VCN", "Optional X6000 fetchResource telemetry route unavailable; continuing");
+        }
+
+        VideoCommandPatch::install(
+            patcher, id, slide, size,
+            "__ZN35AMDRadeonX6000_AMDAccelVideoContext14processCommandEPj16VideoCommandTypeS0_j",
+            "__ZN35AMDRadeonX6000_AMDAccelVideoContext13fetchResourceEP22_AMDVideoResourceParamP21_AMDVideoResourceInfo",
+            "NRedX6000VideoCommandGuarded");
+
         this->x6000Prepared = true;
         NRed::singleton().setProp32("NRedVCNX6000ABIValidated", 1);
+        NRed::singleton().setProp32("NRedVCNResourceFailures", 0);
         SYSLOG("VCN", "X6000 VCN bridge prepared (%zu call-site patches)", callPatchCount);
     }
 }

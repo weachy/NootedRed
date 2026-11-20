@@ -23,7 +23,12 @@
 #include <DeviceProfile.hpp>
 #include <Headers/kern_util.hpp>
 #include <NRed.hpp>
+#include <PenguinWizardry/KernelVersion.hpp>
+#include <UserPatches.hpp>
+#include <VCNBridge.hpp>
 #include <VDA.hpp>
+#include <IOKit/IORegistryEntry.h>
+#include <libkern/c++/OSDictionary.h>
 #include <libkern/OSTypes.h>
 
 static VDA moduleInstance;
@@ -35,9 +40,57 @@ namespace
     const char* const kBootArgNoHEVC   = "-NRedNoHEVC";
     const char* const kBootArgNoHEVC10 = "-NRedNoHEVC10";
 
+    const char* const kMediaCapabilities[] = {
+        "IOGVACodec",         "IOGVAHEVCDecode",           "IOGVAHEVCDecodeCapabilities",
+        "IOGVAHEVCEncode",    "IOGVAHEVCEncodeCapabilities", "IOGVAH264EncodeCapabilities",
+        "IOGVAXDecode",       "IOGVAVP9Decode",            "IOGVAVP9DecodeCapabilities",
+    };
+
 }    // namespace
 
 VDA& VDA::singleton() { return moduleInstance; }
+
+bool VDA::isSupported() const
+{
+    const auto* const profile = DeviceProfile::current();
+    return this->enabled && profile != nullptr && profile->media.hasVCN0 &&
+           profile->media.vcnGeneration == DeviceProfile::kVcn2_2 &&
+           !NRed::singleton().hasExternalVideo() && UserPatches::singleton().mediaSupported();
+}
+
+bool VDA::canAdvertise() const
+{
+    return this->isSupported() && !VCNBridge::singleton().hasMediaFailed();
+}
+
+bool VDA::shouldStripCapabilities() const
+{
+    const auto* const profile = DeviceProfile::current();
+    return !this->enabled ||
+           (profile != nullptr && profile->media.vcnGeneration == DeviceProfile::kVcn2_2 && !this->canAdvertise());
+}
+
+bool VDA::isHEVC10EncodeAllowed() const
+{
+    return this->isHEVC10Allowed() && this->canAdvertise() && currentKernelVersion() >= KernelVersion::Sequoia;
+}
+
+bool VDA::isHEVC8KDecodeAllowed() const
+{
+    return this->isHEVCDecodeAllowed() && this->canAdvertise() && currentKernelVersion() >= KernelVersion::Sequoia;
+}
+
+void VDA::stripCapabilities(OSDictionary* const dictionary)
+{
+    if (dictionary == nullptr) { return; }
+    for (const auto* key : kMediaCapabilities) { dictionary->removeObject(key); }
+}
+
+void VDA::withdrawCapabilities(IORegistryEntry* const entry)
+{
+    if (entry == nullptr) { return; }
+    for (const auto* key : kMediaCapabilities) { entry->removeProperty(key); }
+}
 
 void VDA::init()
 {

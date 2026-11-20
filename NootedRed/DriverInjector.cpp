@@ -23,6 +23,7 @@
 #include <DriverInjector.hpp>
 #include <Headers/kern_patcher.hpp>
 #include <Headers/kern_util.hpp>
+#include <NRed.hpp>
 #include <VDA.hpp>
 #include <libkern/OSTypes.h>
 #include <libkern/c++/OSArray.h>
@@ -33,6 +34,75 @@
 #include <libkern/c++/OSString.h>
 
 static DriverInjector moduleInstance;
+
+// Keep the XML's conservative Main-only default. Publish Main10 only after the
+// build/device/backend policy has accepted the encode path.
+static bool enableHEVC10Encode(OSDictionary* const personality)
+{
+    if (personality == nullptr) { return false; }
+    auto* const original = OSDynamicCast(OSDictionary, personality->getObject("IOGVAHEVCEncodeCapabilities"));
+    if (original == nullptr) { return false; }
+    auto* const originalDetails = OSDynamicCast(OSDictionary, original->getObject("VTPerProfileDetails"));
+    auto* const main =
+        originalDetails != nullptr ? OSDynamicCast(OSDictionary, originalDetails->getObject("1")) : nullptr;
+    if (main == nullptr) { return false; }
+    auto* const caps     = OSDictionary::withDictionary(original);
+    auto* const details  = OSDictionary::withDictionary(originalDetails);
+    auto* const profiles = OSArray::withCapacity(2);
+    auto* const one      = OSNumber::withNumber(static_cast<unsigned long long>(1), 32);
+    auto* const two      = OSNumber::withNumber(static_cast<unsigned long long>(2), 32);
+    auto* const level    = OSString::withCString("2");
+    bool        ready    = caps != nullptr && details != nullptr && profiles != nullptr && one != nullptr &&
+                    two != nullptr && level != nullptr;
+    if (ready) {
+        ready = details->setObject("2", main) && profiles->setObject(one) && profiles->setObject(two) &&
+                caps->setObject("VTPerProfileDetails", details) &&
+                caps->setObject("VTSupportedProfileArray", profiles);
+    }
+    if (ready) {
+        // Publish the level last: AppleGVA uses it to accept the Main10 setter.
+        ready = personality->setObject("IOGVAHEVCEncodeCapabilities", caps) &&
+                personality->setObject("IOGVAHEVCEncode", level);
+    }
+    if (level != nullptr) { level->release(); }
+    if (two != nullptr) { two->release(); }
+    if (one != nullptr) { one->release(); }
+    if (profiles != nullptr) { profiles->release(); }
+    if (details != nullptr) { details->release(); }
+    if (caps != nullptr) { caps->release(); }
+    return ready;
+}
+
+static bool enableHEVC8KDecode(OSDictionary* const personality)
+{
+    if (personality == nullptr) { return false; }
+    auto* const original        = OSDynamicCast(OSDictionary, personality->getObject("IOGVAHEVCDecodeCapabilities"));
+    auto* const originalDetails =
+        original != nullptr ? OSDynamicCast(OSDictionary, original->getObject("VTPerProfileDetails")) : nullptr;
+    if (originalDetails == nullptr) { return false; }
+    auto* const caps    = OSDictionary::withDictionary(original);
+    auto* const details = OSDictionary::withDictionary(originalDetails);
+    auto* const level   = OSNumber::withNumber(static_cast<unsigned long long>(186), 32);    // HEVC Level 6.2
+    bool        ready   = caps != nullptr && details != nullptr && level != nullptr;
+    const char* const profiles[] = {"1", "2", "3"};
+    for (const auto* profile : profiles) {
+        if (!ready) { break; }
+        auto* const old = OSDynamicCast(OSDictionary, originalDetails->getObject(profile));
+        if (old == nullptr) { continue; }
+        auto* const updated = OSDictionary::withDictionary(old);
+        ready = updated != nullptr && updated->setObject("VTMaxDecodeLevel", level) &&
+                details->setObject(profile, updated);
+        if (updated != nullptr) { updated->release(); }
+    }
+    if (ready) {
+        ready = caps->setObject("VTPerProfileDetails", details) &&
+                personality->setObject("IOGVAHEVCDecodeCapabilities", caps);
+    }
+    if (level != nullptr) { level->release(); }
+    if (details != nullptr) { details->release(); }
+    if (caps != nullptr) { caps->release(); }
+    return ready;
+}
 
 static const char com_apple_kext_AMDRadeonX5000[] = {
 #include "Personalities/com.apple.kext.AMDRadeonX5000.inc"
@@ -98,28 +168,15 @@ bool DriverInjector::wrapAddDrivers(void* const self, OSArray* const array, cons
             if (strcmp(driver.identifier, "com.apple.kext.AMDRadeonX5000") == 0) {
                 const auto count = driver.personalities->getCount();
 
-                // If hardware video acceleration is completely disabled (-NRedNoVDA):
-                if (!VDA::singleton().isRequested()) {
+                // Strip codec capabilities when VDA is disabled or the VCN 2.2 bridge cannot run.
+                if (VDA::singleton().shouldStripCapabilities()) {
                     for (UInt32 i = 0; i < count; ++i) {
                         auto* const pDict = OSDynamicCast(OSDictionary, driver.personalities->getObject(i));
-                        if (pDict != nullptr) {
-                            pDict->removeObject("IOGVACodec");
-                            pDict->removeObject("IOGVAHEVCDecode");
-                            pDict->removeObject("IOGVAHEVCDecodeCapabilities");
-                            pDict->removeObject("IOGVAHEVCEncode");
-                            pDict->removeObject("IOGVAHEVCEncodeCapabilities");
-                            pDict->removeObject("IOGVAH264EncodeCapabilities");
-                        }
+                        VDA::stripCapabilities(pDict);
                     }
-                    if (dict != nullptr) {
-                        dict->removeObject("IOGVACodec");
-                        dict->removeObject("IOGVAHEVCDecode");
-                        dict->removeObject("IOGVAHEVCDecodeCapabilities");
-                        dict->removeObject("IOGVAHEVCEncode");
-                        dict->removeObject("IOGVAHEVCEncodeCapabilities");
-                        dict->removeObject("IOGVAH264EncodeCapabilities");
-                    }
-                    DBGLOG("DriverInjector", "-NRedNoVDA active: stripped all hardware video acceleration capabilities from %s", driver.identifier);
+                    VDA::stripCapabilities(dict);
+                    DBGLOG("DriverInjector", "Media bridge unavailable: stripped codec capabilities from %s",
+                           driver.identifier);
                 }
                 else {
                     // 1. HEVC Decode policy:
@@ -173,9 +230,18 @@ bool DriverInjector::wrapAddDrivers(void* const self, OSArray* const array, cons
                     else {
                         DBGLOG("DriverInjector", "Full HEVC hardware decode (8-bit and 10-bit Main 10) enabled for %s", driver.identifier);
                     }
+                    if (VDA::singleton().isHEVC8KDecodeAllowed()) {
+                        bool advertised = false;
+                        for (UInt32 i = 0; i < count; ++i) {
+                            advertised |= enableHEVC8KDecode(OSDynamicCast(OSDictionary, driver.personalities->getObject(i)));
+                        }
+                        advertised |= enableHEVC8KDecode(dict);
+                        NRed::singleton().setProp32("NRedHEVC8KDecodeAdvertised", advertised ? 1 : 0);
+                    }
 
                     // 2. HEVC Encode policy:
                     // - If !isHEVCEncodeAllowed() (-NRedNoHEVC): strip IOGVAHEVCEncode and IOGVAHEVCEncodeCapabilities.
+                    // - If isHEVC10EncodeAllowed(): advertise Main10 (level "2" + profile 2).
                     // - Default: preserve 8-bit HEVC encode.
                     if (!VDA::singleton().isHEVCEncodeAllowed()) {
                         for (UInt32 i = 0; i < count; ++i) {
@@ -189,9 +255,21 @@ bool DriverInjector::wrapAddDrivers(void* const self, OSArray* const array, cons
                             dict->removeObject("IOGVAHEVCEncode");
                             dict->removeObject("IOGVAHEVCEncodeCapabilities");
                         }
+                        NRed::singleton().setProp32("NRedHEVC10EncodeAdvertised", 0);
                         DBGLOG("DriverInjector", "-NRedNoHEVC active: stripped HEVC encode capabilities from %s", driver.identifier);
                     }
+                    else if (VDA::singleton().isHEVC10EncodeAllowed()) {
+                        bool advertised = false;
+                        for (UInt32 i = 0; i < count; ++i) {
+                            advertised |= enableHEVC10Encode(OSDynamicCast(OSDictionary, driver.personalities->getObject(i)));
+                        }
+                        advertised |= enableHEVC10Encode(dict);
+                        NRed::singleton().setProp32("NRedHEVC10EncodeAdvertised", advertised ? 1 : 0);
+                        DBGLOG("DriverInjector", "HEVC Main10 hardware encode advertised (%u) for %s",
+                               static_cast<unsigned>(advertised), driver.identifier);
+                    }
                     else {
+                        NRed::singleton().setProp32("NRedHEVC10EncodeAdvertised", 0);
                         DBGLOG("DriverInjector", "Preserved HEVC 8-bit encode capabilities for %s", driver.identifier);
                     }
                 }
