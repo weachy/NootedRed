@@ -49,6 +49,7 @@
 #include <UserPatches.hpp>
 #include <VCNBridge.hpp>
 #include <VDA.hpp>
+#include <VP9UserPatch.hpp>
 #include <X5000.hpp>
 #include <X6000FB.hpp>
 #include <kern/clock.h>
@@ -77,6 +78,8 @@ void NRed::init()
     VDA::singleton().init();
 
     VCNBridge::singleton().init();
+
+    VP9UserPatch::singleton().init();
 
     lilu.onKextLoadForce(&kextRadeonX6000Framebuffer);
     lilu.onKextLoadForce(&kextRadeonX5000HWLibs);
@@ -234,6 +237,7 @@ void NRed::processPatcher(KernelPatcher& patcher)
 
     VDA::singleton().processPatcher();
     UserPatches::singleton().processPatcher(patcher);
+    VP9UserPatch::singleton().processPatcher(patcher);
 
     DeviceInfo::deleter(devInfo);
 }
