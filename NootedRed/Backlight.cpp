@@ -183,28 +183,29 @@ IOReturn Backlight::wrapSetAttributeForConnection(IOService* const framebuffer, 
         framebuffer, connectIndex, attribute, value);
     if (attribute != kIOAppleBacklightAttribute) { return ret; }
 
-    singleton().curBacklightLvl = static_cast<UInt32>(value);
+    auto &self = singleton();
+    self.curBacklightLvl = static_cast<UInt32>(value);
 
-    if (singleton().embeddedPanelLink == nullptr) { return kIOReturnNoDevice; }
+    if (self.embeddedPanelLink == nullptr) { return kIOReturnNoDevice; }
+    if (self.maxBacklightLvl == 0) { return kIOReturnInternalError; }
 
-    if (singleton().maxBacklightLvl == 0) { return kIOReturnInternalError; }
+    const auto percentage = self.curBacklightLvl * 100 / self.maxBacklightLvl;
 
-    const auto percentage = singleton().curBacklightLvl * 100 / singleton().maxBacklightLvl;
+    // Some eDP OLED panels report DPCD sink capability "oled = 0" at link-create time
+    // because DPCD is not yet populated. The cached supportsAUX stays false, so only
+    // the PWM path is driven; on a self-emissive OLED panel PWM has no effect and the
+    // brightness slider moves without changing the panel.
+    //
+    // Drive both write paths for embedded panels: dc_link_set_backlight_level (PWM)
+    // and dc_link_set_backlight_level_nits (AUX DCS). They program different hardware
+    // and do not override each other; AUX is issued last so OLED panels pick it up.
+    // No link init / power state is touched, so S3 sleep/wake is unaffected.
+    const auto pwmValue = (percentage * 0xFFFF) / 100;
+    const bool pwmOk    = self.orgDcLinkSetBacklightLevel(self.embeddedPanelLink, pwmValue, 0) != 0;
+    const auto auxValue = (self.maxBacklightMillinits * percentage) / 100;
+    const bool nitsOk   = self.orgDcLinkSetBacklightLevelNits(self.embeddedPanelLink, true, auxValue, 50) != 0;
 
-    if (singleton().supportsAUX) {
-        const auto auxValue = (singleton().maxBacklightMillinits * percentage) / 100;
-        if (singleton().orgDcLinkSetBacklightLevelNits(singleton().embeddedPanelLink, true, auxValue, 50)) {
-            return kIOReturnSuccess;
-        }
-    }
-    else {
-        const auto pwmValue = (percentage * 0xFFFF) / 100;
-        if (singleton().orgDcLinkSetBacklightLevel(singleton().embeddedPanelLink, pwmValue, 0)) {
-            return kIOReturnSuccess;
-        }
-    }
-
-    return kIOReturnDeviceError;
+    return (pwmOk || nitsOk) ? kIOReturnSuccess : kIOReturnDeviceError;
 }
 
 IOReturn Backlight::wrapGetAttributeForConnection(IOService* framebuffer, IOIndex connectIndex, IOSelect attribute,
