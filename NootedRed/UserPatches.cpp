@@ -27,19 +27,14 @@
 #include <GLResourceBudgetPatch.hpp>
 #include <NRed.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
-#include <UserPatchMemory.hpp>
 #include <UserPatches.hpp>
 #include <VDA.hpp>
 #include <VCNBridge.hpp>
 #include <libkern/OSAtomic.h>
 #include <libkern/OSTypes.h>
-#include <mach/i386/vm_types.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOUserClient.h>
-#include <kern/task.h>
-#include <sys/errno.h>
-#include <sys/proc.h>
 #include <libkern/c++/OSBoolean.h>
 #include <sys/vnode.h>
 
@@ -513,10 +508,7 @@ void UserPatches::processPatcher(KernelPatcher& patcher)
         this->signatureCount  = 0;
     }
 
-    const auto vcn1Decode = VDA::singleton().isVcn1DecodeRequested();
-    const auto vcn2 = profile != nullptr && profile->media.hasVCN0
-                      && profile->media.vcnGeneration == DeviceProfile::kVcn2_2;
-    const auto vdaAllowed = this->vdaEnabled && (vcn2 || vcn1Decode)
+    const auto vdaAllowed = this->vdaEnabled && VDA::singleton().isBridgeRequested()
                             && !NRed::singleton().hasExternalVideo();
     if (this->vdaEnabled && !vdaAllowed) {
         SYSLOG("UserPatch", "VDA patches requested but this device is outside the supported media policy");
@@ -531,11 +523,6 @@ void UserPatches::processPatcher(KernelPatcher& patcher)
         this->nativeBackendReady = this->installNativePagePatcher(patcher);
         SYSLOG_COND(!this->nativeBackendReady, "UserPatch",
                     "Failed to install the dynamic signature patch backend");
-        if (this->nativeBackendReady && this->vdaEnabled && vcn1Decode) {
-            this->nativeBackendReady = this->installRaven2PrivatePatcher(patcher);
-            SYSLOG_COND(!this->nativeBackendReady, "UserPatch",
-                        "Failed to install Raven2 private shared-cache patcher");
-        }
         return;
     }
 }
@@ -658,122 +645,88 @@ void UserPatches::reapplyCachedSites(const VnodeKind vnodeKind, const UInt64 pag
     }
 }
 
-// On 23J631 all five Vcn2DecCommand register writers occupy this single VA driver cache page.
-// Validate the complete group before rewriting any members. VCN1 uses the absolute SOC15 register
-// index (Raven2 segment 1 at 0x7E00 plus the VCN1 register offset).
-static bool patchRaven2DecodeRegisters(UInt8* const bytes)
-{
-    static constexpr struct RegisterPatch
-    {
-        size_t instructionOffset;
-        UInt16 vcn2Index;
-        UInt16 raven2Index;
-    } patches[] = {
-        {0xD5F, 0x0504, 0x81C4}, // writeUvdGpcomVcpuData0
-        {0xD89, 0x0505, 0x81C5}, // writeUvdGpcomVcpuData1
-        {0xDB3, 0x0503, 0x81C3}, // writeUvdGpcomVcpuCmd
-        {0xDDC, 0x0506, 0x81C6}, // writeUvdEngineStart
-        {0xE08, 0x053F, 0x81FF}, // writeUvdNoOp
-    };
-    for (const auto& patch : patches) {
-        const auto* const instruction = bytes + patch.instructionOffset;
-        const auto index = static_cast<UInt16>(instruction[1] | (static_cast<UInt16>(instruction[2]) << 8));
-        if (instruction[-3] != 0x48 || instruction[-2] != 0x8B || instruction[-1] != 0x07
-            || instruction[0] != 0xBE
-            || (index != patch.vcn2Index && index != patch.raven2Index)
-            || instruction[3] != 0 || instruction[4] != 0
-            || instruction[5] != 0xFF || instruction[6] != 0x50 || instruction[7] != 0x20) {
-            return false;
-        }
-    }
+static constexpr UInt64 kRaven2EncoderPitchPage        = 0x33E4000;
+static constexpr UInt64 kRaven2EncoderPacketPage       = 0x33E5000;
+static constexpr UInt64 kRaven2EncoderAvcStatusPage    = 0x33E7000;
+static constexpr UInt64 kRaven2EncoderHevcPacketPage   = 0x33E6000;
+static constexpr UInt64 kRaven2EncoderHevcStatusPage   = 0x33E8000;
+static constexpr UInt32 kRaven2EncoderPitchApplied     = 1U << 0;
+static constexpr UInt32 kRaven2EncoderPacketsApplied   = 1U << 1;
+static constexpr UInt32 kRaven2EncoderHevcPacketsApplied = 1U << 2;
+static constexpr UInt32 kRaven2EncoderAvcStatus        = 1U << 3;
+static constexpr UInt32 kRaven2EncoderHevcStatus       = 1U << 4;
+static constexpr UInt32 kRaven2EncoderCommonPages      = kRaven2EncoderPitchApplied | kRaven2EncoderPacketsApplied;
+static constexpr unsigned kRaven2MediaFailureShift     = 16;
 
-    for (const auto& patch : patches) {
-        auto* const immediate = bytes + patch.instructionOffset + 1;
-        immediate[0] = static_cast<UInt8>(patch.raven2Index);
-        immediate[1] = static_cast<UInt8>(patch.raven2Index >> 8);
-    }
-    return true;
-}
-
-static constexpr UInt64 kRaven2EncoderPitchPage = 0x33E4000;
-static constexpr UInt64 kRaven2EncoderPacketPage = 0x33E5000;
-static constexpr UInt64 kRaven2EncoderAvcStatusPage = 0x33E7000;
-static constexpr UInt64 kRaven2EncoderHevcPacketPage = 0x33E6000;
-static constexpr UInt64 kRaven2EncoderHevcStatusPage = 0x33E8000;
-static bool patchRaven2EncoderInputOutput(UInt8* const bytes)
+static bool patchRaven2EncoderInputOutput(const UInt8* const bytes)
 {
-    // Vcn2Encoder::setEncodeParams on 23J631. Use the imported texture's
-    // byte pitch before the existing code derives both plane pitches.
     static_assert(sizeof(kVDAFind_SourcePitch) == sizeof(kVDAReplace_SourcePitch));
-    auto* const pitch = bytes + 0x526;
+    auto* const pitch = const_cast<UInt8*>(bytes) + 0x526;
 
-    // Vcn2Encoder::setBitstreamBufParams initializes the mode and first
-    // address word with one store. VCN1 Mesa uses linear bitstream output.
     static constexpr UInt8 circular[] = {0x48, 0xC7, 0x02, 0x01, 0x00, 0x00, 0x00};
-    static constexpr UInt8 linear[] = {0x48, 0xC7, 0x02, 0x00, 0x00, 0x00, 0x00};
-    auto* const bitstreamMode = bytes + 0x40A;
-    const bool pitchApplied = memcmp(pitch, kVDAReplace_SourcePitch, sizeof(kVDAReplace_SourcePitch)) == 0;
-    const bool modeApplied = memcmp(bitstreamMode, linear, sizeof(linear)) == 0;
+    static constexpr UInt8 linear[]   = {0x48, 0xC7, 0x02, 0x00, 0x00, 0x00, 0x00};
+    auto* const bitstreamMode         = const_cast<UInt8*>(bytes) + 0x40A;
+    const bool  pitchApplied = memcmp(pitch, kVDAReplace_SourcePitch, sizeof(kVDAReplace_SourcePitch)) == 0;
+    const bool  modeApplied  = memcmp(bitstreamMode, linear, sizeof(linear)) == 0;
     if ((!pitchApplied && memcmp(pitch, kVDAFind_SourcePitch, sizeof(kVDAFind_SourcePitch)) != 0)
-        || (!modeApplied && memcmp(bitstreamMode, circular, sizeof(circular)) != 0)) { return false; }
+        || (!modeApplied && memcmp(bitstreamMode, circular, sizeof(circular)) != 0)) {
+        return false;
+    }
     if (pitchApplied && modeApplied) { return true; }
+    if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return false; }
     memcpy(pitch, kVDAReplace_SourcePitch, sizeof(kVDAReplace_SourcePitch));
     memcpy(bitstreamMode, linear, sizeof(linear));
+    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
     return true;
 }
 
 struct Raven2EncoderPacketSite
 {
     UInt16 offset;
-    UInt8 size;
-    UInt8 original[10];
-    UInt8 replacement[10];
+    UInt8  size;
+    UInt8  original[10];
+    UInt8  replacement[10];
 };
 
-template <size_t N>
-static bool patchRaven2EncoderSites(UInt8* const bytes, const Raven2EncoderPacketSite (&sites)[N])
+template<size_t N>
+static bool patchRaven2EncoderSites(const UInt8* const bytes, const Raven2EncoderPacketSite (&sites)[N])
 {
     bool alreadyApplied = true;
     for (const auto& site : sites) {
         const auto* const target = bytes + site.offset;
         if (memcmp(target, site.original, site.size) == 0) {
             alreadyApplied = false;
-        }
-        else if (memcmp(target, site.replacement, site.size) != 0) {
+        } else if (memcmp(target, site.replacement, site.size) != 0) {
             return false;
         }
     }
     if (alreadyApplied) { return true; }
+    if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return false; }
     for (const auto& site : sites) {
-        memcpy(bytes + site.offset, site.replacement, site.size);
+        memcpy(const_cast<UInt8*>(bytes) + site.offset, site.replacement, site.size);
     }
+    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
     return true;
 }
 
-static bool patchRaven2EncoderPackets(UInt8* const bytes)
+static bool patchRaven2EncoderPackets(const UInt8* const bytes)
 {
-    // Sonoma 23J631 VA cache .03, page 0x33E5000. Keep the native
-    // RENCODE session operations. The Raven firmware also handles the
-    // legacy ring-test operations in a separate parser.
     static constexpr Raven2EncoderPacketSite sites[] = {
-        {0xA8B, 10, {0xBE, 0x0B, 0x00, 0x00, 0x00, 0xBA, 0xC0, 0x00, 0x00, 0x00}, {0xBE, 0x0A, 0x00, 0x00, 0x00, 0xBA, 0xC0, 0x00, 0x00, 0x00}}, // addSliceHeaderPacket
-        {0xB2B, 10, {0xBE, 0x10, 0x00, 0x00, 0x00, 0xBA, 0x0C, 0x00, 0x00, 0x00}, {0xBE, 0x0C, 0x00, 0x00, 0x00, 0xBA, 0x0C, 0x00, 0x00, 0x00}}, // addIntraRefreshPacket
-        {0xB70, 10, {0xBE, 0x11, 0x00, 0x00, 0x00, 0xBA, 0x58, 0x02, 0x00, 0x00}, {0xBE, 0x0D, 0x00, 0x00, 0x00, 0xBA, 0x4C, 0x02, 0x00, 0x00}}, // addContextBufferPacket
-        {0xCFD, 10, {0xBE, 0x0F, 0x00, 0x00, 0x00, 0xBA, 0x2C, 0x00, 0x00, 0x00}, {0xBE, 0x0B, 0x00, 0x00, 0x00, 0xBA, 0x2C, 0x00, 0x00, 0x00}}, // addEncodePacket
-        {0xC2A, 10, {0xBE, 0x15, 0x00, 0x00, 0x00, 0xBA, 0x14, 0x00, 0x00, 0x00}, {0xBE, 0x10, 0x00, 0x00, 0x00, 0xBA, 0x14, 0x00, 0x00, 0x00}}, // addFeedbackBufferPacket
-        {0xC90, 10, {0xBE, 0x12, 0x00, 0x00, 0x00, 0xBA, 0x14, 0x00, 0x00, 0x00}, {0xBE, 0x0E, 0x00, 0x00, 0x00, 0xBA, 0x14, 0x00, 0x00, 0x00}}, // addBitstreamBufferPacket
-        {0xA9C,  3, {0x55, 0x48, 0x89}, {0x31, 0xC0, 0xC3}}, // addInputFormatPacket
-        {0xAB8,  3, {0x55, 0x48, 0x89}, {0x31, 0xC0, 0xC3}}, // addOutputFormatPacket
-        // The optional VCN2 EFC packet collides with VCN1's bitstream buffer ID.
-        {0xAD4,  8, {0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x30}, {0x31, 0xC0, 0xC3, 0xE5, 0x48, 0x83, 0xEC, 0x30}}, // addEfcPacket
+        {0xA8B, 10, {0xBE, 0x0B, 0x00, 0x00, 0x00, 0xBA, 0xC0, 0x00, 0x00, 0x00}, {0xBE, 0x0A, 0x00, 0x00, 0x00, 0xBA, 0xC0, 0x00, 0x00, 0x00}},
+        {0xB2B, 10, {0xBE, 0x10, 0x00, 0x00, 0x00, 0xBA, 0x0C, 0x00, 0x00, 0x00}, {0xBE, 0x0C, 0x00, 0x00, 0x00, 0xBA, 0x0C, 0x00, 0x00, 0x00}},
+        {0xB70, 10, {0xBE, 0x11, 0x00, 0x00, 0x00, 0xBA, 0x58, 0x02, 0x00, 0x00}, {0xBE, 0x0D, 0x00, 0x00, 0x00, 0xBA, 0x4C, 0x02, 0x00, 0x00}},
+        {0xCFD, 10, {0xBE, 0x0F, 0x00, 0x00, 0x00, 0xBA, 0x2C, 0x00, 0x00, 0x00}, {0xBE, 0x0B, 0x00, 0x00, 0x00, 0xBA, 0x2C, 0x00, 0x00, 0x00}},
+        {0xC2A, 10, {0xBE, 0x15, 0x00, 0x00, 0x00, 0xBA, 0x14, 0x00, 0x00, 0x00}, {0xBE, 0x10, 0x00, 0x00, 0x00, 0xBA, 0x14, 0x00, 0x00, 0x00}},
+        {0xC90, 10, {0xBE, 0x12, 0x00, 0x00, 0x00, 0xBA, 0x14, 0x00, 0x00, 0x00}, {0xBE, 0x0E, 0x00, 0x00, 0x00, 0xBA, 0x14, 0x00, 0x00, 0x00}},
+        {0xA9C,  3, {0x55, 0x48, 0x89}, {0x31, 0xC0, 0xC3}},
+        {0xAB8,  3, {0x55, 0x48, 0x89}, {0x31, 0xC0, 0xC3}},
+        {0xAD4,  8, {0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x30}, {0x31, 0xC0, 0xC3, 0xE5, 0x48, 0x83, 0xEC, 0x30}},
     };
     return patchRaven2EncoderSites(bytes, sites);
 }
 
-static bool patchRaven2EncoderHevcPackets(UInt8* const bytes)
+static bool patchRaven2EncoderHevcPackets(const UInt8* const bytes)
 {
-    // VCN1 uses the first six deblock words. Skip the Apple HW-specific
-    // instruction packet in both the inlined and standalone writers.
     static constexpr Raven2EncoderPacketSite sites[] = {
         {0x4A2, 10, {0x41, 0x80, 0x7E, 0x1A, 0x00, 0x74, 0x1C, 0x48, 0x8D, 0x8B},
                     {0x41, 0x80, 0x7E, 0x1A, 0x00, 0xEB, 0x1C, 0x48, 0x8D, 0x8B}},
@@ -787,459 +740,126 @@ static bool patchRaven2EncoderHevcPackets(UInt8* const bytes)
     return patchRaven2EncoderSites(bytes, sites);
 }
 
-static bool patchRaven2EncoderStatus(UInt8* const bytes, const size_t offset)
+static bool patchRaven2EncoderStatus(const UInt8* const bytes, const size_t offset)
 {
-    // AVDVcn2AvcEncDataProcessor and AVDVcn2HevcEncDataProcessor use the same
-    // feedback indexing sequence in ProcessEncodeStatus on Sonoma 23J631.
-    // Index the feedback ring using the same 48-byte record size sent in
-    // setFeedbackBufParams. Keep the larger host allocation as padding.
-    constexpr auto& original = kVDACtx_StatusStride_Modern;
-    constexpr auto& replacement = kVDAReplace_StatusStride_Modern;
+    constexpr auto&  original     = kVDACtx_StatusStride_Modern;
+    constexpr auto&  replacement  = kVDAReplace_StatusStride_Modern;
     constexpr size_t strideOffset = 3;
-    constexpr size_t afterStride = strideOffset + sizeof(replacement);
-    constexpr size_t suffixSize = sizeof(original) - afterStride;
-    auto* const site = bytes + offset;
-    auto* const stride = site + strideOffset;
+    constexpr size_t afterStride  = strideOffset + sizeof(replacement);
+    constexpr size_t suffixSize   = sizeof(original) - afterStride;
+    auto* const      site         = const_cast<UInt8*>(bytes) + offset;
+    auto* const      stride       = site + strideOffset;
     if (memcmp(site, original, strideOffset) != 0
-        || memcmp(site + afterStride, original + afterStride, suffixSize) != 0) { return false; }
+        || memcmp(site + afterStride, original + afterStride, suffixSize) != 0) {
+        return false;
+    }
     if (memcmp(stride, replacement, sizeof(replacement)) == 0) { return true; }
-    if (memcmp(stride, original + strideOffset, sizeof(replacement)) != 0) { return false; }
+    if (memcmp(stride, original + strideOffset, sizeof(replacement)) != 0
+        || MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
+        return false;
+    }
     memcpy(stride, replacement, sizeof(replacement));
+    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
     return true;
 }
 
-static bool patchRaven2DecodePage(UInt8* const bytes, const UInt64 pageOffset, const bool gvaCache)
+bool UserPatches::raven2EncoderPagesReady(const bool hevc) const
 {
-    // File offsets from the installed 23J631 x86_64h subcaches. All sites on one page
-    // must match before any writes to the private buffer.
-    static constexpr struct Site
-    {
-        UInt64                 fileOffset;
-        const UserPatches::SignaturePatch* signature;
-    } sites[] = {
-        {0x2A2D3C, &kGVAResolverSignature_Sonoma},
-        {0x339D546, &kVDAResolverSignatures_Sonoma[0]}, // VA accelerator family
-        {0x339ED9C, &kVDAResolverSignatures_Sonoma[1]}, // AddrLib interface
-        {0x33A64C7, &kVDAResolverSignatures_Sonoma[6]}, // GFX9 video processors
-        {0x33A6589, &kVDAResolverSignatures_Sonoma[6]},
-        {0x33A660B, &kVDAResolverSignatures_Sonoma[6]},
-        {0x33A6710, &kVDAResolverSignatures_Sonoma[5]}, // GFX9 graphics engine and blit
-        {0x33A67A9, &kVDAResolverSignatures_Sonoma[5]},
-        {0x33FFC15, &kVDAResolverSignatures_Sonoma[2]}, // AddrLib creation
-        {0x34154F0, &kVDAResolverSignatures_Sonoma[3]}, // GFX9 chip family
-    };
-    static_assert(arrsize(sites) <= 32);
-
-    if (!gvaCache) {
-        switch (pageOffset) {
-            case 0x33E3000: return patchRaven2DecodeRegisters(bytes);
-            case kRaven2EncoderPitchPage: return patchRaven2EncoderInputOutput(bytes);
-            case kRaven2EncoderPacketPage: return patchRaven2EncoderPackets(bytes);
-            case kRaven2EncoderHevcPacketPage: return patchRaven2EncoderHevcPackets(bytes);
-            case kRaven2EncoderAvcStatusPage: return patchRaven2EncoderStatus(bytes, 0xA1);
-            case kRaven2EncoderHevcStatusPage: return patchRaven2EncoderStatus(bytes, 0x279);
-        }
-    }
-
-    bool found = false;
-    UInt32 pending = 0;
-    for (size_t i = 0; i < arrsize(sites); ++i) {
-        const auto& site = sites[i];
-        const auto offset = site.fileOffset % UserPatches::kPageSize;
-        const bool matchingCache = site.signature == &kGVAResolverSignature_Sonoma ? gvaCache : !gvaCache;
-        if (!matchingCache || site.fileOffset - offset != pageOffset) {
-            continue;
-        }
-
-        found = true;
-        const auto& sig = *site.signature;
-        const auto* const target = bytes + offset;
-        if (memcmp(target, sig.replace, sig.replaceSize) == 0) { continue; }
-        size_t matchOffset = 0;
-        const auto contextOffset = offset - sig.patchOffset;
-        if (!matchSignature(bytes, sig, matchOffset, contextOffset) || matchOffset != contextOffset) {
-            return false;
-        }
-        pending |= UInt32{1} << i;
-    }
-    for (size_t i = 0; i < arrsize(sites); ++i) {
-        if ((pending & (UInt32{1} << i)) == 0) { continue; }
-        const auto& site = sites[i];
-        memcpy(bytes + site.fileOffset % UserPatches::kPageSize,
-               site.signature->replace, site.signature->replaceSize);
-    }
-
-    return found;
+    const UInt32 required    = kRaven2EncoderCommonPages | (hevc ? kRaven2EncoderHevcPacketsApplied : 0U);
+    const UInt32 failureMask = (required | (hevc ? kRaven2EncoderHevcStatus : kRaven2EncoderAvcStatus))
+                               << kRaven2MediaFailureShift;
+    const auto state = __atomic_load_n(&this->raven2MediaPatchState, __ATOMIC_ACQUIRE);
+    return (state & (required | failureMask)) == required;
 }
 
-namespace
+void UserPatches::recordRaven2MediaPage(const UInt32 page, const bool applied)
 {
-    // Sonoma 23J631 x86_64h cache UUIDs and RX mapping deltas from their headers.
-    constexpr UInt64 kRaven2GVAOffset = 0x200000000;
-    constexpr UInt64 kRaven2VAOffset  = 0x300000000;
-    constexpr UInt8 kRaven2CacheUUID[] = {0x4C, 0x14, 0x41, 0xFD, 0x8A, 0x54, 0x3D, 0xC2,
-                                         0x86, 0x3D, 0x49, 0x11, 0x0B, 0x94, 0x6A, 0x25};
-    constexpr UInt8 kRaven2GVAUUID[] = {0x14, 0xCB, 0xFF, 0xB6, 0x1F, 0x33, 0x33, 0x9C,
-                                        0x80, 0xC3, 0x74, 0xC7, 0xB0, 0x65, 0xDB, 0xAD};
-    constexpr UInt8 kRaven2VAUUID[] = {0x51, 0x8E, 0x60, 0x50, 0x16, 0x9E, 0x34, 0xDD,
-                                       0x9A, 0x0F, 0x2F, 0x32, 0xC3, 0xAF, 0xB8, 0x78};
+    const auto state = __atomic_or_fetch(&this->raven2MediaPatchState,
+                                         applied ? page : page << kRaven2MediaFailureShift, __ATOMIC_ACQ_REL);
+    if (!applied) { NRed::singleton().setProp32("NRedRaven2MediaPatchFailures", state >> kRaven2MediaFailureShift); }
+}
 
-    enum class Raven2PageUse : UInt8 { Decode, Encode, AvcEncode, HevcEncode, Metal };
-    struct Raven2PageTarget
-    {
-        UInt64 subcache;
-        UInt64 fileOffset;
-        Raven2PageUse use;
-    };
-
-    constexpr Raven2PageTarget kRaven2PageTargets[] = {
-        {kRaven2GVAOffset, 0x2A2000, Raven2PageUse::Decode},
-        {kRaven2VAOffset, 0x339D000, Raven2PageUse::Decode},
-        {kRaven2VAOffset, 0x339E000, Raven2PageUse::Decode},
-        {kRaven2VAOffset, 0x33A6000, Raven2PageUse::Decode},
-        {kRaven2VAOffset, 0x33E3000, Raven2PageUse::Decode},
-        {kRaven2VAOffset, 0x33FF000, Raven2PageUse::Decode},
-        {kRaven2VAOffset, 0x3415000, Raven2PageUse::Decode},
-        {kRaven2VAOffset, kRaven2EncoderPitchPage, Raven2PageUse::Encode},
-        {kRaven2VAOffset, kRaven2EncoderPacketPage, Raven2PageUse::Encode},
-        {kRaven2VAOffset, kRaven2EncoderAvcStatusPage, Raven2PageUse::AvcEncode},
-        {kRaven2VAOffset, kRaven2EncoderHevcPacketPage, Raven2PageUse::HevcEncode},
-        {kRaven2VAOffset, kRaven2EncoderHevcStatusPage, Raven2PageUse::HevcEncode},
-        {kRaven2VAOffset, 0x354D000, Raven2PageUse::Metal},
-        {kRaven2VAOffset, 0x358A000, Raven2PageUse::Metal},
-    };
-
-    struct Raven2PrivatePage
-    {
-        UserPatchMemory::Page vm;
-        vm_prot_t maximum;
-        UInt8 original[PAGE_SIZE];
-        UInt8 patched[PAGE_SIZE];
-        bool writeAttempted;
-    };
-
-    struct Raven2MapState
-    {
-        vm_map_t map;
-        vm_map_t readyMap;
-    };
-
-    struct Raven2SharedRegionArgs { user_addr_t startAddress; };
-    using Raven2SharedRegionCheck = int (*)(proc_t, Raven2SharedRegionArgs*, int*);
-    using Raven2MapDestroy = void (*)(vm_map_t);
-    using Raven2GetTaskMap = vm_map_t (*)(task_t);
-    using Raven2CopyIn = int (*)(user_addr_t, void*, size_t);
-    using Raven2CopyOut = int (*)(const void*, user_addr_t, size_t);
-
-    static Raven2SharedRegionCheck raven2OriginalSharedRegionCheck{nullptr};
-    static Raven2MapDestroy raven2OriginalMapDestroy{nullptr};
-    static Raven2GetTaskMap raven2GetTaskMap{nullptr};
-    static Raven2CopyIn raven2CopyIn{nullptr};
-    static Raven2CopyOut raven2CopyOut{nullptr};
-    static UserPatchMemory::RegionQuery raven2QueryRegion{nullptr};
-    static IOLock* raven2MapLock{nullptr};
-    static Raven2MapState raven2Maps[1024]{};
-    static bool raven2MetalEnabled{false};
-    static UInt64 raven2VerifiedCacheBase{0};
-
-    void reportRaven2VMError(const kern_return_t result)
-    {
-        NRed::singleton().setProp32("NRedRaven2PrivateVMError", static_cast<UInt32>(result));
+void UserPatches::applyRaven2EncoderDebugPage(const UInt8* const bytes, const UInt64 pageOffset)
+{
+    const auto& vda  = VDA::singleton();
+    const bool  avc  = vda.isRaven2AVCEncodeTestRequested();
+    const bool  hevc = vda.isRaven2HEVCEncodeTestRequested();
+    if (avc && pageOffset == kRaven2EncoderAvcStatusPage) {
+        const bool applied = patchRaven2EncoderStatus(bytes, 0xA1);
+        this->recordRaven2MediaPage(kRaven2EncoderAvcStatus, applied);
+        if (applied) { NRed::singleton().setProp32("NRedRaven2AvcFeedbackStride", 0x30); }
+        return;
     }
-
-    vm_map_t raven2CurrentMap()
-    {
-        const auto map = current_map();
-        return map != nullptr && raven2GetTaskMap(current_task()) == map ? map : nullptr;
+    if (hevc && pageOffset == kRaven2EncoderHevcStatusPage) {
+        const bool applied = patchRaven2EncoderStatus(bytes, 0x279);
+        this->recordRaven2MediaPage(kRaven2EncoderHevcStatus, applied);
+        if (applied) { NRed::singleton().setProp32("NRedRaven2HevcFeedbackStride", 0x30); }
+        return;
     }
-
-    bool matchesRaven2Cache(const UInt64 address, const UInt8 (&uuid)[16])
-    {
-        UInt8 header[0x68];
-        return raven2CopyIn(address, header, sizeof(header)) == 0
-            && memcmp(header, "dyld_v1 ", 8) == 0
-            && memcmp(header + 0x58, uuid, sizeof(uuid)) == 0;
+    if (hevc && pageOffset == kRaven2EncoderHevcPacketPage) {
+        this->recordRaven2MediaPage(kRaven2EncoderHevcPacketsApplied, patchRaven2EncoderHevcPackets(bytes));
+        return;
     }
-
-    bool prepareRaven2MetalPage(UInt8* const bytes, const UInt64 fileOffset)
-    {
-        if (fileOffset == 0x358A000) {
-            constexpr size_t offsets[] = {0xBF3, 0xC3E, 0xC7B};
-            for (const auto offset : offsets) {
-                if (memcmp(bytes + offset, kGLDriverHwInfoFind, sizeof(kGLDriverHwInfoFind)) != 0
-                    && memcmp(bytes + offset, kGLDriverHwInfoReplace, sizeof(kGLDriverHwInfoReplace)) != 0) {
-                    return false;
-                }
-            }
-            for (const auto offset : offsets) {
-                memcpy(bytes + offset, kGLDriverHwInfoReplace, sizeof(kGLDriverHwInfoReplace));
-            }
-            return true;
+    if ((avc || hevc) && (pageOffset == kRaven2EncoderPitchPage || pageOffset == kRaven2EncoderPacketPage)) {
+        const bool pitchPage = pageOffset == kRaven2EncoderPitchPage;
+        const bool applied   = pitchPage ? patchRaven2EncoderInputOutput(bytes) : patchRaven2EncoderPackets(bytes);
+        this->recordRaven2MediaPage(pitchPage ? kRaven2EncoderPitchApplied : kRaven2EncoderPacketsApplied, applied);
+        constexpr UInt32 commonMask = kRaven2EncoderCommonPages
+                                      | (kRaven2EncoderCommonPages << kRaven2MediaFailureShift);
+        const auto state = __atomic_load_n(&this->raven2MediaPatchState, __ATOMIC_ACQUIRE);
+        if (applied && (state & commonMask) == kRaven2EncoderCommonPages) {
+            NRed::singleton().setProp32("NRedRaven2EncodePageApplied", 1);
         }
-
-        constexpr size_t offsets[] = {0x1BC, 0x1E1};
-        for (size_t i = 0; i < arrsize(offsets); ++i) {
-            const auto& sig = kResolverSignatures_Sonoma[i + 3];
-            const auto offset = offsets[i];
-            if (memcmp(bytes + offset, sig.replace, sig.replaceSize) == 0) { continue; }
-            const auto contextOffset = offset - sig.patchOffset;
-            size_t match;
-            if (!matchSignature(bytes, sig, match, contextOffset) || match != contextOffset) { return false; }
-            memcpy(bytes + offset, sig.replace, sig.replaceSize);
-        }
-        return true;
     }
+}
 
-    bool restoreRaven2Page(vm_map_t map, Raven2PrivatePage& entry)
-    {
-        auto& page = entry.vm;
-        if (!page.writable && !page.maximumPending) { return true; }
+void UserPatches::applyVdaSignatureList(const VnodeKind vnodeKind, const UInt64 pageOffset, const UInt8* const bytes,
+                                        const SignaturePatch* const sigs, const size_t sigCount,
+                                        size_t* const appliedCounts, const size_t maxCounts, const char* const label)
+{
+    if (sigs == nullptr || sigCount == 0 || appliedCounts == nullptr) { return; }
 
-        // Restore the task's original maximum, which can differ from its current RX protection.
-        if (page.writable) {
-            auto result = vm_protect(map, page.address, PAGE_SIZE, FALSE, page.protection);
-            if (result != KERN_SUCCESS) {
-                reportRaven2VMError(result);
-                result = vm_protect(map, page.address, PAGE_SIZE, FALSE, page.protection);
-            }
-            if (result != KERN_SUCCESS) {
-                reportRaven2VMError(result);
-                return false;
-            }
-            page.writable = false;
-            page.maximumPending = true;
+    bool allApplied = true;
+    for (size_t i = 0; i < sigCount && i < maxCounts; ++i) {
+        if (appliedCounts[i] < sigs[i].count) {
+            allApplied = false;
+            break;
         }
-
-        const auto result = vm_protect(map, page.address, PAGE_SIZE, TRUE, entry.maximum);
-        if (result != KERN_SUCCESS) {
-            reportRaven2VMError(result);
-            return false;
-        }
-        page.maximumPending = false;
-        return true;
     }
+    if (allApplied) { return; }
 
-    bool applyRaven2PrivatePages(const vm_map_t map, Raven2PrivatePage* const pages, const size_t count)
-    {
-        for (size_t i = 0; i < count; ++i) {
-            auto& page = pages[i];
-            if (memcmp(page.original, page.patched, PAGE_SIZE) == 0) { continue; }
-            const auto changed = UserPatchMemory::makeWritable(map, page.vm, reportRaven2VMError);
-            if (!changed) { return false; }
-            page.writeAttempted = true;
-            if (raven2CopyOut(page.patched, page.vm.address, PAGE_SIZE) != 0) { return false; }
-        }
+    for (size_t sigIdx = 0; sigIdx < sigCount && sigIdx < maxCounts; ++sigIdx) {
+        const auto& sig = sigs[sigIdx];
+        if (appliedCounts[sigIdx] >= sig.count) { continue; }
 
-        // Publish admission only after every modified page has returned to executable protection.
-        for (size_t i = 0; i < count; ++i) {
-            if (!restoreRaven2Page(map, pages[i])) { return false; }
-        }
-        return true;
-    }
-
-    bool restoreRaven2OriginalPages(const vm_map_t map, Raven2PrivatePage* const pages, const size_t count)
-    {
-        bool restored = true;
-        for (size_t i = 0; i < count; ++i) {
-            auto& page = pages[i];
-            if (page.writeAttempted &&
-                (!UserPatchMemory::makeWritable(map, page.vm, reportRaven2VMError)
-                 || raven2CopyOut(page.original, page.vm.address, PAGE_SIZE) != 0)) {
-                restored = false;
-            }
-            if (!restoreRaven2Page(map, page)) { restored = false; }
-        }
-        return restored;
-    }
-
-    enum class Raven2PatchResult { Ready, Rejected, RestoreFailed };
-
-    Raven2PatchResult patchRaven2PrivateCache(const vm_map_t map, const UInt64 base, const bool verifyOnly = false)
-    {
-        if (base == 0 || base >= (1ULL << 47) - kRaven2VAOffset - 0x4000000
-            || !matchesRaven2Cache(base, kRaven2CacheUUID)
-            || !matchesRaven2Cache(base + kRaven2GVAOffset, kRaven2GVAUUID)
-            || !matchesRaven2Cache(base + kRaven2VAOffset, kRaven2VAUUID)) {
-            return Raven2PatchResult::Rejected;
-        }
-
-        auto* const pages = IONewZero(Raven2PrivatePage, arrsize(kRaven2PageTargets));
-        if (pages == nullptr) { return Raven2PatchResult::Rejected; }
-
-        const auto& vda = VDA::singleton();
-        const bool avc = vda.isRaven2AVCEncodeTestRequested();
-        const bool hevc = vda.isRaven2HEVCEncodeTestRequested();
-        size_t count = 0;
-        bool valid = true;
-        for (const auto& target : kRaven2PageTargets) {
-            if ((target.use == Raven2PageUse::Encode && !avc && !hevc)
-                || (target.use == Raven2PageUse::AvcEncode && !avc)
-                || (target.use == Raven2PageUse::HevcEncode && !hevc)
-                || (target.use == Raven2PageUse::Metal && !raven2MetalEnabled)) {
-                continue;
-            }
-            auto& page = pages[count++];
-            page.vm.address = base + target.subcache + target.fileOffset;
-            auto& protection = page.vm.protection;
-            if (!UserPatchMemory::leafProtection(map, page.vm.address, protection,
-                                                raven2QueryRegion, reportRaven2VMError, &page.maximum)
-                || protection != (VM_PROT_READ | VM_PROT_EXECUTE)
-                || raven2CopyIn(page.vm.address, page.original, PAGE_SIZE) != 0) {
-                valid = false;
+        size_t matchOffset  = 0;
+        size_t searchOffset = 0;
+        while (appliedCounts[sigIdx] < sig.count && matchSignature(bytes, sig, matchOffset, searchOffset)) {
+            if (matchOffset + sig.patchOffset + sig.replaceSize > kPageSize) {
+                SYSLOG("UserPatch", "Resolver: %s patch out of page bounds (0x%zX + 0x%zX + 0x%zX)", label,
+                       matchOffset, sig.patchOffset, sig.replaceSize);
                 break;
             }
-            memcpy(page.patched, page.original, PAGE_SIZE);
-            valid = target.use == Raven2PageUse::Metal
-                ? prepareRaven2MetalPage(page.patched, target.fileOffset)
-                : patchRaven2DecodePage(page.patched, target.fileOffset, target.subcache == kRaven2GVAOffset);
-            if (verifyOnly && memcmp(page.original, page.patched, PAGE_SIZE) != 0) { valid = false; }
-            if (!valid) { break; }
-        }
 
-        auto result = Raven2PatchResult::Rejected;
-        if (valid) {
-            if (verifyOnly || applyRaven2PrivatePages(map, pages, count)) {
-                result = Raven2PatchResult::Ready;
-            } else if (!restoreRaven2OriginalPages(map, pages, count)) {
-                result = Raven2PatchResult::RestoreFailed;
+            if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
+                SYSLOG("UserPatch", "Resolver: failed to disable kernel write protection (%s)", label);
+                return;
             }
+            memcpy(const_cast<UInt8*>(bytes) + matchOffset + sig.patchOffset, sig.replace, sig.replaceSize);
+            MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+
+            this->recordCachedSite(vnodeKind, pageOffset, matchOffset + sig.patchOffset, sig.find, sig.replace,
+                                   sig.replaceSize);
+
+            SYSLOG("UserPatch", "Resolver patched %s signature %zu (site %zu/%zu) at page offset 0x%zX", label,
+                   sigIdx, appliedCounts[sigIdx] + 1, sig.count, matchOffset);
+            appliedCounts[sigIdx]++;
+            const auto applied = static_cast<UInt32>(OSIncrementAtomic(&this->vdaAppliedCount) + 1);
+            NRed::singleton().setProp32("NRedVCNUserApplied", applied);
+
+            searchOffset = matchOffset + 1;
         }
-        IODelete(pages, Raven2PrivatePage, arrsize(kRaven2PageTargets));
-        return result;
     }
-
-    Raven2MapState* reserveRaven2Map(const vm_map_t map)
-    {
-        IOLockLock(raven2MapLock);
-        Raven2MapState* empty = nullptr;
-        for (auto& state : raven2Maps) {
-            if (state.map == map) {
-                IOLockUnlock(raven2MapLock);
-                return nullptr;
-            }
-            if (empty == nullptr && state.map == nullptr) { empty = &state; }
-        }
-        if (empty != nullptr) { empty->map = map; }
-        IOLockUnlock(raven2MapLock);
-        return empty;
-    }
-
-    void finishRaven2Map(Raven2MapState& state, bool ready)
-    {
-        IOLockLock(raven2MapLock);
-        if (ready) {
-            __atomic_store_n(&state.readyMap, state.map, __ATOMIC_RELEASE);
-        } else {
-            state.map = nullptr;
-        }
-        IOLockUnlock(raven2MapLock);
-    }
-
-    int wrapRaven2SharedRegionCheck(const proc_t process, Raven2SharedRegionArgs* const args, int* const retval)
-    {
-        const auto result = raven2OriginalSharedRegionCheck(process, args, retval);
-        if (result != 0 || args == nullptr) { return result; }
-        const auto map = raven2CurrentMap();
-        UInt64 base;
-        if (map == nullptr || raven2CopyIn(args->startAddress, &base, sizeof(base)) != 0) { return result; }
-
-        auto* const state = reserveRaven2Map(map);
-        if (state == nullptr) { return result; }
-        const auto patched = patchRaven2PrivateCache(map, base);
-        const bool ready = patched == Raven2PatchResult::Ready;
-        finishRaven2Map(*state, ready);
-
-        auto& nred = NRed::singleton();
-        if (ready) {
-            __atomic_store_n(&raven2VerifiedCacheBase, base, __ATOMIC_RELEASE);
-            const auto& vda = VDA::singleton();
-            nred.setProp32("NRedVCNUserApplied", 10);
-            nred.setProp32("NRedRaven2DecodeRegistersPatched", 1);
-            if (raven2MetalEnabled) {
-                nred.setProp32("NRedMTLHwInfoApplied", 3);
-                nred.setProp32("NRedLegacyBlendApplied", 1);
-            }
-            if (vda.isRaven2AVCEncodeTestRequested() || vda.isRaven2HEVCEncodeTestRequested()) {
-                nred.setProp32("NRedRaven2EncodePageApplied", 1);
-            }
-            if (vda.isRaven2AVCEncodeTestRequested()) { nred.setProp32("NRedRaven2AvcFeedbackStride", 0x30); }
-            if (vda.isRaven2HEVCEncodeTestRequested()) { nred.setProp32("NRedRaven2HevcFeedbackStride", 0x30); }
-        }
-        return patched == Raven2PatchResult::RestoreFailed ? EFAULT : result;
-    }
-
-    void wrapRaven2MapDestroy(const vm_map_t map)
-    {
-        IOLockLock(raven2MapLock);
-        for (auto& state : raven2Maps) {
-            if (state.map == map) {
-                __atomic_store_n(&state.readyMap, nullptr, __ATOMIC_RELEASE);
-                state.map = nullptr;
-                break;
-            }
-        }
-        IOLockUnlock(raven2MapLock);
-        raven2OriginalMapDestroy(map);
-    }
-} // namespace
-
-bool UserPatches::installRaven2PrivatePatcher(KernelPatcher& patcher)
-{
-    raven2GetTaskMap = reinterpret_cast<Raven2GetTaskMap>(patcher.solveSymbol(KernelPatcher::KernelID, "_get_task_map"));
-    raven2QueryRegion = reinterpret_cast<UserPatchMemory::RegionQuery>(
-        patcher.solveSymbol(KernelPatcher::KernelID, "_mach_vm_region_recurse"));
-    raven2CopyIn = reinterpret_cast<Raven2CopyIn>(patcher.solveSymbol(KernelPatcher::KernelID, "_copyin"));
-    raven2CopyOut = reinterpret_cast<Raven2CopyOut>(patcher.solveSymbol(KernelPatcher::KernelID, "_copyout"));
-    if (!raven2GetTaskMap || !raven2QueryRegion || !raven2CopyIn || !raven2CopyOut) {
-        patcher.clearError();
-        return false;
-    }
-
-    raven2MapLock = IOLockAlloc();
-    if (raven2MapLock == nullptr) { return false; }
-    raven2MetalEnabled = this->resolverEnabled && this->signatureCount >= 5;
-
-    KernelPatcher::RouteRequest routes[] = {
-        {"_vm_map_destroy", wrapRaven2MapDestroy, raven2OriginalMapDestroy},
-        {"_shared_region_check_np", wrapRaven2SharedRegionCheck, raven2OriginalSharedRegionCheck},
-    };
-    if (!patcher.routeMultiple(KernelPatcher::KernelID, routes, arrsize(routes))) {
-        patcher.clearError();
-        return false;
-    }
-    NRed::singleton().setProp32("NRedRaven2PrivateCachePatcher", 1);
-    return true;
-}
-
-bool UserPatches::raven2MediaPagesReady() const
-{
-    if (raven2GetTaskMap == nullptr) { return false; }
-    const auto map = raven2CurrentMap();
-    if (map == nullptr) { return false; }
-
-    // The current task holds the map alive. Map destruction clears readyMap before
-    // the address can be reused. This lookup must be safe under the accelerator lock.
-    for (const auto& state : raven2Maps) {
-        if (__atomic_load_n(&state.readyMap, __ATOMIC_ACQUIRE) == map) { return true; }
-    }
-    return false;
-}
-
-bool UserPatches::prepareRaven2MediaPages() const
-{
-    if (raven2MapLock == nullptr) { return false; }
-    if (raven2MediaPagesReady()) { return true; }
-    const auto map = raven2CurrentMap();
-    if (map == nullptr) { return false; }
-    // A child can inherit already private pages without running dyld startup.
-    // Verify them before the native context creation entry point enters lock_busy.
-    const auto base = __atomic_load_n(&raven2VerifiedCacheBase, __ATOMIC_ACQUIRE);
-    if (base == 0) { return false; }
-    auto* const state = reserveRaven2Map(map);
-    if (state == nullptr) { return raven2MediaPagesReady(); }
-    const bool ready = patchRaven2PrivateCache(map, base, true) == Raven2PatchResult::Ready;
-    finishRaven2Map(*state, ready);
-    return ready;
 }
 
 void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOffset, void* const vnode)
@@ -1277,10 +897,6 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     }
 
     const auto* const bytes = static_cast<const UInt8*>(data);
-    const bool vcn1Decode = VDA::singleton().isVcn1DecodeRequested();
-    // For opted-in VCN1, media and Metal shared-cache edits live in private task mappings.
-    // Keep the upstream loose OpenGL driver patch path, including its resource budget fix.
-    if (vcn1Decode && isSharedCache) { return; }
 
     // O(1) fast path for previously discovered sites whose clean UBC pages were evicted under
     // memory pressure and re-faulted from disk. Must run before the `allApplied` early-outs.
@@ -1290,58 +906,18 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     // Note: _cs_validate_page is invoked by XNU only once per physical page when the page enters the
     // global shared-cache vm_object. Do not gate on per-process identity (e.g. WindowServer or BootCache)
     // or accelerator start timing, as skipping a page during its first fault caches it unpatched globally.
-    if ((isVADriver || isSharedCache) && this->vdaEnabled && !vcn1Decode && this->vdaSignatures != nullptr &&
-        this->vdaSignatureCount > 0) {
-        {
-            bool vdaAllApplied = true;
-            for (size_t i = 0; i < this->vdaSignatureCount && i < kMaxVDASignatures; ++i) {
-                if (this->vdaSignatureApplied[i] < this->vdaSignatures[i].count) {
-                    vdaAllApplied = false;
-                    break;
-                }
-            }
+    if ((isVADriver || isSharedCache) && this->vdaEnabled) {
+        this->applyVdaSignatureList(vnodeKind, pageOffset, bytes, this->vdaSignatures, this->vdaSignatureCount,
+                                    this->vdaSignatureApplied, kMaxVDASignatures, "VDA");
 
-            if (!vdaAllApplied) {
-                for (size_t sigIdx = 0; sigIdx < this->vdaSignatureCount; sigIdx++) {
-                    const auto& sig = this->vdaSignatures[sigIdx];
-                    if (sigIdx < kMaxVDASignatures && this->vdaSignatureApplied[sigIdx] >= sig.count) {
-                        continue;
-                    }
-
-                    size_t matchOffset = 0;
-                    size_t searchOffset = 0;
-                    while (sigIdx < kMaxVDASignatures && this->vdaSignatureApplied[sigIdx] < sig.count &&
-                           matchSignature(bytes, sig, matchOffset, searchOffset)) {
-                        // Layer 4: Page boundary verification
-                        if (matchOffset + sig.patchOffset + sig.replaceSize > kPageSize) {
-                            SYSLOG("UserPatch", "Resolver: VDA patch out of page bounds (0x%zX + 0x%zX + 0x%zX)",
-                                   matchOffset, sig.patchOffset, sig.replaceSize);
-                            break;
-                        }
-
-                        if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
-                            SYSLOG("UserPatch", "Resolver: failed to disable kernel write protection (VDA)");
-                            return;
-                        }
-
-                        memcpy(const_cast<UInt8*>(bytes) + matchOffset + sig.patchOffset, sig.replace, sig.replaceSize);
-
-                        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-
-                        this->recordCachedSite(vnodeKind, pageOffset, matchOffset + sig.patchOffset, sig.find,
-                                               sig.replace, sig.replaceSize);
-
-                        SYSLOG("UserPatch", "Resolver patched VDA signature %zu (site %zu/%zu) at page offset 0x%zX",
-                               sigIdx, this->vdaSignatureApplied[sigIdx] + 1, sig.count, matchOffset);
-                        if (sigIdx < kMaxVDASignatures) {
-                            this->vdaSignatureApplied[sigIdx]++;
-                        }
-                        const auto applied = static_cast<UInt32>(OSIncrementAtomic(&this->vdaAppliedCount) + 1);
-                        NRed::singleton().setProp32("NRedVCNUserApplied", applied);
-
-                        searchOffset = matchOffset + 1;
-                    }
-                }
+        if (VDA::singleton().isVcn1Mode()) {
+            this->applyVdaSignatureList(vnodeKind, pageOffset, bytes, kVcn1DecodeRegisterSignatures,
+                                        kVcn1DecodeRegisterSignatureCount, this->vcn1SignatureApplied,
+                                        kMaxVcn1Signatures, "VCN1");
+            if (isSharedCache
+                && (VDA::singleton().isRaven2AVCEncodeTestRequested()
+                    || VDA::singleton().isRaven2HEVCEncodeTestRequested())) {
+                this->applyRaven2EncoderDebugPage(bytes, pageOffset);
             }
         }
         if (isVADriver && !isSharedCache) {
@@ -1350,7 +926,7 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     }
 
     // AppleGVA Dynamic Resolver path (embedded in dyld_shared_cache or standalone AppleGVA bundle)
-    if ((isAppleGVA || isSharedCache) && this->vdaEnabled && !vcn1Decode && this->gvaSignature != nullptr &&
+    if ((isAppleGVA || isSharedCache) && this->vdaEnabled && this->gvaSignature != nullptr &&
         this->gvaSignatureApplied < this->gvaSignature->count) {
         {
             size_t matchOffset = 0;

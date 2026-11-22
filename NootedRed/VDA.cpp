@@ -55,13 +55,18 @@ namespace
 
 VDA& VDA::singleton() { return moduleInstance; }
 
-bool VDA::isSupported() const
+bool VDA::isBridgeRequested() const
 {
     const auto* const profile = DeviceProfile::current();
-    const bool vcn2 = profile != nullptr && profile->media.hasVCN0 &&
-                      profile->media.vcnGeneration == DeviceProfile::kVcn2_2;
-    return this->enabled && (vcn2 || this->isVcn1DecodeRequested()) &&
-           !NRed::singleton().hasExternalVideo() && UserPatches::singleton().mediaSupported();
+    const bool        vcn2    = profile != nullptr && profile->media.hasVCN0
+                             && profile->media.vcnGeneration == DeviceProfile::kVcn2_2;
+    return this->enabled && (vcn2 || this->isVcn1Mode());
+}
+
+bool VDA::isSupported() const
+{
+    return this->isBridgeRequested() && !NRed::singleton().hasExternalVideo()
+           && UserPatches::singleton().mediaSupported();
 }
 
 bool VDA::canAdvertise() const
@@ -72,8 +77,10 @@ bool VDA::canAdvertise() const
 bool VDA::shouldStripCapabilities() const
 {
     const auto* const profile = DeviceProfile::current();
-    const bool bridgeDevice = NRed::singleton().getDeviceID() == 0x15D8 ||
-                              (profile != nullptr && profile->media.vcnGeneration == DeviceProfile::kVcn2_2);
+    const bool        bridgeDevice =
+        profile != nullptr
+        && (profile->media.vcnGeneration == DeviceProfile::kVcn2_2
+            || profile->media.vcnGeneration == DeviceProfile::kVcn1_0);
     return !this->enabled || (bridgeDevice && !this->canAdvertise());
 }
 
@@ -140,35 +147,32 @@ void VDA::processPatcher()
     const auto  vcnGeneration = static_cast<UInt32>(media.vcnGeneration);
 
     auto& nred = NRed::singleton();
-    if (nred.getDeviceID() == 0x15D8) {
+    if (profile->media.vcnGeneration == DeviceProfile::kVcn1_0 && nred.getDeviceID() == 0x15D8) {
         nred.setProp32("NRedRaven2DecodeOptIn", static_cast<UInt32>(this->raven2Requested));
         if (this->raven2Requested || this->picassoRequested) {
-            // The kernel version is available even if the OS build string has not been set at patcher load.
-            const bool osBuildAvailable = osversion[0] != '\0';
-            const bool buildMatches = osBuildAvailable ? strcmp(osversion, kRaven2OSBuild) == 0 :
-                                                        strstr(version, kRaven2KernelBuild) != nullptr;
-            nred.setProp32("NRedRaven2DecodeOSBuildAvailable", static_cast<UInt32>(osBuildAvailable));
-            nred.setProp32("NRedRaven2DecodeBuildMatched", static_cast<UInt32>(buildMatches));
             nred.setProp32("NRedRaven2DecodeExternalAMD", static_cast<UInt32>(nred.hasDetectedExternalVideo()));
-            if (buildMatches && !nred.hasDetectedExternalVideo()) {
+            if (!nred.hasExternalVideo()) {
                 nred.hwLateInit();
                 nred.setProp32("NRedRaven2DecodeStrapRevision", nred.getDevRevision());
                 const auto& attributes = nred.getAttributes();
-                this->raven2Decode = this->raven2Requested && attributes.isRaven2();
+                this->raven2Decode     = this->raven2Requested && attributes.isRaven2();
                 // 0x15D8 starts with the Picasso attribute. The MMIO strap can also mark it as Raven2.
                 this->picassoDecode = this->picassoRequested && attributes.isPicasso() && !attributes.isRaven2();
                 if (this->raven2Decode) {
-                    this->raven2AVCEncodeTest = checkKernelArgument("-NRedRaven2AVCEncodeTest");
+                    const bool osBuildAvailable = osversion[0] != '\0';
+                    const bool encodeBuildMatches =
+                        osBuildAvailable ? strcmp(osversion, kRaven2OSBuild) == 0
+                                         : strstr(version, kRaven2KernelBuild) != nullptr;
+                    this->hevcAllowed          = this->hevcAllowed && this->raven2HEVCRequested;
+                    this->hevc10Allowed        = this->hevc10Allowed && this->hevcAllowed && checkKernelArgument("-NRedRaven2HEVC10");
+                    this->raven2AVCEncodeTest  = encodeBuildMatches && checkKernelArgument("-NRedRaven2AVCEncodeTest");
+                    this->raven2HEVCEncodeTest = encodeBuildMatches && this->hevcAllowed
+                                                 && checkKernelArgument("-NRedRaven2HEVCEncodeTest");
                     nred.setProp32("NRedRaven2AVCEncodeTest", static_cast<UInt32>(this->raven2AVCEncodeTest));
-                    this->hevcAllowed = this->hevcAllowed && this->raven2HEVCRequested;
-                    this->hevc10Allowed = this->hevc10Allowed && this->hevcAllowed
-                        && checkKernelArgument("-NRedRaven2HEVC10");
-                    this->raven2HEVCEncodeTest = this->hevcAllowed
-                        && checkKernelArgument("-NRedRaven2HEVCEncodeTest");
                     nred.setProp32("NRedRaven2DecodeRequested", 1);
                 }
                 if (this->picassoDecode) {
-                    this->hevcAllowed = false;
+                    this->hevcAllowed   = false;
                     this->hevc10Allowed = false;
                     nred.setProp32("NRedPicassoDecodeRequested", 1);
                 }
@@ -181,7 +185,7 @@ void VDA::processPatcher()
            media.vcnRingSize, media.vcnFenceSize, static_cast<UInt32>(media.decode.h264),
            static_cast<UInt32>(this->isHEVCDecodeAllowed() ? media.decode.hevc : false), static_cast<UInt32>(media.decode.av1));
 
-    if (!this->enabled) {
+    if (!this->isBridgeRequested()) {
         NRed::singleton().setProp32("NRedVDARequested", 0);
         NRed::singleton().setProp32("NRedVDAAVCOnly", 0);
         NRed::singleton().setProp32("NRedVDAHEVCEncodeAllowed", 0);

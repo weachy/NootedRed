@@ -101,11 +101,7 @@ namespace
 
     bool isSupportedDevice()
     {
-        const auto* const profile = DeviceProfile::current();
-        const bool vcn2 = profile != nullptr && profile->media.vcnGeneration == DeviceProfile::kVcn2_2 &&
-                          profile->media.hasVCN0;
-        return isSupportedBuild() && VDA::singleton().canAdvertise() &&
-               (vcn2 || VDA::singleton().isVcn1DecodeRequested());
+        return isSupportedBuild() && VDA::singleton().canAdvertise() && VDA::singleton().isBridgeRequested();
     }
 
     // Boot diagnostics: the iGPU is guaranteed to exist once the device ID is known, so properties can be
@@ -552,45 +548,23 @@ bool VCNBridge::fetchResource(void* const self, void* const parameters, void* co
     return ok;
 }
 
-static bool prepareRaven2Context(const void* createInfo, const void* returnInfo)
-{
-    if (createInfo == nullptr || returnInfo == nullptr) { return true; }
-    if (UserPatches::singleton().prepareRaven2MediaPages()) { return true; }
-    NRed::singleton().setProp32("NRedRaven2PrivateCacheRejected", 1);
-    return false;
-}
-
-IOReturn VCNBridge::createVcnContext(void* const self, void* const createInfo, void* const returnInfo)
-{
-    if (!prepareRaven2Context(createInfo, returnInfo)) { return kIOReturnUnsupported; }
-    return FunctionCast(createVcnContext, singleton().orgCreateVcnContext)(self, createInfo, returnInfo);
-}
-
-IOReturn VCNBridge::newVcnContext(void* const self, void* const createInfo, void* const returnInfo,
-                                  const UInt64 event, UInt64* const contextId)
-{
-    if (!prepareRaven2Context(createInfo, returnInfo)) { return kIOReturnUnsupported; }
-    return FunctionCast(newVcnContext, singleton().orgNewVcnContext)(self, createInfo, returnInfo, event, contextId);
-}
-
 bool VCNBridge::initVCNContext(void* const self, void* const accelerator, void* const context,
                               void* const createInfo)
 {
     auto& bridge = singleton();
     if (!bridge.userPatchesAllowed() || createInfo == nullptr) { return false; }
 
-    // The 23J631 AMD VA driver uses type 5 for AV1. VCN1 cannot submit it.
-    // On 23J631 VAUveEncoder::init writes type 6 or 7 to sVideoContextCreateInfo + 4.
-    // AMDAccelVCNContext::requestCapability uses the same pair to set its encode flag.
+    // sVideoContextCreateInfo + 4 holds the context/codec type across macOS 13-26:
+    // type 5 is AV1 (unsupported on VCN1), type 6/7 are AVC/HEVC encode.
     UInt32 type;
     memcpy(&type, static_cast<const UInt8*>(createInfo) + sizeof(UInt32), sizeof(type));
-    if (type == 5 || !UserPatches::singleton().raven2MediaPagesReady()) { return false; }
+    if (type == 5) { return false; }
 
     if (type == 6 || type == 7) {
         const bool hevc = type == 7;
         const auto& vda = VDA::singleton();
         const bool requested = hevc ? vda.isRaven2HEVCEncodeTestRequested() : vda.isRaven2AVCEncodeTestRequested();
-        if (!requested) {
+        if (!requested || !UserPatches::singleton().raven2EncoderPagesReady(hevc)) {
             NRed::singleton().setProp32("NRedRaven2EncodeContextRejected", 1);
             return false;
         }
@@ -846,13 +820,8 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
              this->orgInitHardware},
             {"__ZN33AMDRadeonX6000_AMDAccelVCNContext4initEP37AMDRadeonX6000_AMDGraphicsAcceleratorP35AMDRadeonX6000_AMDAccelVideoContextP23sVideoContextCreateInfo",
              initVCNContext, this->orgInitVCNContext},
-            {"__ZN29AMDRadeonX6000_AMDAccelShared16CreateVcnContextEP23sVideoContextCreateInfoP23sVideoContextReturnInfo",
-             createVcnContext, this->orgCreateVcnContext},
-            {"__ZN36AMDRadeonX6000_AMDNavi10VideoContext10newContextEP23sVideoContextCreateInfoP23sVideoContextReturnInfoyPy",
-             newVcnContext, this->orgNewVcnContext},
         };
-        // The create-info layout is verified only for the build accepted by the Raven2 policy.
-        const size_t routeCount = arrsize(routes) - (VDA::singleton().isVcn1DecodeRequested() ? 0 : 3);
+        const size_t routeCount = arrsize(routes) - (VDA::singleton().isVcn1Mode() ? 0 : 1);
         if (!patcher.routeMultiple(id, routes, routeCount, slide, size)) {
             patcher.clearError();
             if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {

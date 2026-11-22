@@ -61,7 +61,9 @@ public:
 
     static void stripCapabilities(OSDictionary* dictionary);
     static void withdrawCapabilities(IORegistryEntry* entry);
-    bool isVcn1DecodeRequested() const { return this->raven2Decode || this->picassoDecode; }
+    bool isVcn1Mode() const { return this->raven2Decode || this->picassoDecode; }
+    bool isVcn1DecodeRequested() const { return this->isVcn1Mode(); }
+    bool isBridgeRequested() const;
     bool isRaven2AVCEncodeTestRequested() const { return this->raven2AVCEncodeTest; }
     bool isRaven2HEVCEncodeTestRequested() const { return this->raven2HEVCEncodeTest; }
 

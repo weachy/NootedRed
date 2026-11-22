@@ -70,8 +70,6 @@ class VCNBridge
     mach_vm_address_t orgSurfaceCopy{0};
     mach_vm_address_t orgInitHardware{0};
     mach_vm_address_t orgInitVCNContext{0};
-    mach_vm_address_t orgCreateVcnContext{0};
-    mach_vm_address_t orgNewVcnContext{0};
     mach_vm_address_t orgSafeMetaCast{0};
     mach_vm_address_t orgFetchResource{0};
     volatile UInt32   resourceFailures{0};
@@ -132,7 +130,5 @@ private:
     static bool          initHardware(void* self, UInt32 channel);
     static bool          fetchResource(void* self, void* parameters, void* resourceInfo);
     static bool          initVCNContext(void* self, void* accelerator, void* context, void* createInfo);
-    static IOReturn      createVcnContext(void* self, void* createInfo, void* returnInfo);
-    static IOReturn      newVcnContext(void* self, void* createInfo, void* returnInfo, UInt64 event, UInt64* contextId);
     static OSMetaClassBase* safeMetaCast(const OSMetaClassBase* object, const OSMetaClass* target);
 };
