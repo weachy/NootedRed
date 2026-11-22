@@ -51,6 +51,7 @@
 #include <VDA.hpp>
 #include <VP9UserPatch.hpp>
 #include <X5000.hpp>
+#include <X5000Memory.hpp>
 #include <X6000FB.hpp>
 #include <kern/clock.h>
 #include <libkern/OSTypes.h>
@@ -73,6 +74,7 @@ void NRed::init()
 
     this->forceVDA = checkKernelArgument("-NRedForceVDA");
 
+    X5000Memory::init();
     UserPatches::singleton().init();
 
     VDA::singleton().init();
@@ -107,6 +109,7 @@ void NRed::init()
             AppleGFXHDA::singleton().processKext(patcher, id, slide, size);
             X5000HWLibs::singleton().processKext(patcher, id, slide, size);
             X5000::singleton().processKext(patcher, id, slide, size);
+            X5000Memory::processKext(patcher, id, slide, size);
             VCNBridge::singleton().processKext(patcher, id, slide, size);
         },
         nullptr);

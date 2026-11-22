@@ -30,6 +30,7 @@
 #include <UserPatches.hpp>
 #include <VDA.hpp>
 #include <VCNBridge.hpp>
+#include <X5000Memory.hpp>
 #include <libkern/OSAtomic.h>
 #include <libkern/OSTypes.h>
 #include <IOKit/IOLib.h>
@@ -393,7 +394,7 @@ void UserPatches::init()
 
     this->vdaEnabled = !checkKernelArgument(kBootArgNoVDA);
 
-    if (!this->enabled && !this->vdaEnabled) {
+    if (!this->enabled && !this->vdaEnabled && !X5000Memory::requested()) {
         DBGLOG("UserPatch", "User-space driver patches are disabled");
         return;
     }
@@ -480,7 +481,7 @@ void UserPatches::selectPatchSet()
 
 void UserPatches::processPatcher(KernelPatcher& patcher)
 {
-    if (!this->enabled && !this->vdaEnabled) {
+    if (!this->enabled && !this->vdaEnabled && !X5000Memory::requested()) {
         DBGLOG("UserPatch", "User-space driver patches are disabled");
         return;
     }
@@ -515,7 +516,7 @@ void UserPatches::processPatcher(KernelPatcher& patcher)
         this->vdaEnabled = false;
     }
     if (currentKernelVersion() >= MACOS_11) {
-        if (!glEnabled && !this->vdaEnabled) {
+        if (!glEnabled && !this->vdaEnabled && !X5000Memory::requested()) {
             SYSLOG("UserPatch", "No user-space driver patches are configured, not installing any hooks");
             return;
         }
@@ -881,6 +882,11 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     const bool isAppleGVA    = (strstr(vnodeName, "AppleGVA") != nullptr);
     const bool isSharedCache = (strstr(vnodeName, "dyld_shared_cache") != nullptr) ||
                                (strstr(vnodeName, "dyld") != nullptr);
+    if (isSharedCache && X5000Memory::requested()) {
+        X5000Memory::patchMetalBudgetPage(vnodeName, pageOffset, data);
+    } else if (isGLDriver && X5000Memory::requested()) {
+        X5000Memory::patchGLBudgetPage(pageOffset, data);
+    }
     vnode_putname(vnodeName);
 
     VnodeKind vnodeKind = kVnodeNone;

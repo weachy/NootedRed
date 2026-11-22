@@ -37,6 +37,7 @@
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <PenguinWizardry/PatcherPlus.hpp>
 #include <X5000.hpp>
+#include <X5000Memory.hpp>
 #include <DeviceProfile.hpp>
 #include <VCNBridge.hpp>
 #include <VDA.hpp>
@@ -333,7 +334,10 @@ void X5000::processKext(KernelPatcher& patcher, const size_t id, const mach_vm_a
         slide, size));
     this->allocatorTraceEnabled = checkKernelArgument("-NRedAllocTrace");
 
-    if (this->orgTotalFreeMemory != nullptr && this->orgAllocate != nullptr && this->orgAllocateNonContiguous != nullptr) {
+    // Unified memory keeps the native VRAM allocator for the allocations that stay in the carve-out.
+    if (!X5000Memory::requested() && this->orgTotalFreeMemory != nullptr && this->orgAllocate != nullptr
+        && this->orgAllocateNonContiguous != nullptr)
+    {
         PenguinWizardry::PatternRouteRequest allocLargeReq{
             "__ZN26AMDRadeonX5000_AMDHWMemory19allocateLargeBlocksEP16AMDMemoryElementyyy15_eOP_ORIGINATOR9_eOP_TYPEb",
             wrapAllocateLargeBlocks, this->orgAllocateLargeBlocks};

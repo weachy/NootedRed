@@ -109,6 +109,9 @@
 		40FC5FD629BF995000367F9D /* X6000FB.hpp in Headers */ = {isa = PBXBuildFile; fileRef = 40FC5FD429BF995000367F9D /* X6000FB.hpp */; };
 		40FC5FD929BF995E00367F9D /* X5000.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 40FC5FD729BF995E00367F9D /* X5000.cpp */; };
 		40FC5FDA29BF995E00367F9D /* X5000.hpp in Headers */ = {isa = PBXBuildFile; fileRef = 40FC5FD829BF995E00367F9D /* X5000.hpp */; };
+		EF0400010000000000000016 /* X5000Memory.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EF0400020000000000000016 /* X5000Memory.cpp */; };
+		EF0400030000000000000016 /* X5000Memory.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000016 /* X5000Memory.hpp */; };
+		EF0400030000000000000017 /* X5000MemoryPolicy.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000017 /* X5000MemoryPolicy.hpp */; };
 		40FC5FDD29BF996900367F9D /* HWLibs.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 40FC5FDB29BF996900367F9D /* HWLibs.cpp */; };
 		40FC5FDE29BF996900367F9D /* HWLibs.hpp in Headers */ = {isa = PBXBuildFile; fileRef = 40FC5FDC29BF996900367F9D /* HWLibs.hpp */; };
 		40FD2ACD2E6B6107007C2290 /* EnableIf.hpp in Headers */ = {isa = PBXBuildFile; fileRef = 40FD2ACC2E6B6107007C2290 /* EnableIf.hpp */; };
@@ -286,6 +289,9 @@
 		40FC5FD429BF995000367F9D /* X6000FB.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = X6000FB.hpp; sourceTree = "<group>"; };
 		40FC5FD729BF995E00367F9D /* X5000.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = X5000.cpp; sourceTree = "<group>"; };
 		40FC5FD829BF995E00367F9D /* X5000.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = X5000.hpp; sourceTree = "<group>"; };
+		EF0400020000000000000016 /* X5000Memory.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = X5000Memory.cpp; sourceTree = "<group>"; };
+		EF0400040000000000000016 /* X5000Memory.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = X5000Memory.hpp; sourceTree = "<group>"; };
+		EF0400040000000000000017 /* X5000MemoryPolicy.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = X5000MemoryPolicy.hpp; sourceTree = "<group>"; };
 		40FC5FDB29BF996900367F9D /* HWLibs.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = HWLibs.cpp; sourceTree = "<group>"; };
 		40FC5FDC29BF996900367F9D /* HWLibs.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = HWLibs.hpp; sourceTree = "<group>"; };
 		40FD2ACC2E6B6107007C2290 /* EnableIf.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = EnableIf.hpp; sourceTree = "<group>"; };
@@ -383,6 +389,9 @@
 				1C748C2C1C21952C0024EED2 /* Plugin.cpp */,
 				40FC5FD829BF995E00367F9D /* X5000.hpp */,
 				40FC5FD729BF995E00367F9D /* X5000.cpp */,
+				EF0400040000000000000016 /* X5000Memory.hpp */,
+				EF0400020000000000000016 /* X5000Memory.cpp */,
+				EF0400040000000000000017 /* X5000MemoryPolicy.hpp */,
 				40FC5FD429BF995000367F9D /* X6000FB.hpp */,
 				40FC5FD329BF995000367F9D /* X6000FB.cpp */,
 				4098F4EA302B9B6F00B475DE /* AmdAtomVramInfoIGP.hpp */,
@@ -648,6 +657,8 @@
 				4069F00F29C3A241005293B4 /* ATOMBIOS.hpp in Headers */,
 				409127742CE2F7B0004DBDB5 /* SMU.hpp in Headers */,
 				40FC5FDA29BF995E00367F9D /* X5000.hpp in Headers */,
+				EF0400030000000000000016 /* X5000Memory.hpp in Headers */,
+				EF0400030000000000000017 /* X5000MemoryPolicy.hpp in Headers */,
 				4014D9722C74AA7000FDE986 /* ObjectField.hpp in Headers */,
 				4091276D2CE2F681004DBDB5 /* SignalTypes.hpp in Headers */,
 				CEA03B5F20EE825A00BA842F /* NRed.hpp in Headers */,
@@ -825,6 +836,7 @@
 				4054309B2E6DF772000AEB46 /* AMDGFX9DCN2Display.cpp in Sources */,
 				4059A1132E6DECA600F20858 /* DriverInjector.cpp in Sources */,
 				40FC5FD929BF995E00367F9D /* X5000.cpp in Sources */,
+				EF0400010000000000000016 /* X5000Memory.cpp in Sources */,
 				40AF79773030BCC00005EFAB /* AmdAtomPspDirectoryDummy.cpp in Sources */,
 				CEA03B5E20EE825A00BA842F /* NRed.cpp in Sources */,
 				1C748C2D1C21952C0024EED2 /* Plugin.cpp in Sources */,
