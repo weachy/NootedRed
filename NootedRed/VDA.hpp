@@ -35,6 +35,12 @@ class VDA
     bool enabled{true};
     bool hevcAllowed{true};
     bool hevc10Allowed{true};
+    bool vcn1DecodeRequested{false};
+    bool vcn1HEVCRequested{false};
+    bool vcn1HEVC10Requested{false};
+    bool vcn1Decode{false};
+    bool raven2AVCEncodeTest{false};
+    bool raven2HEVCEncodeTest{false};
 
 public:
     static VDA& singleton();
@@ -54,19 +60,28 @@ public:
 
     static void stripCapabilities(OSDictionary* dictionary);
     static void withdrawCapabilities(IORegistryEntry* entry);
+    bool isVcn1Mode() const { return this->vcn1Decode; }
+    bool isVcn1DecodeRequested() const { return this->isVcn1Mode(); }
+    bool isBridgeRequested() const;
+    bool isRaven2AVCEncodeTestRequested() const { return this->raven2AVCEncodeTest; }
+    bool isRaven2HEVCEncodeTestRequested() const { return this->raven2HEVCEncodeTest; }
 
     // True when only AVC is enabled and HEVC is disabled (-NRedNoHEVC).
     bool isAVCOnly() const { return this->enabled && !this->hevcAllowed; }
 
-    // True when HEVC 8-bit hardware encode is allowed (default true, disabled by -NRedNoHEVC or -NRedNoVDA).
-    bool isHEVCEncodeAllowed() const { return this->enabled && this->hevcAllowed; }
+    // VCN1 HEVC Main encode requires the Raven2 packet translation.
+    bool isHEVCEncodeAllowed() const
+    {
+        return this->enabled && this->hevcAllowed
+            && (!this->isVcn1DecodeRequested() || this->raven2HEVCEncodeTest);
+    }
 
     // True when HEVC hardware decode (8-bit) is allowed (default true, disabled by -NRedNoHEVC or -NRedNoVDA).
     bool isHEVCDecodeAllowed() const { return this->enabled && this->hevcAllowed; }
 
     // True when HEVC 10-bit (Profile 2 / Main 10) hardware decode is allowed.
-    // Default true: AMD VCN 2.2 fully supports 10-bit HEVC decode via AMDRadeonVADriver2.
-    // Can be disabled with -NRedNoHEVC10 if explicitly desired.
+    // Raven2 requires -NRedRaven2HEVC10 in addition to its decode and HEVC opt-ins.
+    // -NRedNoHEVC10 disables Main 10 on all devices.
     bool isHEVC10Allowed() const { return this->enabled && this->hevcAllowed && this->hevc10Allowed; }
     bool isHEVC10EncodeAllowed() const;
     bool isHEVC8KDecodeAllowed() const;

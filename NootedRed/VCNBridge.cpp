@@ -29,6 +29,7 @@
 #include <IOKit/pci/IOPCIDevice.h>
 #include <Kexts.hpp>
 #include <NRed.hpp>
+#include <UserPatches.hpp>
 #include <VCNBridge.hpp>
 #include <VCNKernelData.hpp>
 #include <VCNKernelDataVentura.hpp>
@@ -100,12 +101,7 @@ namespace
 
     bool isSupportedDevice()
     {
-        // The profile is the single source of truth for the target: a VCN 2.x device whose profile enables
-        // the engine (0x1638 is validated; the other VCN 2.x APUs are experimental) may use this bridge.  The
-        // generated ABI guards and the exact build check remain the hard safety gates.
-        const auto* const profile = DeviceProfile::current();
-        return isSupportedBuild() && VDA::singleton().canAdvertise() && profile != nullptr
-               && profile->media.vcnGeneration == DeviceProfile::kVcn2_2 && profile->media.hasVCN0;
+        return isSupportedBuild() && VDA::singleton().canAdvertise() && VDA::singleton().isBridgeRequested();
     }
 
     // Boot diagnostics: the iGPU is guaranteed to exist once the device ID is known, so properties can be
@@ -552,6 +548,35 @@ bool VCNBridge::fetchResource(void* const self, void* const parameters, void* co
     return ok;
 }
 
+bool VCNBridge::initVCNContext(void* const self, void* const accelerator, void* const context,
+                              void* const createInfo)
+{
+    auto& bridge = singleton();
+    if (!bridge.userPatchesAllowed() || createInfo == nullptr) { return false; }
+
+    // sVideoContextCreateInfo + 4 holds the context/codec type across macOS 13-26:
+    // type 5 is AV1 (unsupported on VCN1), type 6/7 are AVC/HEVC encode.
+    UInt32 type;
+    memcpy(&type, static_cast<const UInt8*>(createInfo) + sizeof(UInt32), sizeof(type));
+    if (type == 5) { return false; }
+
+    if (type == 6 || type == 7) {
+        const bool hevc = type == 7;
+        const auto& vda = VDA::singleton();
+        const bool requested = hevc ? vda.isRaven2HEVCEncodeTestRequested() : vda.isRaven2AVCEncodeTestRequested();
+        if (!requested || !UserPatches::singleton().raven2EncoderPagesReady(hevc)) {
+            NRed::singleton().setProp32("NRedRaven2EncodeContextRejected", 1);
+            return false;
+        }
+        const bool result = FunctionCast(initVCNContext, bridge.orgInitVCNContext)(self, accelerator, context, createInfo);
+        NRed::singleton().setProp32(hevc ? "NRedRaven2HEVCEncodeContextResult" : "NRedRaven2EncodeContextResult",
+                                   result ? 1 : 2);
+        return result;
+    }
+
+    return FunctionCast(initVCNContext, bridge.orgInitVCNContext)(self, accelerator, context, createInfo);
+}
+
 OSMetaClassBase* VCNBridge::safeMetaCast(const OSMetaClassBase* const object, const OSMetaClass* const target)
 {
     auto& bridge = singleton();
@@ -793,8 +818,11 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
             {"__ZN29AMDRadeonX6000_AMDAccelShared11SurfaceCopyEPjyP12IOAccelEvent", surfaceCopy, this->orgSurfaceCopy},
             {"__ZN30AMDRadeonX6000_AMDVCN2HWEngine12initHardwareE21eAMDAccelVideoChannel", initHardware,
              this->orgInitHardware},
+            {"__ZN33AMDRadeonX6000_AMDAccelVCNContext4initEP37AMDRadeonX6000_AMDGraphicsAcceleratorP35AMDRadeonX6000_AMDAccelVideoContextP23sVideoContextCreateInfo",
+             initVCNContext, this->orgInitVCNContext},
         };
-        if (!patcher.routeMultiple(id, routes, arrsize(routes), slide, size)) {
+        const size_t routeCount = arrsize(routes) - (VDA::singleton().isVcn1Mode() ? 0 : 1);
+        if (!patcher.routeMultiple(id, routes, routeCount, slide, size)) {
             patcher.clearError();
             if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
                 for (size_t i = 0; i < callPatchCount; ++i) {

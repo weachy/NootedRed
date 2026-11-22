@@ -168,8 +168,8 @@ bool DriverInjector::wrapAddDrivers(void* const self, OSArray* const array, cons
             if (strcmp(driver.identifier, "com.apple.kext.AMDRadeonX5000") == 0) {
                 const auto count = driver.personalities->getCount();
 
-                // Strip codec capabilities when VDA is disabled or the VCN 2.2 bridge cannot run.
-                if (VDA::singleton().shouldStripCapabilities()) {
+                const auto& vda = VDA::singleton();
+                if (vda.shouldStripCapabilities()) {
                     for (UInt32 i = 0; i < count; ++i) {
                         auto* const pDict = OSDynamicCast(OSDictionary, driver.personalities->getObject(i));
                         VDA::stripCapabilities(pDict);
@@ -179,11 +179,20 @@ bool DriverInjector::wrapAddDrivers(void* const self, OSArray* const array, cons
                            driver.identifier);
                 }
                 else {
+                    if (vda.isVcn1DecodeRequested() && !vda.isRaven2AVCEncodeTestRequested()) {
+                        for (UInt32 i = 0; i < count; ++i) {
+                            if (auto* const personality = OSDynamicCast(OSDictionary, driver.personalities->getObject(i))) {
+                                personality->removeObject("IOGVAH264EncodeCapabilities");
+                            }
+                        }
+                        if (dict != nullptr) {
+                            dict->removeObject("IOGVAH264EncodeCapabilities");
+                        }
+                    }
                     // 1. HEVC Decode policy:
                     // - If !isHEVCDecodeAllowed() (-NRedNoHEVC): strip IOGVAHEVCDecode and IOGVAHEVCDecodeCapabilities.
-                    // - If !isHEVC10Allowed() (-NRedNoHEVC10): strip Profile 2 and 3 so VideoToolbox cleanly stays on 8-bit.
-                    // - Default: preserve full native HEVC hardware decode (8-bit and 10-bit at Level 153).
-                    if (!VDA::singleton().isHEVCDecodeAllowed()) {
+                    // - Limit VCN1 to Main and Main 10. The Main Still Picture profile has its own capability.
+                    if (!vda.isHEVCDecodeAllowed()) {
                         for (UInt32 i = 0; i < count; ++i) {
                             auto* const pDict = OSDynamicCast(OSDictionary, driver.personalities->getObject(i));
                             if (pDict != nullptr) {
@@ -195,7 +204,38 @@ bool DriverInjector::wrapAddDrivers(void* const self, OSArray* const array, cons
                             dict->removeObject("IOGVAHEVCDecode");
                             dict->removeObject("IOGVAHEVCDecodeCapabilities");
                         }
-                        DBGLOG("DriverInjector", "-NRedNoHEVC active: stripped HEVC decode capabilities from %s", driver.identifier);
+                        DBGLOG("DriverInjector", "HEVC decode disabled: stripped capabilities from %s", driver.identifier);
+                    }
+                    else if (vda.isVcn1DecodeRequested()) {
+                        const bool main10Allowed = vda.isHEVC10Allowed();
+                        auto limitProfiles = [main10Allowed](OSDictionary* p) {
+                            if (p == nullptr) { return; }
+                            auto* const hevcCaps = OSDynamicCast(OSDictionary, p->getObject("IOGVAHEVCDecodeCapabilities"));
+                            if (hevcCaps == nullptr) { return; }
+                            auto* const profiles = OSDynamicCast(OSArray, hevcCaps->getObject("VTSupportedProfileArray"));
+                            if (profiles != nullptr) {
+                                for (UInt32 i = profiles->getCount(); i > 0; --i) {
+                                    const auto* const profile = OSDynamicCast(OSNumber, profiles->getObject(i - 1));
+                                    if (profile == nullptr) { continue; }
+                                    const auto number = profile->unsigned32BitValue();
+                                    if (number == 3 || (number == 2 && !main10Allowed)) {
+                                        profiles->removeObject(i - 1);
+                                    }
+                                }
+                            }
+                            auto* const details = OSDynamicCast(OSDictionary, hevcCaps->getObject("VTPerProfileDetails"));
+                            if (details != nullptr) {
+                                if (!main10Allowed) { details->removeObject("2"); }
+                                details->removeObject("3");
+                            }
+                        };
+
+                        for (UInt32 i = 0; i < count; ++i) {
+                            limitProfiles(OSDynamicCast(OSDictionary, driver.personalities->getObject(i)));
+                        }
+                        limitProfiles(dict);
+                        DBGLOG("DriverInjector", "HEVC decode limited to %s for %s",
+                               main10Allowed ? "Main and Main 10" : "Main", driver.identifier);
                     }
                     else if (!VDA::singleton().isHEVC10Allowed()) {
                         auto strip10Bit = [](OSDictionary* p) {
@@ -256,7 +296,8 @@ bool DriverInjector::wrapAddDrivers(void* const self, OSArray* const array, cons
                             dict->removeObject("IOGVAHEVCEncodeCapabilities");
                         }
                         NRed::singleton().setProp32("NRedHEVC10EncodeAdvertised", 0);
-                        DBGLOG("DriverInjector", "-NRedNoHEVC active: stripped HEVC encode capabilities from %s", driver.identifier);
+                        DBGLOG("DriverInjector", "HEVC encode disabled: stripped capabilities from %s",
+                               driver.identifier);
                     }
                     else if (VDA::singleton().isHEVC10EncodeAllowed()) {
                         bool advertised = false;

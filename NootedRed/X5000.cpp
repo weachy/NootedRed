@@ -524,8 +524,7 @@ bool X5000::allocateHWEngines(void* const self)
 
     // VCN0 is only populated when the opt-in bridge validated both drivers and allocated the native X6000
     // VCN2 engine.  If allocation fails, make sure the capability does not stay advertised.
-    const auto* const profile = DeviceProfile::current();
-    if (profile != nullptr && profile->media.hasVCN0 && VCNBridge::singleton().isRequested()) {
+    if (VDA::singleton().isBridgeRequested() && VCNBridge::singleton().isRequested()) {
         if (auto* const vcn0 = VCNBridge::singleton().allocateEngine(self); vcn0 != nullptr) {
             (singleton().pm4EngineField + kAMDHWEngineTypeVCN0 * sizeof(void*))(self) = vcn0;
             // Keep the capability in sync regardless of whether setupAndInitializeHWCapabilities runs before
@@ -574,7 +573,7 @@ void X5000::wrapSetupAndInitializeHWCapabilities(void* const self)
     singleton().supportedDisplayCountField(self) = 4;
     singleton().hasUVD0Field(self)               = mediaEnabled && profile != nullptr && profile->media.hasUVD0;
     singleton().hasVCEField(self)                = mediaEnabled && profile != nullptr && profile->media.hasVCE;
-    singleton().hasVCN0Field(self)               = mediaEnabled && profile != nullptr && profile->media.hasVCN0;
+    singleton().hasVCN0Field(self) = mediaEnabled && VDA::singleton().isBridgeRequested();
     singleton().hasSDMAPagingQueueField(self)    = false;
     singleton().hasGetAllClockLimitsField(self)  = false;
     if (currentKernelVersion() >= MACOS_10_15) { singleton().dccDisplayableSupportField(self) = true; }

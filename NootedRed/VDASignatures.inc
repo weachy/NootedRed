@@ -487,6 +487,84 @@ namespace
         kGVAReplace_Tahoe, sizeof(kGVAReplace_Tahoe), 0, 1, ~0ULL,
         kGVAFind_Tahoe, sizeof(kGVAFind_Tahoe)
     };
+
+    // =========================================================================
+    // VCN 1.0 (Raven2/Picasso) Vcn2DecCommand register remapping (macOS 13-26)
+    // Remaps VCN2 register indices to absolute SOC15 VCN1 indices
+    // (Raven2 segment 1 base 0x7E00 + VCN1 register offset).
+    // =========================================================================
+
+    // writeUvdGpcomVcpuData0/Data1/Cmd:
+    //   macOS 13:     55 48 89 E5 41 56 53 [41 89 F6 48 89 FB] 48 8B 07 BE <reg> 00 00 FF 50 20
+    //   macOS 14-26:  55 48 89 E5 41 56 53 [89 F3 49 89 FE]    48 8B 07 BE <reg> 00 00 FF 50 20
+    static const UInt8 kVcn1Mask_GpcomReg[] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+
+    static const UInt8 kVcn1Ctx_Data0[] = {
+        0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x8B, 0x07, 0xBE, 0x04, 0x05, 0x00, 0x00, 0xFF, 0x50, 0x20,
+    };
+    static const UInt8 kVcn1Find_Data0[]    = {0x04, 0x05, 0x00, 0x00};
+    static const UInt8 kVcn1Replace_Data0[] = {0xC4, 0x81, 0x00, 0x00};
+
+    static const UInt8 kVcn1Ctx_Data1[] = {
+        0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x8B, 0x07, 0xBE, 0x05, 0x05, 0x00, 0x00, 0xFF, 0x50, 0x20,
+    };
+    static const UInt8 kVcn1Find_Data1[]    = {0x05, 0x05, 0x00, 0x00};
+    static const UInt8 kVcn1Replace_Data1[] = {0xC5, 0x81, 0x00, 0x00};
+
+    static const UInt8 kVcn1Ctx_Cmd[] = {
+        0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x8B, 0x07, 0xBE, 0x03, 0x05, 0x00, 0x00, 0xFF, 0x50, 0x20,
+    };
+    static const UInt8 kVcn1Find_Cmd[]    = {0x03, 0x05, 0x00, 0x00};
+    static const UInt8 kVcn1Replace_Cmd[] = {0xC3, 0x81, 0x00, 0x00};
+
+    // writeUvdEngineStart / writeUvdNoOp (identical across macOS 13-26)
+    static const UInt8 kVcn1Mask_UvdCtrl[] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+
+    static const UInt8 kVcn1Ctx_EngineStart[] = {
+        0x55, 0x48, 0x89, 0xE5, 0x53, 0x50, 0x48, 0x89, 0xFB, 0x48,
+        0x8B, 0x07, 0xBE, 0x06, 0x05, 0x00, 0x00, 0xFF, 0x50, 0x20,
+    };
+    static const UInt8 kVcn1Find_EngineStart[]    = {0x06, 0x05, 0x00, 0x00};
+    static const UInt8 kVcn1Replace_EngineStart[] = {0xC6, 0x81, 0x00, 0x00};
+
+    static const UInt8 kVcn1Ctx_NoOp[] = {
+        0x55, 0x48, 0x89, 0xE5, 0x53, 0x50, 0x48, 0x89, 0xFB, 0x48,
+        0x8B, 0x07, 0xBE, 0x3F, 0x05, 0x00, 0x00, 0xFF, 0x50, 0x20,
+    };
+    static const UInt8 kVcn1Find_NoOp[]    = {0x3F, 0x05, 0x00, 0x00};
+    static const UInt8 kVcn1Replace_NoOp[] = {0xFF, 0x81, 0x00, 0x00};
+
+    static const UserPatches::SignaturePatch kVcn1DecodeRegisterSignatures[] = {
+        {kVcn1Ctx_Data0, kVcn1Mask_GpcomReg, sizeof(kVcn1Ctx_Data0), 17,
+         kVcn1Replace_Data0, sizeof(kVcn1Replace_Data0), 0, 2, ~0ULL,
+         kVcn1Find_Data0, sizeof(kVcn1Find_Data0)},
+        {kVcn1Ctx_Data1, kVcn1Mask_GpcomReg, sizeof(kVcn1Ctx_Data1), 17,
+         kVcn1Replace_Data1, sizeof(kVcn1Replace_Data1), 0, 2, ~0ULL,
+         kVcn1Find_Data1, sizeof(kVcn1Find_Data1)},
+        {kVcn1Ctx_Cmd, kVcn1Mask_GpcomReg, sizeof(kVcn1Ctx_Cmd), 17,
+         kVcn1Replace_Cmd, sizeof(kVcn1Replace_Cmd), 0, 2, ~0ULL,
+         kVcn1Find_Cmd, sizeof(kVcn1Find_Cmd)},
+        {kVcn1Ctx_EngineStart, kVcn1Mask_UvdCtrl, sizeof(kVcn1Ctx_EngineStart), 13,
+         kVcn1Replace_EngineStart, sizeof(kVcn1Replace_EngineStart), 0, 2, ~0ULL,
+         kVcn1Find_EngineStart, sizeof(kVcn1Find_EngineStart)},
+        {kVcn1Ctx_NoOp, kVcn1Mask_UvdCtrl, sizeof(kVcn1Ctx_NoOp), 13,
+         kVcn1Replace_NoOp, sizeof(kVcn1Replace_NoOp), 0, 2, ~0ULL,
+         kVcn1Find_NoOp, sizeof(kVcn1Find_NoOp)},
+    };
+    constexpr size_t kVcn1DecodeRegisterSignatureCount = arrsize(kVcn1DecodeRegisterSignatures);
 }
 
 #endif // VDASignatures_inc
