@@ -86,8 +86,7 @@ bool VDA::shouldStripCapabilities() const
 
 bool VDA::isHEVC10EncodeAllowed() const
 {
-    return !this->isVcn1DecodeRequested() && this->isHEVC10Allowed() && this->canAdvertise() &&
-           currentKernelVersion() >= KernelVersion::Sequoia;
+    return !this->isVcn1Mode() && this->isHEVC10Allowed() && this->canAdvertise();
 }
 
 bool VDA::isHEVC8KDecodeAllowed() const
