@@ -297,8 +297,9 @@ bool NRedAudio::configureAudio(const bool pulseDpSec)
         bool   valid{false};
     };
 
-    bool      hasInternalPanel = false;
-    bool      haveExtConn      = false;
+    bool      hasInternalPanel    = false;
+    bool      internalPanelActive = false;
+    bool      haveExtConn         = false;
     ExtFbInfo firstExtFb;
     ExtFbInfo dpExtFb;
     ExtFbInfo hdmiExtFb;
@@ -310,6 +311,7 @@ bool NRedAudio::configureAudio(const bool pulseDpSec)
                 const UInt32 pixClk   = readPropU32(fb, "IOFBCurrentPixelClock");
                 if (connType == kConnectorLVDS) {
                     hasInternalPanel = true;
+                    if (pixClk != 0) { internalPanelActive = true; }
                     continue;
                 }
                 if (connType == kConnectorDisplayPort || connType == kConnectorHDMI) {
@@ -367,16 +369,17 @@ bool NRedAudio::configureAudio(const bool pulseDpSec)
     }
 
     // Find the first enabled external OTG (skip OTG0 when internal panel is active).
-    UInt32 extOtg = 0;
+    UInt32 extOtg = 0xFFFFFFFFU;
     for (UInt32 otg = 0; otg < blk.maxOtg; otg++) {
-        if (hasInternalPanel && otg == 0) { continue; }
+        if (internalPanelActive && otg == 0) { continue; }
         if ((nred.readReg32(blk.dcnBase + blk.otgMasterEnOffset + (otg * blk.otgStride)) & 1U) != 0) {
             extOtg = otg;
             break;
         }
     }
+    if (extOtg == 0xFFFFFFFFU) { return false; }
 
-    // If AFMT is already enabled and routing the right endpoint, leave AFMT intact and only refresh DTO if clock changed.
+    // If AFMT is already enabled and routing the right endpoint, leave AFMT intact and only refresh DTO if source/clock changed.
     const UInt32 afmtStat   = nred.readReg32(blk.dcnBase + kDcn21AfmtStatus + digOff);
     const UInt32 afmtSrc    = nred.readReg32(blk.dcnBase + kDcn21AfmtSrcCtl + digOff) & 0x7U;
     const bool   afmtActive = (afmtStat & 0x10U) != 0 && (afmtSrc == extEp);
@@ -384,17 +387,20 @@ bool NRedAudio::configureAudio(const bool pulseDpSec)
     const bool isDP = (extConnType == kConnectorDisplayPort);
     configureAzaliaEndpoint(nred, blk, extEp, isDP);
 
-    const UInt32 targetMod = extPixClk / 100U;
-    const UInt32 curMod    = nred.readReg32(blk.dccgBase + kDcn21DccgAudioDto0Module);
-    const UInt32 curPhase  = nred.readReg32(blk.dccgBase + kDcn21DccgAudioDto0Phase);
+    const UInt32 targetMod   = extPixClk / 100U;
+    const UInt32 curSrc      = nred.readReg32(blk.dccgBase + kDcn21DccgAudioDtoSource);
+    const UInt32 curMod      = nred.readReg32(blk.dccgBase + kDcn21DccgAudioDto0Module);
+    const UInt32 curPhase    = nred.readReg32(blk.dccgBase + kDcn21DccgAudioDto0Phase);
+    const bool   dtoMismatch = ((curSrc & 0x7U) != extOtg) || ((curSrc & 0x01000030U) != 0)
+                               || (curMod != targetMod) || (curPhase != kDtoPhase24MHz);
     if (!afmtActive) {
         programAudioDto(nred, blk, extOtg, extPixClk);
         configureAfmt(nred, blk, extDig, extEp);
-    } else {
-        if (curMod != targetMod || curPhase != kDtoPhase24MHz) {
+    } else if (isDP) {
+        if (dtoMismatch) {
             programAudioDto(nred, blk, extOtg, extPixClk);
         }
-        if (isDP && (nred.readReg32(blk.dcnBase + kDcn21AfmtPacketCtl2 + digOff) & 0x0000FF00U) == 0) {
+        if ((nred.readReg32(blk.dcnBase + kDcn21AfmtPacketCtl2 + digOff) & 0x0000FF00U) == 0) {
             configureAfmt(nred, blk, extDig, extEp);
         }
     }
