@@ -35,11 +35,10 @@ class VDA
     bool enabled{true};
     bool hevcAllowed{true};
     bool hevc10Allowed{true};
-    bool raven2Requested{false};
-    bool raven2HEVCRequested{false};
-    bool raven2Decode{false};
-    bool picassoRequested{false};
-    bool picassoDecode{false};
+    bool vcn1DecodeRequested{false};
+    bool vcn1HEVCRequested{false};
+    bool vcn1HEVC10Requested{false};
+    bool vcn1Decode{false};
     bool raven2AVCEncodeTest{false};
     bool raven2HEVCEncodeTest{false};
 
@@ -61,7 +60,7 @@ public:
 
     static void stripCapabilities(OSDictionary* dictionary);
     static void withdrawCapabilities(IORegistryEntry* entry);
-    bool isVcn1Mode() const { return this->raven2Decode || this->picassoDecode; }
+    bool isVcn1Mode() const { return this->vcn1Decode; }
     bool isVcn1DecodeRequested() const { return this->isVcn1Mode(); }
     bool isBridgeRequested() const;
     bool isRaven2AVCEncodeTestRequested() const { return this->raven2AVCEncodeTest; }

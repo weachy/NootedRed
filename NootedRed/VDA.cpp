@@ -114,12 +114,12 @@ void VDA::init()
     const bool noHevc   = checkKernelArgument(kBootArgNoHEVC);
     const bool noHevc10 = checkKernelArgument(kBootArgNoHEVC10);
 
-    this->enabled       = !noVda;
-    this->hevcAllowed   = this->enabled && !noHevc;
-    this->hevc10Allowed = this->hevcAllowed && !noHevc10;
-    this->raven2Requested = this->enabled && checkKernelArgument("-NRedRaven2Decode");
-    this->raven2HEVCRequested = this->raven2Requested && checkKernelArgument("-NRedRaven2HEVC");
-    this->picassoRequested = this->enabled && checkKernelArgument("-NRedPicassoDecodeTest");
+    this->enabled             = !noVda;
+    this->hevcAllowed         = this->enabled && !noHevc;
+    this->hevc10Allowed       = this->hevcAllowed && !noHevc10;
+    this->vcn1DecodeRequested = this->enabled && checkKernelArgument("-NRedVCN1Decode");
+    this->vcn1HEVCRequested   = this->vcn1DecodeRequested && checkKernelArgument("-NRedVCN1HEVC");
+    this->vcn1HEVC10Requested = this->vcn1DecodeRequested && checkKernelArgument("-NRedVCN1HEVC10");
 
     if (!this->enabled) {
         DBGLOG("VDA", "-NRedNoVDA active: all hardware video acceleration disabled (AVC + HEVC)");
@@ -147,34 +147,32 @@ void VDA::processPatcher()
     const auto  vcnGeneration = static_cast<UInt32>(media.vcnGeneration);
 
     auto& nred = NRed::singleton();
-    if (profile->media.vcnGeneration == DeviceProfile::kVcn1_0 && nred.getDeviceID() == 0x15D8) {
-        nred.setProp32("NRedRaven2DecodeOptIn", static_cast<UInt32>(this->raven2Requested));
-        if (this->raven2Requested || this->picassoRequested) {
-            nred.setProp32("NRedRaven2DecodeExternalAMD", static_cast<UInt32>(nred.hasDetectedExternalVideo()));
+    if (profile->media.vcnGeneration == DeviceProfile::kVcn1_0) {
+        nred.setProp32("NRedVCN1DecodeOptIn", static_cast<UInt32>(this->vcn1DecodeRequested));
+        if (this->vcn1DecodeRequested) {
+            nred.setProp32("NRedVCN1DecodeExternalAMD", static_cast<UInt32>(nred.hasDetectedExternalVideo()));
             if (!nred.hasExternalVideo()) {
-                nred.hwLateInit();
-                nred.setProp32("NRedRaven2DecodeStrapRevision", nred.getDevRevision());
-                const auto& attributes = nred.getAttributes();
-                this->raven2Decode     = this->raven2Requested && attributes.isRaven2();
-                // 0x15D8 starts with the Picasso attribute. The MMIO strap can also mark it as Raven2.
-                this->picassoDecode = this->picassoRequested && attributes.isPicasso() && !attributes.isRaven2();
-                if (this->raven2Decode) {
+                this->vcn1Decode    = true;
+                this->hevcAllowed   = this->hevcAllowed && (this->vcn1HEVCRequested || this->vcn1HEVC10Requested);
+                this->hevc10Allowed = this->hevc10Allowed && this->hevcAllowed && this->vcn1HEVC10Requested;
+                nred.setProp32("NRedVCN1DecodeRequested", 1);
+
+                const bool avcEncodeArg  = checkKernelArgument("-NRedRaven2AVCEncodeTest");
+                const bool hevcEncodeArg = this->hevcAllowed && checkKernelArgument("-NRedRaven2HEVCEncodeTest");
+                if (nred.getDeviceID() == 0x15D8 && (avcEncodeArg || hevcEncodeArg)) {
                     const bool osBuildAvailable = osversion[0] != '\0';
                     const bool encodeBuildMatches =
                         osBuildAvailable ? strcmp(osversion, kRaven2OSBuild) == 0
                                          : strstr(version, kRaven2KernelBuild) != nullptr;
-                    this->hevcAllowed          = this->hevcAllowed && this->raven2HEVCRequested;
-                    this->hevc10Allowed        = this->hevc10Allowed && this->hevcAllowed && checkKernelArgument("-NRedRaven2HEVC10");
-                    this->raven2AVCEncodeTest  = encodeBuildMatches && checkKernelArgument("-NRedRaven2AVCEncodeTest");
-                    this->raven2HEVCEncodeTest = encodeBuildMatches && this->hevcAllowed
-                                                 && checkKernelArgument("-NRedRaven2HEVCEncodeTest");
-                    nred.setProp32("NRedRaven2AVCEncodeTest", static_cast<UInt32>(this->raven2AVCEncodeTest));
-                    nred.setProp32("NRedRaven2DecodeRequested", 1);
-                }
-                if (this->picassoDecode) {
-                    this->hevcAllowed   = false;
-                    this->hevc10Allowed = false;
-                    nred.setProp32("NRedPicassoDecodeRequested", 1);
+                    if (encodeBuildMatches) {
+                        nred.hwLateInit();
+                        nred.setProp32("NRedRaven2DecodeStrapRevision", nred.getDevRevision());
+                        if (nred.getAttributes().isRaven2()) {
+                            this->raven2AVCEncodeTest  = avcEncodeArg;
+                            this->raven2HEVCEncodeTest = hevcEncodeArg;
+                            nred.setProp32("NRedRaven2AVCEncodeTest", static_cast<UInt32>(this->raven2AVCEncodeTest));
+                        }
+                    }
                 }
             }
         }

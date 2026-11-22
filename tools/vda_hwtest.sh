@@ -25,7 +25,7 @@ raven2_smoke() {
     echo "Raven2 smoke-test artifacts: $work"
 
     ioreg -l -w0 -r -n IGPU >"$work/before.ioreg" || return 1
-    if ! grep -Eq '"NRed(Raven2|Picasso)DecodeRequested" = 1' "$work/before.ioreg" ||
+    if ! grep -q '"NRedVCN1DecodeRequested" = 1' "$work/before.ioreg" ||
        ! grep -q '"NRedVCNEngineAllocated" = 1' "$work/before.ioreg"; then
         echo 'Raven2 experiment is not active or its engine was not allocated.' >&2
         return 1
