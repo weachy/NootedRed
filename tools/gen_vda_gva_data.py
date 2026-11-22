@@ -186,6 +186,23 @@ class GeneratorError(RuntimeError):
     """Raised when the live cache does not match the data this generator supports."""
 
 
+def is_nootedred_active(bootargs: str) -> bool:
+    """Return True only when org.ChefKiss.NootedRed is loaded and not disabled by -NRedOff/-liluoff."""
+    tokens = set(bootargs.split())
+    if "-NRedOff" in tokens or "-liluoff" in tokens:
+        return False
+    for cmd in (
+        ["/usr/sbin/kextstat", "-b", "org.ChefKiss.NootedRed"],
+        ["/usr/bin/kmutil", "showloaded", "--bundle-identifier", "org.ChefKiss.NootedRed"],
+    ):
+        try:
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+            return "org.ChefKiss.NootedRed" in out
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return True
+
+
 def warn_if_live_patched_cache(cache_dir: Path) -> bool:
     """Detect reading the running system's cache on a `-NRedVDA`/`-NRedAVC` boot.
 
@@ -204,7 +221,10 @@ def warn_if_live_patched_cache(cache_dir: Path) -> bool:
         bootargs = subprocess.check_output(["/usr/sbin/sysctl", "-n", "kern.bootargs"], text=True)
     except (OSError, subprocess.SubprocessError):
         return False
-    if "-NRedVDA" in bootargs or "-NRedAVC" in bootargs:
+    if not is_nootedred_active(bootargs):
+        return False
+    tokens = set(bootargs.split())
+    if "-NRedVDA" in tokens or "-NRedAVC" in tokens:
         print(
             "warning: this boot has the VDA user-space patches active; pages of the live dyld "
             "cache may read back patched bytes. Regenerate on a boot without -NRedVDA/-NRedAVC "

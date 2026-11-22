@@ -352,16 +352,21 @@ def collect_metadata(root: Path, warnings: list[str], sys_root: Path = Path("/")
     write_text(meta / "videotoolbox-ffmpeg.txt", run(["ffmpeg", "-hide_banner", "-hwaccels"]).get("stdout", ""))
     write_text(meta / "coremedia-defaults.txt", run(["defaults", "read", "com.apple.coremedia"]).get("stdout", ""))
 
+    boot_tokens = set(boot_args.split())
     nootedred_loaded = "org.ChefKiss.NootedRed" in kexts or "org.ChefKiss.NootedRed" in kextstat
+    nred_disabled = "-NRedOff" in boot_tokens or "-liluoff" in boot_tokens
+    nootedred_active = nootedred_loaded and not nred_disabled
     flags = [flag for flag in ("-NRedGLFix", "-NRedVDA", "-NRedAVC", "-NRedAVCEncode", "-NRedNoSubmitGuard", "-NRedGLFixResolve", "-NRedGLFixResolveOnly")
-             if flag in boot_args]
+             if flag in boot_tokens]
     environment = {
         "boot_args": boot_args,
         "csr": csr,
         "nootedred_loaded": nootedred_loaded,
+        "nootedred_disabled_by_bootarg": nred_disabled,
+        "nootedred_active": nootedred_active,
         "userspace_patch_flags": flags,
         "offline_sys_root": str(sys_root) if sys_root != Path("/") else None,
-        "patched_page_cache_risk": bool(nootedred_loaded and flags and sys_root == Path("/")),
+        "patched_page_cache_risk": bool(nootedred_active and flags and sys_root == Path("/")),
     }
     if environment["patched_page_cache_risk"]:
         warnings.append(
