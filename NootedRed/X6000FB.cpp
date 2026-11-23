@@ -255,6 +255,18 @@ void X6000FB::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t s
                                             this->orgControllerPowerUp};
         PANIC_COND(!patcher.routeMultiple(id, &request, 1, slide, size), "X6000FB", "Failed to route powerUp");
 
+        if (checkKernelArgument("-NRedOLED")) {
+            this->oledEnabled = true;
+            if (this->fbPowerLock == nullptr) { this->fbPowerLock = IOLockAlloc(); }
+            KernelPatcher::RouteRequest fbPowerRequest{
+                "__ZN35AMDRadeonX6000_AmdRadeonFramebuffer18doPowerStateChangeENS_15AmdFbPowerStateE",
+                wrapDoPowerStateChange, this->orgDoPowerStateChange};
+            if (!patcher.routeMultiple(id, &fbPowerRequest, 1, slide, size)) {
+                patcher.clearError();
+                SYSLOG("X6000FB", "Failed to route doPowerStateChange (non-fatal)");
+            }
+        }
+
         const PenguinWizardry::MaskedLookupPatch patches[] = {
             {&kextRadeonX6000Framebuffer, kControllerPowerUpOriginal, kControllerPowerUpOriginalMask,
              kControllerPowerUpReplace, kControllerPowerUpReplaceMask, 1},
@@ -608,12 +620,52 @@ IOReturn X6000FB::getTriageHardwareDataRN(void*, const UInt32 fbIndex, void* con
 
 UInt32 X6000FB::wrapControllerPowerUp(void* const self)
 {
+    if (singleton().cachedController == nullptr) { singleton().cachedController = self; }
     auto& m_flags  = getMember<UInt8>(self, 0x5F18);
     auto  send     = (m_flags & 2) == 0;
-    m_flags       |= 4;    // All framebuffers enabled
+    m_flags       |= singleton().oledEnabled ? 0x0C : 4;    // All framebuffers enabled (+ hw attached for OLED)
     auto ret       = FunctionCast(wrapControllerPowerUp, singleton().orgControllerPowerUp)(self);
     if (send) { singleton().orgMessageAccelerator(self, IOFBRequestControllerEnabled, nullptr, nullptr, nullptr); }
     NRedAudio::singleton().onControllerPowerUp();
+    return ret;
+}
+
+UInt32 X6000FB::wrapDoPowerStateChange(void* const self, const UInt32 state)
+{
+    const auto ret = FunctionCast(wrapDoPowerStateChange, singleton().orgDoPowerStateChange)(self, state);
+    if (self == nullptr) { return ret; }
+
+    static constexpr UInt32 fbPowerOn = 2;
+    auto&                   inst      = singleton();
+    bool                    repower   = false;
+
+    if (inst.fbPowerLock != nullptr) { IOLockLock(inst.fbPowerLock); }
+    FbPowerStateEntry* entry = nullptr;
+    for (auto& item : inst.fbPowerStates) {
+        if (item.fb == self) {
+            entry = &item;
+            break;
+        }
+        if (item.fb == nullptr && entry == nullptr) { entry = &item; }
+    }
+    if (entry != nullptr) {
+        if (entry->fb == nullptr) { entry->fb = self; }
+        if (state == fbPowerOn) {
+            if (!entry->armed) { entry->armed = true; }
+            else if (entry->lastState != fbPowerOn) { repower = true; }
+        }
+        entry->lastState = state;
+    }
+    if (inst.fbPowerLock != nullptr) { IOLockUnlock(inst.fbPowerLock); }
+
+    if (repower) {
+        void* const controller = inst.cachedController;
+        // Only re-power if the controller is genuinely powered down (m_flags bit 1 clear).
+        if (controller != nullptr && (getMember<UInt8>(controller, 0x5F18) & 2) == 0) {
+            wrapControllerPowerUp(controller);
+        }
+    }
+
     return ret;
 }
 

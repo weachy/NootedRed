@@ -26,6 +26,7 @@
 #include <GPUDriversAMD/FB/AmdDeviceMemoryManager.hpp>
 #include <GPUDriversAMD/FB/BiosParser.hpp>
 #include <Headers/kern_patcher.hpp>
+#include <IOKit/IOLocks.h>
 
 class X6000FB
 {
@@ -38,6 +39,14 @@ class X6000FB
     using validateBiosImage_t   = bool(const void* self, UInt8* buffer, size_t bufferSize);
 
     static constexpr UInt32 IOFBRequestControllerEnabled = 0x1B;
+    static constexpr size_t kMaxFbPowerStates            = 16;
+
+    struct FbPowerStateEntry
+    {
+        void*  fb{nullptr};
+        UInt32 lastState{0xFF};
+        bool   armed{false};
+    };
 
     mach_vm_address_t      orgIH40IVRingInitHardware{0};
     IRQMGRWriteRegister_t* orgIRQMGRWriteRegister{nullptr};
@@ -47,6 +56,11 @@ class X6000FB
     mach_vm_address_t      orgDpReceiverPowerCtrl{0};
     messageAccelerator_t*  orgMessageAccelerator{nullptr};
     mach_vm_address_t      orgControllerPowerUp{0};
+    mach_vm_address_t      orgDoPowerStateChange{0};
+    void*                  cachedController{nullptr};
+    IOLock*                fbPowerLock{nullptr};
+    FbPowerStateEntry      fbPowerStates[kMaxFbPowerStates]{};
+    bool                   oledEnabled{false};
     mach_vm_address_t      orgCreateObjectInfo{0};
     mach_vm_address_t      orgCreateVramInfo{0};
     mach_vm_address_t      orgGetVendorInfo{0};
@@ -76,6 +90,7 @@ private:
     static IOReturn                         getTriageHardwareDataRN(void* self, UInt32 fbIndex, void* triageData);
     static void                             wrapDpReceiverPowerCtrl(void* link, bool powerOn);
     static UInt32                           wrapControllerPowerUp(void* self);
+    static UInt32                           wrapDoPowerStateChange(void* self, UInt32 state);
     static IOReturn                         wrapReportCapabilitiesLinkInfo(void* self);
     static void*                            wrapCreateObjectInfo(void* helper, UInt32 tableOffset);
     static AmdAtomVramInfo*                 wrapCreateVramInfo(AmdAtomFwHelper* biosHelper, UInt32 tableOffset);
