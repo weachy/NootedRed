@@ -91,6 +91,8 @@ void Backlight::init()
     PE_parse_boot_argn("AMDBacklight", &bkltArg, sizeof(bkltArg));
     if (!bkltArg) { return; }
 
+    if (checkKernelArgument("-NRedOLED")) { this->supportsAUX = true; }
+
     lilu.onKextLoadForce(&kextAppleBacklight);
     lilu.onKextLoadForce(&kextAppleMCCSControl);
 
@@ -189,16 +191,25 @@ IOReturn Backlight::wrapSetAttributeForConnection(IOService* const framebuffer, 
 
     if (singleton().maxBacklightLvl == 0) { return kIOReturnInternalError; }
 
-    const auto percentage = singleton().curBacklightLvl * 100 / singleton().maxBacklightLvl;
+    if (!singleton().supportsAUX && singleton().dcLinkCapsField(singleton().embeddedPanelLink).oled != 0) {
+        singleton().supportsAUX = true;
+    }
 
     if (singleton().supportsAUX) {
-        const auto auxValue = (singleton().maxBacklightMillinits * percentage) / 100;
+        // Avoid integer truncation to 0 and prevent self-emissive OLED panels from turning
+        // completely off at the lowest slider position.
+        const auto minAuxValue = (singleton().maxBacklightMillinits * 2) / 100;
+        auto       auxValue    = static_cast<UInt32>(
+            (static_cast<UInt64>(singleton().maxBacklightMillinits) * singleton().curBacklightLvl) /
+            singleton().maxBacklightLvl);
+        if (auxValue < minAuxValue) { auxValue = minAuxValue; }
         if (singleton().orgDcLinkSetBacklightLevelNits(singleton().embeddedPanelLink, true, auxValue, 50)) {
             return kIOReturnSuccess;
         }
     }
     else {
-        const auto pwmValue = (percentage * 0xFFFF) / 100;
+        const auto percentage = singleton().curBacklightLvl * 100 / singleton().maxBacklightLvl;
+        const auto pwmValue   = (percentage * 0xFFFF) / 100;
         if (singleton().orgDcLinkSetBacklightLevel(singleton().embeddedPanelLink, pwmValue, 0)) {
             return kIOReturnSuccess;
         }
@@ -260,7 +271,7 @@ void* Backlight::wrapLinkCreate(void* data)
                 // TODO: PWM should be used for SDR mode on LCD HDR panels,
                 // but AUX for HDR mode. Linux doesn't support HDR properly,
                 // but macOS does, so here's another thing to fix.
-                singleton().supportsAUX = linkCaps.oled != 0;
+                if (linkCaps.oled != 0) { singleton().supportsAUX = true; }
             }
             else {
                 SYSLOG("Backlight", "Found multiple embedded panel links. This may be a bug. Please report this.");
