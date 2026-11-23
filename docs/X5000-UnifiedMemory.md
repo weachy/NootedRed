@@ -199,19 +199,13 @@ removed, because the native staging branch was never reached during the animatio
 Add `-NRedUnifiedMemory` to the boot arguments. Lilu must load before NootedRed. The large pool buckets, hand-back
 and PTE coalescing are on by default with it. To roll back, remove the argument.
 
-- `debug.nred_uma.active` is `1` once the driver routes are installed. `debug.nred_uma.pool_state` reads `none`
-  until the pool exists, and `debug.nred_uma.pool_large` reads `1` only when the large bucket tables are installed.
-  NootedRed also logs `Creating the native buffer pool` and `Large buffer pool buckets installed`, but on the test
-  machine these lines did not reach the unified log, so use the sysctls to check.
 - Each part acts only after it has verified that its routes are in place. Otherwise it turns itself off and keeps
-  the native behavior.
-- These sysctls switch a part off at runtime (root). Reads report the effective state, and a reboot restores the
-  defaults:
-  - `debug.nred_uma.pool_large=0`: requests above 24 MiB take the pageable path;
-  - `debug.nred_uma.pool_return=0`: stop returning descriptors to the pool;
-  - `debug.nred_uma.pte_coalesce=0`: write PTEs one entry at a time.
-
-  The bucket tables are set when the pool is created and do not change at runtime.
+  the native behavior. There are no runtime switches.
+- The read-only `debug.nred_uma` sysctls report the state and the counters the probes use. `active` is `1` once the
+  driver routes are installed, and `pool_state` reads `none` until the pool exists. `pool_large_requests`,
+  `pool_returns` and `pte_batches` grow only while the large buckets, hand-back and PTE coalescing are in use.
+  NootedRed also logs `Creating the native buffer pool` and `Large buffer pool buckets installed`, but on the test
+  machine these lines did not reach the unified log.
 - `nred-uma-wired-mib=<MiB>` lowers the residency budget, for example `768` to trigger native reclaim in tests.
 
 ## Testing
@@ -283,9 +277,10 @@ Test machine: Renoir `0x1636`, 64 GiB RAM, 4K 10-bit DisplayPort display, macOS 
 
 ### This branch (2026-11-23)
 
-Kext `FE9FAF85`, built from this branch, in two boots: one without `-NRedUnifiedMemory`, one with it. In the second
-boot the pool and coalescing were switched off at runtime for the middle phase. All runs start a few minutes after
-login, and such runs differ by about 5 points between boots.
+Kext `FE9FAF85`, built from commit `23b1302` of this branch, in two boots: one without `-NRedUnifiedMemory`, one
+with it. In the second boot the pool and coalescing were switched off for the middle phase with runtime switches
+that a later commit removed. All runs start a few minutes after login, and such runs differ by about 5 points
+between boots.
 
 | | flag off | on | on, pool and coalescing off |
 | --- | --- | --- | --- |
@@ -305,10 +300,16 @@ login, and such runs differ by about 5 points between boots.
   `pool_return_skips` and `pte_fallbacks` stayed at 0. Accelerator wired memory was 438 MB after 60 s idle and
   449 MB after the probes.
 
+The build without the switches (kext `4D2DE009`, commit `13942cd`) was checked in one more boot with the flag on:
+64 MiB create to release 7.94 ms, 16 MiB 2.23 ms, all probes passed including the pressure case, and the
+cross-process check found 0 of 8 markers with 4 of 4 in the control. In that boot 2727 backings were handed back
+and one was skipped: `returnPooledDescriptors` declined it (purgeable state, an extra reference or an attached
+resource), and the backing was freed the native way instead.
+
 ### Pool, hand-back and PTE coalescing (2026-11-23)
 
-Kext `5DAA2EEC`, one boot, switching `pool_large`/`pool_return` and `pte_coalesce` at runtime. The final build only
-removed development switches.
+Kext `5DAA2EEC`, one boot, switching the pool, hand-back and PTE coalescing on and off with development switches
+that this branch no longer has.
 
 - 64 MiB private texture create, first use and release, median: all off 33.5/35.9 ms, pool only 18 ms,
   coalescing only 24 ms, all on 8.2/8.4 ms. 16 MiB: 8.2/8.7, 5.5, 5.6 and 2.1/2.2 ms.

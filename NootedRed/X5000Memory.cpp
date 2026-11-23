@@ -345,13 +345,10 @@ namespace
     void* (*getEventMachine)(const OSObject*){nullptr};
     void (*mergeMappingEvents)(OSObject*, void*){nullptr};
     bool largePoolInstalled{false};
-    // Set only when the shared release and prune routes were verified in place; pool_return cannot be enabled before.
+    // Set only when the shared release and prune routes were verified in place; hand-back stays off before.
     bool poolReturnAvailable{false};
     // The prune collector reads the VMPT event from the routed releaseFromGPUPageTable; verified in installX5000.
     bool releasePTERouted{false};
-    // On by default; each takes effect only when its routes were verified. Runtime off switches: sysctl.
-    UInt32 poolReturnEnabled{1};
-    UInt32 poolLargeEnabled{1};
     void* activePool{nullptr};
     mach_vm_address_t originalSharedRelease{0};
     mach_vm_address_t originalPrune{0};
@@ -785,7 +782,7 @@ namespace
             return nullptr;
         }
         const bool large = size > nativePoolLimit;
-        const bool pooled = !large || (largePoolInstalled && __atomic_load_n(&poolLargeEnabled, __ATOMIC_RELAXED) != 0);
+        const bool pooled = !large || largePoolInstalled;
         if (large && pooled) { increment(poolLargeRequests); }
         auto* const memory = static_cast<OSObject*>(
             pooled ? allocatePooled(accelerator, task, shared, resource, options, size, unshared)
@@ -1105,11 +1102,7 @@ namespace
     // unwire every piece just before the backing is destroyed.
     bool holdsPooledWire(OSObject* const memory)
     {
-        if (!largePoolInstalled || !poolReturnAvailable || !releasePTERouted
-            || __atomic_load_n(&poolReturnEnabled, __ATOMIC_RELAXED) == 0)
-        {
-            return false;
-        }
+        if (!largePoolInstalled || !poolReturnAvailable || !releasePTERouted) { return false; }
         const auto flags = getMember<UInt32>(memory, memoryFlags);
         if ((flags & (pooledMemory | wiredMemory)) != (pooledMemory | wiredMemory)) { return false; }
         virtualSlot<void (*)(OSObject*)>(memory, incrementWireSlot)(memory);
@@ -1159,10 +1152,8 @@ namespace
     {
         // The collector is used under the accelerator lock; the exchange keeps a second thread out regardless.
         thread_t expected = nullptr;
-        auto* const machine = largePoolInstalled && poolReturnAvailable && releasePTERouted
-                                      && __atomic_load_n(&poolReturnEnabled, __ATOMIC_RELAXED) != 0
-                                  ? getEventMachine(memory)
-                                  : nullptr;
+        auto* const machine =
+            largePoolInstalled && poolReturnAvailable && releasePTERouted ? getEventMachine(memory) : nullptr;
         const bool collecting = machine != nullptr
                                 && __atomic_compare_exchange_n(&pruneOwner, &expected, current_thread(), false,
                                                                __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
@@ -1571,46 +1562,6 @@ namespace
     UMA_COUNTER(pte_fallbacks, pteFallbacks, "Coalesced runs written entry by entry because the pool was full");
 #undef UMA_COUNTER
 
-    int handlePoolSwitch(struct sysctl_oid* oidp, void* arg1, int, struct sysctl_req* req)
-    {
-        auto* const target = static_cast<UInt32*>(arg1);
-        // Reads report the effective state: on only when the feature's routes were verified.
-        const bool available = largePoolInstalled && (target != &poolReturnEnabled || (poolReturnAvailable && releasePTERouted));
-        int value = available && __atomic_load_n(target, __ATOMIC_RELAXED) != 0 ? 1 : 0;
-        const auto error = sysctl_handle_int(oidp, &value, 0, req);
-        if (error != 0 || req->newptr == USER_ADDR_NULL) { return error; }
-        if (value != 0 && value != 1) { return EINVAL; }
-        if (value == 1
-            && ((target == &poolReturnEnabled && (!poolReturnAvailable || !releasePTERouted)) || !largePoolInstalled))
-        {
-            return ENOTSUP;
-        }
-        __atomic_store_n(target, static_cast<UInt32>(value), __ATOMIC_RELAXED);
-        return 0;
-    }
-    SYSCTL_PROC(_debug_nred_uma, OID_AUTO, pool_return, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &poolReturnEnabled,
-                0, handlePoolSwitch, "I", "Hand pooled descriptors back when a backing is destroyed");
-    SYSCTL_PROC(_debug_nred_uma, OID_AUTO, pool_large, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &poolLargeEnabled,
-                0, handlePoolSwitch, "I", "Serve backings above 24 MiB from the pool");
-
-    int handlePTECoalesce(struct sysctl_oid* const oidp, void*, int, struct sysctl_req* const req)
-    {
-        int value = poolCommit != nullptr && __atomic_load_n(&pteCoalesce, __ATOMIC_RELAXED) != 0 ? 1 : 0;
-        const auto error = sysctl_handle_int(oidp, &value, 0, req);
-        if (error != 0 || req->newptr == USER_ADDR_NULL) { return error; }
-        if (value != 0 && value != 1) { return EINVAL; }
-        if (originalPTEUpdate == 0 || originalMapVMPT == 0 || originalMapVA == 0 || originalPoolReserve == 0
-            || originalPoolSubmit == 0 || poolCommit == nullptr)
-        {
-            return ENODEV;
-        }
-        __atomic_store_n(&pteCoalesce, static_cast<UInt32>(value), __ATOMIC_RELAXED);
-        return 0;
-    }
-    SYSCTL_PROC(_debug_nred_uma, OID_AUTO, pte_coalesce, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0,
-                handlePTECoalesce, "I", "Write runs of single-page PTE updates as one SDMA WRITE_LINEAR packet");
-
-
     // Bucket occupancy of the native pool (wired clean, purgeable clean, dirty per bucket), as last sampled under the
     // accelerator lock by a pooled allocation, a hand-back or a shared release.
     int handlePoolState(struct sysctl_oid* oidp, void*, int, struct sysctl_req* req)
@@ -1652,9 +1603,8 @@ namespace
             &sysctl__debug_nred_uma_gl_command_budget_kib, &sysctl__debug_nred_uma_gl_budget_sites,
             &sysctl__debug_nred_uma_gl_budget_queries, &sysctl__debug_nred_uma_pool_returns,
             &sysctl__debug_nred_uma_pool_return_pieces, &sysctl__debug_nred_uma_pool_return_skips,
-            &sysctl__debug_nred_uma_pool_large_requests, &sysctl__debug_nred_uma_pool_return,
-            &sysctl__debug_nred_uma_pool_large, &sysctl__debug_nred_uma_pool_state, &sysctl__debug_nred_uma_pool_rekeyed,
-            &sysctl__debug_nred_uma_pte_coalesce, &sysctl__debug_nred_uma_pte_batches,
+            &sysctl__debug_nred_uma_pool_large_requests, &sysctl__debug_nred_uma_pool_state,
+            &sysctl__debug_nred_uma_pool_rekeyed, &sysctl__debug_nred_uma_pte_batches,
             &sysctl__debug_nred_uma_pte_batched_entries, &sysctl__debug_nred_uma_pte_direct_calls,
             &sysctl__debug_nred_uma_pte_fallbacks,
         };
@@ -1853,7 +1803,6 @@ namespace
             poolReturnAvailable = installed && patched;
             if (!poolReturnAvailable) {
                 // Without the re-keying, dirty slots must not be produced at all.
-                __atomic_store_n(&poolReturnEnabled, 0, __ATOMIC_RELAXED);
                 largePoolInstalled = false;
                 restoreNativePoolBuckets();
                 SYSLOG("UnifiedMemory", "Shared release or prune route failed; pooled hand-back disabled");
