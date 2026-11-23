@@ -76,9 +76,10 @@ barrier wait fell to 0.06 ms, but WindowServer kernel CPU time per run rose from
 the light animation from 16% to 34%. A write-combined mapping caused GPU page protection faults. Linux amdgpu also
 updates the graphics page tables of Renoir with SDMA.
 
-Runs of single-page PTE updates are coalesced. Inside `AMDHWVMContext::mapVA`, single-entry updates of consecutive
-PTEs from `mapVMPT` are staged and written as one SDMA `WRITE_LINEAR` packet with two dwords per entry, as in
-amdgpu's `sdma_v4_0_vm_write_pte`. The thread flushes its staged entries before any other reservation or commit on
+Runs of single-page PTE updates are coalesced for unified memory backings. Other GPUs driven by `AMDRadeonX5000`,
+such as a Vega card next to the APU, keep the native writer. Inside `AMDHWVMContext::mapVA`, single-entry updates
+of consecutive PTEs from `mapVMPT` are staged and written as one SDMA `WRITE_LINEAR` packet with two dwords per
+entry, as in amdgpu's `sdma_v4_0_vm_write_pte`. The thread flushes its staged entries before any other reservation or commit on
 the same command pool and when the outermost `mapVMPT` returns, so the pool holds every packet when `mapVA` ends.
 If a large reservation fails, the entries go to the native single-entry writer. SDMA stays the only page table
 writer, and `unmapVA` keeps the native path. A 64 MiB texture needs about 190,000 dwords of PTE packets. The GPU job
@@ -210,6 +211,10 @@ and PTE coalescing are on by default with it. To roll back, remove the argument.
 
 - Each part acts only after it has verified that its routes are in place. Otherwise it turns itself off and keeps
   the native behavior. There are no runtime switches.
+- The GPU's registry entry (`IGPU` in `ioreg`) shows the state. `NRedUnifiedMemory` reads `active`, or why the
+  feature is off (`off: unsupported IOAcceleratorFamily2`, `off: unsupported AMDRadeonX5000`, `off: not a
+  Renoir-family GPU`). While active, `NRedUnifiedMemoryPoolBuckets` is `large` or `native`, and
+  `NRedUnifiedMemoryHandBack` and `NRedUnifiedMemoryPTECoalescing` show whether those parts are on.
 - The read-only `debug.nred_uma` sysctls report the state and the counters the probes use. `active` is `1` once the
   driver routes are installed, and `pool_state` reads `none` until the pool exists. `pool_large_requests`,
   `pool_returns` and `pte_batches` grow only while the large buckets, hand-back and PTE coalescing are in use.
@@ -281,6 +286,16 @@ codesign -s - /tmp/x5000_uma_gl_probe
 probe keeps the resources and reads them again after an empty line on standard input. The VBO case then updates the
 buffers from the CPU and checks that the GPU sees the update.
 
+The churn tool creates a private RGBA16Float texture, writes it once from a compute kernel and releases it, 30 times,
+and prints the median. This is the "create, first use, release" figure below.
+
+```sh
+xcrun swiftc -O tools/x5000_uma_churn.swift -o /tmp/x5000_uma_churn
+codesign -s - /tmp/x5000_uma_churn
+/tmp/x5000_uma_churn 64
+/tmp/x5000_uma_churn 16
+```
+
 The cross-process check writes marked 64 MiB private textures in one process and looks for the marker in new
 textures of another process. The `both` run is the control and should see reuse within one process.
 
@@ -350,6 +365,14 @@ no display transactions and are not reported.
 All probes passed in both boots: readback with surfaces, cross-process IOSurface and layouts, purgeable states,
 Managed resources, OpenGL smoke, VBO and full cases, a 5 GiB reclaim run against the 4 GiB budget, and the 23 GiB
 pressure case with the default budget. `pool_return_skips` and `pte_fallbacks` stayed at 0.
+
+The build that limits PTE coalescing to unified memory backings and publishes the registry state (kext `EE30E22B`,
+commit `71d9eeb`) was checked in one boot with default boot arguments. The registry showed `active`, `large`, and
+hand-back and coalescing on. 64 MiB create to release took 7.89 ms and 16 MiB 2.08 ms, about 178,000 coalesced
+packets were written, and the cross-process check found 0 of 8 markers (control 4 of 4). The managed, OpenGL and
+23 GiB pressure probes passed. The purgeable probe failed once while the external display came back online during
+the run, which made WindowServer release and re-create surfaces and kept the device-wide `bytes_live` growth at
+500 MiB; it passed three times when run again in the same boot.
 
 ### Pool, hand-back and PTE coalescing (2026-11-23)
 

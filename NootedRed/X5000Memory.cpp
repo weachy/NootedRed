@@ -327,6 +327,8 @@ namespace
     }
 
     bool enabledAtBoot{false};
+    bool ioChecked{false};
+    bool amdChecked{false};
     bool ioReady{false};
     bool amdReady{false};
     UInt32 active{0};
@@ -1481,7 +1483,9 @@ namespace
     {
         const auto original = FunctionCast(mapVA, originalMapVA);
         thread_t expected = nullptr;
-        const bool owner = __atomic_load_n(&pteCoalesce, __ATOMIC_RELAXED) != 0
+        // Only unified memory backings, which belong to the Renoir accelerator, are coalesced. Other GPUs driven by
+        // AMDRadeonX5000 (a Vega card next to the APU) keep the native writer.
+        const bool owner = __atomic_load_n(&pteCoalesce, __ATOMIC_RELAXED) != 0 && isManaged(memory)
                            && __atomic_compare_exchange_n(&pteOwner, &expected, current_thread(), false,
                                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
         if (owner) { pteDepth = 0; }
@@ -1615,6 +1619,23 @@ namespace
         for (auto* const control : controls) { sysctl_register_oid(control); }
         __atomic_store_n(&active, 1, __ATOMIC_RELEASE);
         SYSLOG("UnifiedMemory", "Installed X5000 pageable backing, residency budget, and display routes");
+    }
+
+    // The state on the GPU's registry entry, so that an ioreg dump shows it (the SYSLOG lines may not reach the log).
+    void publishState()
+    {
+        auto* const gpu = NRed::singleton().getIGPU();
+        if (gpu == nullptr) { return; }
+        const char* state = "waiting for AMDRadeonX5000";
+        if (ready()) { state = "active"; }
+        else if (ioChecked && !ioReady) { state = "off: unsupported IOAcceleratorFamily2"; }
+        else if (amdChecked && !NRed::singleton().getAttributes().isRenoir()) { state = "off: not a Renoir-family GPU"; }
+        else if (amdChecked && !amdReady) { state = "off: unsupported AMDRadeonX5000"; }
+        gpu->setProperty("NRedUnifiedMemory", state);
+        if (!ready()) { return; }
+        gpu->setProperty("NRedUnifiedMemoryPoolBuckets", largeBuckets ? "large" : "native");
+        gpu->setProperty("NRedUnifiedMemoryHandBack", pooledHandBack && poolReturnAvailable && releasePTERouted);
+        gpu->setProperty("NRedUnifiedMemoryPTECoalescing", __atomic_load_n(&pteCoalesce, __ATOMIC_RELAXED) != 0);
     }
 
     UInt32* poolWiredTable{nullptr};
@@ -1982,12 +2003,19 @@ void X5000Memory::processKext(KernelPatcher& patcher, const size_t id, const mac
 
     const Image image{patcher, id, slide, size};
     if (id == kextIOAcceleratorFamily2.loadIndex) {
+        ioChecked = true;
         ioReady = verifiedImage(slide, size, ioAccelUUID) && installIOAccel(image);
         if (!ioReady) { SYSLOG("UnifiedMemory", "Unsupported IOAcceleratorFamily2 residency ABI"); }
     }
-    else if (id == kextRadeonX5000.loadIndex && NRed::singleton().getAttributes().isRenoir()) {
-        amdReady = verifiedImage(slide, size, x5000UUID) && installX5000(image);
-        if (!amdReady) { SYSLOG("UnifiedMemory", "Unsupported X5000 display ABI"); }
+    else if (id == kextRadeonX5000.loadIndex) {
+        amdChecked = true;
+        if (NRed::singleton().getAttributes().isRenoir()) {
+            amdReady = verifiedImage(slide, size, x5000UUID) && installX5000(image);
+            if (!amdReady) { SYSLOG("UnifiedMemory", "Unsupported X5000 display ABI"); }
+        }
+        else { SYSLOG("UnifiedMemory", "Not a Renoir-family GPU"); }
     }
+    else { return; }
     activate();
+    publishState();
 }
