@@ -240,7 +240,7 @@ auto NRedAudio::resolveDcnIpBlock() -> DcnIpBlock
 
 void NRedAudio::delayedProbeCallback(thread_call_param_t, thread_call_param_t)
 {
-    static constexpr UInt32 kRetryDelaysMs[] = {1000, 1000, 1500, 1500};
+    static constexpr UInt32 kRetryDelaysMs[] = {500, 1000, 1000, 1500, 1500};
     auto&                   audio            = singleton();
     const bool              settled          = audio.configureAudio(audio.postLinkPassDone);
     audio.probeTopology();
@@ -271,7 +271,7 @@ void NRedAudio::onControllerPowerUp()
     this->settleRetries    = 0;
     this->postLinkPassDone = false;
     this->probeTopology();
-    this->scheduleDelayedProbe(2000);
+    this->scheduleDelayedProbe(500);
 }
 
 void NRedAudio::onLinkCapabilitiesReported()
@@ -279,7 +279,7 @@ void NRedAudio::onLinkCapabilitiesReported()
     this->settleRetries    = 0;
     this->postLinkPassDone = false;
     this->probeTopology();
-    this->scheduleDelayedProbe(2000);
+    this->scheduleDelayedProbe(500);
 }
 
 bool NRedAudio::configureAudio(const bool pulseDpSec)

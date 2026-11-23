@@ -48,7 +48,7 @@ private:
     UInt32        settleRetries{0};
     bool          postLinkPassDone{false};
 
-    void        scheduleDelayedProbe(UInt32 delayMs = 2000);
+    void        scheduleDelayedProbe(UInt32 delayMs = 500);
     static void delayedProbeCallback(thread_call_param_t param0, thread_call_param_t param1);
     static auto resolveDcnIpBlock() -> DcnIpBlock;
 };
