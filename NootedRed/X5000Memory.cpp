@@ -346,14 +346,13 @@ namespace
     void (*kickPoolTimer)(IOService*){nullptr};
     void* (*getEventMachine)(const OSObject*){nullptr};
     void (*mergeMappingEvents)(OSObject*, void*){nullptr};
-    // The pooled path (pool requests, hand-back, re-keying) is installed. Requires the shared release, prune and
-    // PTE release routes.
+    // The pooled path is installed: the pool exists, takes requests, and hands back and re-keys descriptors. Requires
+    // the shared release, prune and PTE release routes; installIOAccel and installX5000 turn it off otherwise.
     bool pooledHandBack{false};
     // The 4 MiB bucket tables are installed, so requests up to 96 MiB come from the pool.
     bool largeBuckets{false};
-    // Set only when the shared release and prune routes were verified in place; hand-back stays off before.
-    bool poolReturnAvailable{false};
-    // The prune collector reads the VMPT event from the routed releaseFromGPUPageTable; verified in installX5000.
+    // The prune collector reads the VMPT event from the routed releaseFromGPUPageTable. installX5000 verifies the
+    // route and turns the pooled path off without it.
     bool releasePTERouted{false};
     void* activePool{nullptr};
     mach_vm_address_t originalSharedRelease{0};
@@ -384,7 +383,6 @@ namespace
     mach_vm_address_t originalReleasePTE{0};
     mach_vm_address_t originalFlip{0};
 
-    UInt64 pageableRequests{0};
     UInt64 pooledAllocations{0};
     UInt64 poolReturns{0};
     UInt64 poolReturnPieces{0};
@@ -396,7 +394,6 @@ namespace
     UInt64 textureAllocations{0};
     UInt64 surfaceAllocations{0};
     UInt64 liveBytes{0};
-    UInt64 wireCount{0};
     UInt64 unwireCount{0};
     UInt64 rewireCount{0};
     UInt64 purgeUnwires{0};
@@ -405,8 +402,6 @@ namespace
     UInt64 mappingAddressChanges{0};
     UInt64 mappingTrackingFailures{0};
     UInt64 taskCommits{0};
-    UInt64 unwiredBytes{0};
-    UInt64 residentBytes{0};
     UInt64 totalResidentBytes{0};
     UInt64 deniedFlips{0};
     UInt64 effectiveBudget{0};
@@ -493,15 +488,9 @@ namespace
         if (auto* const backing = *findBacking(memory)) {
             const auto change = X5000Memory::updateResidency(backing->residency, wired);
             backing->residency = change.state;
-            if (change.wired) {
-                increment(wireCount);
-                increment(residentBytes, backing->size);
-            }
             if (change.evicted) {
                 ++backing->evictionEpoch;
                 increment(unwireCount);
-                increment(unwiredBytes, backing->size);
-                __atomic_sub_fetch(&residentBytes, backing->size, __ATOMIC_RELAXED);
             }
             if (change.rewired) { increment(rewireCount); }
         }
@@ -512,8 +501,9 @@ namespace
     {
         if (!ready() || accelerator == nullptr) { return false; }
         const auto& nred = NRed::singleton();
-        return nred.getIGPU() != nullptr && nred.getAttributes().isRenoir()
-               && accelerator->metaCast(acceleratorClass) != nullptr && accelerator->getProvider() == nred.getIGPU();
+        // ready() implies a Renoir-family device: AMDRadeonX5000 routes are only installed there.
+        return nred.getIGPU() != nullptr && accelerator->metaCast(acceleratorClass) != nullptr
+               && accelerator->getProvider() == nred.getIGPU();
     }
 
     bool hasPerTaskPageTable(void* const task)
@@ -728,7 +718,8 @@ extern "C" [[gnu::used, gnu::noinline]] bool nredUnifiedUseSystem(void* const re
 
 extern "C" [[gnu::used, gnu::noinline]] bool nredUnifiedBufferPool(IOService* const accelerator)
 {
-    if (!ownsAccelerator(accelerator)) { return false; }
+    // Without the pooled path (hand-back and re-keying) no pool is created, so no task-keyed dirty slots appear.
+    if (!ownsAccelerator(accelerator) || !pooledHandBack) { return false; }
     SYSLOG("UnifiedMemory", "Creating the native buffer pool for unified memory backings");
     return true;
 }
@@ -781,14 +772,13 @@ namespace
         void* const resource, const UInt32 options, const UInt64 size, const bool unshared, const BackingKind kind,
         const UInt64 alignment)
     {
-        increment(pageableRequests);
         auto* const backing = static_cast<Backing*>(IOMalloc(sizeof(Backing)));
         if (backing == nullptr) {
             increment(allocationFailures);
             return nullptr;
         }
         const bool large = size > nativePoolLimit;
-        const bool pooled = !large || largeBuckets;
+        const bool pooled = pooledHandBack && (!large || largeBuckets);
         if (large && pooled) { increment(poolLargeRequests); }
         auto* const memory = static_cast<OSObject*>(
             pooled ? allocatePooled(accelerator, task, shared, resource, options, size, unshared)
@@ -827,7 +817,6 @@ namespace
         *backing = {memory, bucket, getMember<UInt64>(memory, memorySize), residency};
         bucket = backing;
         increment(liveBytes, backing->size);
-        if (residency == Residency::Wired) { increment(residentBytes, backing->size); }
         IOSimpleLockUnlock(backingLock);
         switch (kind) {
             case BackingKind::Buffer: increment(bufferAllocations); break;
@@ -989,9 +978,6 @@ namespace
             if (backing != nullptr) {
                 *link = backing->next;
                 __atomic_sub_fetch(&liveBytes, backing->size, __ATOMIC_RELAXED);
-                if (backing->residency == Residency::Wired) {
-                    __atomic_sub_fetch(&residentBytes, backing->size, __ATOMIC_RELAXED);
-                }
             }
             IOSimpleLockUnlock(backingLock);
             if (backing != nullptr) {
@@ -1029,8 +1015,7 @@ namespace
 
     void* ownedPool(IOService* const accelerator)
     {
-        return accelerator != nullptr && ownsAccelerator(accelerator)
-                       && getMember<UInt32>(accelerator, acceleratorPoolEnabled) != 0
+        return ownsAccelerator(accelerator) && getMember<UInt32>(accelerator, acceleratorPoolEnabled) != 0
                    ? getMember<void*>(accelerator, acceleratorPool)
                    : nullptr;
     }
@@ -1108,18 +1093,17 @@ namespace
     // unwire every piece just before the backing is destroyed.
     bool holdsPooledWire(OSObject* const memory)
     {
-        if (!pooledHandBack || !poolReturnAvailable || !releasePTERouted) { return false; }
         const auto flags = getMember<UInt32>(memory, memoryFlags);
         if ((flags & (pooledMemory | wiredMemory)) != (pooledMemory | wiredMemory)) { return false; }
         virtualSlot<void (*)(OSObject*)>(memory, incrementWireSlot)(memory);
         return true;
     }
 
-    // Same hand-back as IOAccelSysMemory::orphanIt, for a pooled backing whose orphaned mappings were all idle and
-    // released. orphanIt runs after IOAccelMemory::release dropped its reference, so once the orphans are gone only
-    // orphanBacking's own reference is left and the backing is destroyed when it drops it. Same-task reuse inherits the merged
-    // mapping events; other tasks get the pieces after the pool timer zero-fills them once the events complete.
-    bool returnPooledDescriptors(OSObject* const memory, const UInt32 dyingRetainCount)
+    // Same hand-back as IOAccelSysMemory::orphanIt, for a dying pooled backing whose orphaned mappings were all idle
+    // and released. Exactly one reference is left: orphanBacking's own, or the temporary one that
+    // IOAccelMemory::release holds across pruneOrphanedMappings. Same-task reuse inherits the merged mapping events;
+    // other tasks get the pieces after the pool timer zero-fills them once the events complete.
+    bool returnPooledDescriptors(OSObject* const memory)
     {
         auto* const accelerator = getMember<IOService*>(memory, memoryAccelerator);
         auto* const descriptors = getMember<void*>(memory, memoryDescriptors);
@@ -1128,7 +1112,7 @@ namespace
         const auto state = (flags >> purgeableShift) & purgeableMask;
         auto* const pool = ownedPool(accelerator);
         if (pool == nullptr || descriptors == nullptr || count == 0 || state > volatileState
-            || memory->getRetainCount() != static_cast<int>(dyingRetainCount)
+            || memory->getRetainCount() != 1
             || getMember<void*>(memory, memoryResource) != nullptr || !claimPoolReturn(memory))
         {
             return false;
@@ -1148,18 +1132,13 @@ namespace
         return true;
     }
 
-    // A backing is orphaned once only orphaned mappings reference it. Nothing can revive them any more, and a pooled
-    // backing hands its pages back to the pool here, so idle mappings are released first, as in IOAccelMemory::release.
-    // Mappings with GPU work still pending stay orphaned under the native rules. The gate is the registry rather than
-    // the kept-mappings flag, because a fixed-address mapping clears the flag while earlier orphans remain.
     // Starts collecting the VMPT events of the PTE releases done by the coming prune and holds the backing wired.
     // Returns false (nothing held) unless the backing is a wired pooled one and the collector is free.
     bool beginPooledPrune(OSObject* const memory)
     {
         // The collector is used under the accelerator lock; the exchange keeps a second thread out regardless.
         thread_t expected = nullptr;
-        auto* const machine =
-            pooledHandBack && poolReturnAvailable && releasePTERouted ? getEventMachine(memory) : nullptr;
+        auto* const machine = pooledHandBack ? getEventMachine(memory) : nullptr;
         const bool collecting = machine != nullptr
                                 && __atomic_compare_exchange_n(&pruneOwner, &expected, current_thread(), false,
                                                                __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
@@ -1182,6 +1161,10 @@ namespace
         __atomic_store_n(&pruneOwner, nullptr, __ATOMIC_RELEASE);
     }
 
+    // A backing is orphaned once only orphaned mappings reference it. Nothing can revive them any more, and a pooled
+    // backing hands its pages back to the pool here, so idle mappings are released first, as in IOAccelMemory::release.
+    // Mappings with GPU work still pending stay orphaned under the native rules. The gate is the registry rather than
+    // the kept-mappings flag, because a fixed-address mapping clears the flag while earlier orphans remain.
     void orphanBacking(OSObject* const memory)
     {
         const auto orphan = FunctionCast(orphanBacking, originalOrphan);
@@ -1203,7 +1186,7 @@ namespace
             if (held) { addPruneEventToSlots(memory); }
         } else if (held) {
             // orphanIt runs after IOAccelMemory::release dropped its reference: only ours is left.
-            if (!returnPooledDescriptors(memory, 1)) { increment(poolReturnSkips); }
+            if (!returnPooledDescriptors(memory)) { increment(poolReturnSkips); }
             virtualSlot<void (*)(OSObject*)>(memory, decrementWireSlot)(memory);
         }
         if (held) { endPooledPrune(); }
@@ -1225,7 +1208,7 @@ namespace
         const bool held = beginPooledPrune(memory);
         original(memory);
         if (held) {
-            if (getMember<SInt16>(memory, memoryMappingCount) == 0 && !returnPooledDescriptors(memory, 1)) {
+            if (getMember<SInt16>(memory, memoryMappingCount) == 0 && !returnPooledDescriptors(memory)) {
                 increment(poolReturnSkips);
             }
             virtualSlot<void (*)(OSObject*)>(memory, decrementWireSlot)(memory);
@@ -1392,7 +1375,6 @@ namespace
         UInt64 addresses[pteBatchMax]{};
     };
 
-    UInt32 pteCoalesce{1};
     thread_t pteOwner{nullptr};  // thread inside the outermost coalescing mapVMPT call
     UInt32 pteDepth{0};          // mapVMPT nesting of pteOwner; only pteOwner reads or writes it and pteBatch
     PTEBatch pteBatch{};
@@ -1404,7 +1386,6 @@ namespace
     void (*poolCommit)(void*, UInt32*){nullptr};
     UInt64 pteBatches{0};
     UInt64 pteBatchedEntries{0};
-    UInt64 pteDirectCalls{0};
     UInt64 pteFallbacks{0};
 
     bool ownsPTEBatch() { return __atomic_load_n(&pteOwner, __ATOMIC_ACQUIRE) == current_thread(); }
@@ -1473,7 +1454,6 @@ namespace
             return;
         }
         flushPTEBatch();
-        increment(pteDirectCalls);
         writePTEsNative(context, entry, count, addr, flags, step);
     }
 
@@ -1485,7 +1465,7 @@ namespace
         thread_t expected = nullptr;
         // Only unified memory backings, which belong to the Renoir accelerator, are coalesced. Other GPUs driven by
         // AMDRadeonX5000 (a Vega card next to the APU) keep the native writer.
-        const bool owner = __atomic_load_n(&pteCoalesce, __ATOMIC_RELAXED) != 0 && isManaged(memory)
+        const bool owner = poolCommit != nullptr && isManaged(memory)
                            && __atomic_compare_exchange_n(&pteOwner, &expected, current_thread(), false,
                                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
         if (owner) { pteDepth = 0; }
@@ -1532,14 +1512,12 @@ namespace
 #define UMA_COUNTER(name, value, description)                                                             \
     SYSCTL_OID(_debug_nred_uma, OID_AUTO, name, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, &value, 0,      \
                sysctl_handle_quad, "QU", description)
-    UMA_COUNTER(pageable_requests, pageableRequests, "Pageable resource backing requests");
     UMA_COUNTER(pool_allocations, pooledAllocations, "Backings served pre-wired by the native buffer pool");
     UMA_COUNTER(allocation_failures, allocationFailures, "Failed pageable backing allocations");
     UMA_COUNTER(data_buffers, bufferAllocations, "Data buffers allocated with pageable backing");
     UMA_COUNTER(textures, textureAllocations, "Textures allocated with pageable primary backing");
     UMA_COUNTER(surfaces, surfaceAllocations, "Surfaces allocated with pageable primary backing");
     UMA_COUNTER(bytes_live, liveBytes, "Logical size of managed backing objects");
-    UMA_COUNTER(wire_count, wireCount, "Managed backing wire events");
     UMA_COUNTER(unwire_count, unwireCount, "Managed backing unwired before destruction");
     UMA_COUNTER(rewire_count, rewireCount, "Managed backing wired again after eviction");
     UMA_COUNTER(purge_unwires, purgeUnwires, "Idle backings unwired for explicit purgeability requests");
@@ -1548,8 +1526,6 @@ namespace
     UMA_COUNTER(mapping_va_changes, mappingAddressChanges, "Primary mappings observed changing GPU task or VA");
     UMA_COUNTER(mapping_tracking_failures, mappingTrackingFailures, "Failed primary mapping records");
     UMA_COUNTER(task_commits, taskCommits, "Managed backing committed into per-task GPU page tables");
-    UMA_COUNTER(bytes_unwired, unwiredBytes, "Cumulative managed bytes unwired before destruction");
-    UMA_COUNTER(bytes_resident, residentBytes, "Logical size of wired managed backing objects");
     UMA_COUNTER(bytes_total_wired, totalResidentBytes, "Total system bytes wired by the accelerator");
     UMA_COUNTER(scanout_denials, deniedFlips, "System memory resources declined for native scanout");
     UMA_COUNTER(wired_budget, effectiveBudget, "Effective accelerator wired system memory limit");
@@ -1566,7 +1542,6 @@ namespace
     UMA_COUNTER(pool_rekeyed, poolRekeyed, "Dirty pool slots handed to kernel_task when their task released a shared");
     UMA_COUNTER(pte_batches, pteBatches, "SDMA WRITE_LINEAR packets written for coalesced page-table entries");
     UMA_COUNTER(pte_batched_entries, pteBatchedEntries, "Page-table entries written through coalesced packets");
-    UMA_COUNTER(pte_direct_calls, pteDirectCalls, "Page-table updates passed to the native packet writer while coalescing");
     UMA_COUNTER(pte_fallbacks, pteFallbacks, "Coalesced runs written entry by entry because the pool was full");
 #undef UMA_COUNTER
 
@@ -1595,16 +1570,16 @@ namespace
     {
         if (!ioReady || !amdReady || ready()) { return; }
         struct sysctl_oid* const controls[] = {
-            &sysctl__debug_nred_uma, &sysctl__debug_nred_uma_active, &sysctl__debug_nred_uma_pageable_requests,
+            &sysctl__debug_nred_uma, &sysctl__debug_nred_uma_active,
             &sysctl__debug_nred_uma_pool_allocations, &sysctl__debug_nred_uma_allocation_failures,
             &sysctl__debug_nred_uma_data_buffers, &sysctl__debug_nred_uma_textures, &sysctl__debug_nred_uma_surfaces,
-            &sysctl__debug_nred_uma_bytes_live, &sysctl__debug_nred_uma_wire_count, &sysctl__debug_nred_uma_unwire_count,
+            &sysctl__debug_nred_uma_bytes_live, &sysctl__debug_nred_uma_unwire_count,
             &sysctl__debug_nred_uma_rewire_count, &sysctl__debug_nred_uma_purge_unwires,
             &sysctl__debug_nred_uma_same_va_recommits,
             &sysctl__debug_nred_uma_shared_va_recommits, &sysctl__debug_nred_uma_mapping_va_changes,
             &sysctl__debug_nred_uma_mapping_tracking_failures,
-            &sysctl__debug_nred_uma_task_commits, &sysctl__debug_nred_uma_bytes_unwired,
-            &sysctl__debug_nred_uma_bytes_resident, &sysctl__debug_nred_uma_bytes_total_wired,
+            &sysctl__debug_nred_uma_task_commits,
+            &sysctl__debug_nred_uma_bytes_total_wired,
             &sysctl__debug_nred_uma_scanout_denials, &sysctl__debug_nred_uma_wired_budget,
             &sysctl__debug_nred_uma_metal_working_set, &sysctl__debug_nred_uma_metal_budget_pages,
             &sysctl__debug_nred_uma_metal_budget_queries,
@@ -1613,7 +1588,7 @@ namespace
             &sysctl__debug_nred_uma_pool_return_pieces, &sysctl__debug_nred_uma_pool_return_skips,
             &sysctl__debug_nred_uma_pool_large_requests, &sysctl__debug_nred_uma_pool_state,
             &sysctl__debug_nred_uma_pool_rekeyed, &sysctl__debug_nred_uma_pte_batches,
-            &sysctl__debug_nred_uma_pte_batched_entries, &sysctl__debug_nred_uma_pte_direct_calls,
+            &sysctl__debug_nred_uma_pte_batched_entries,
             &sysctl__debug_nred_uma_pte_fallbacks,
         };
         for (auto* const control : controls) { sysctl_register_oid(control); }
@@ -1634,8 +1609,8 @@ namespace
         gpu->setProperty("NRedUnifiedMemory", state);
         if (!ready()) { return; }
         gpu->setProperty("NRedUnifiedMemoryPoolBuckets", largeBuckets ? "large" : "native");
-        gpu->setProperty("NRedUnifiedMemoryHandBack", pooledHandBack && poolReturnAvailable && releasePTERouted);
-        gpu->setProperty("NRedUnifiedMemoryPTECoalescing", __atomic_load_n(&pteCoalesce, __ATOMIC_RELAXED) != 0);
+        gpu->setProperty("NRedUnifiedMemoryHandBack", pooledHandBack);
+        gpu->setProperty("NRedUnifiedMemoryPTECoalescing", poolCommit != nullptr);
     }
 
     UInt32* poolWiredTable{nullptr};
@@ -1824,14 +1799,9 @@ namespace
             {mapAtSymbol, mapAtAddress, originalMapAt},
         };
         const auto memoryRelease = image.resolve(memoryReleaseSymbol);
-        const auto sharedReleaseEntry = image.resolve(sharedReleaseSymbol);
-        UInt8 sharedHead[8]{}, pruneHead[8]{};
-        if (sharedReleaseEntry != 0 && image.contains(sharedReleaseEntry, sizeof(sharedHead))
-            && image.contains(prune, sizeof(pruneHead)))
-        {
-            memcpy(sharedHead, reinterpret_cast<const void*>(sharedReleaseEntry), sizeof(sharedHead));
-            memcpy(pruneHead, reinterpret_cast<const void*>(prune), sizeof(pruneHead));
-        } else if (pooledHandBack) {
+        const auto sharedHead = image.head(sharedReleaseSymbol);
+        const auto pruneHead = image.head(pruneSymbol);
+        if (pooledHandBack && (sharedHead.address == 0 || pruneHead.address == 0)) {
             disablePooledPath("Shared release or prune entry not found; pooled hand-back disabled");
         }
         if (pooledHandBack
@@ -1849,11 +1819,8 @@ namespace
             const bool installed = image.install(shared, arrsize(shared)) && originalSharedRelease != 0
                                    && originalPrune != 0;
             // Lilu can report success after writing the trampoline without the jump; require both entries patched.
-            const bool patched = memcmp(reinterpret_cast<const void*>(sharedReleaseEntry), sharedHead, sizeof(sharedHead)) != 0
-                                 && memcmp(reinterpret_cast<const void*>(prune), pruneHead, sizeof(pruneHead)) != 0;
-            poolReturnAvailable = installed && patched;
-            if (!poolReturnAvailable) {
-                // Without the re-keying, dirty slots must not be produced at all.
+            if (!installed || !Image::patched(sharedHead) || !Image::patched(pruneHead)) {
+                // Without the re-keying, the pool must not exist: native hand-back would key dirty slots by task.
                 disablePooledPath("Shared release or prune route failed; pooled hand-back disabled");
             }
             // NootedRed's own prune calls (orphanBacking, mapAtAddress) bypass the route.
@@ -1924,7 +1891,6 @@ namespace
         if (!pteReady) {
             // Routes that did get installed pass everything through while coalescing is off.
             poolCommit = nullptr;
-            __atomic_store_n(&pteCoalesce, 0, __ATOMIC_RELAXED);
             SYSLOG("UnifiedMemory", "Page-table write coalescing unavailable");
         }
         if (!releasePTERouted && pooledHandBack) {
@@ -1950,6 +1916,12 @@ void X5000Memory::init()
 }
 
 bool X5000Memory::requested() { return enabledAtBoot; }
+
+bool X5000Memory::managesX5000(const mach_vm_address_t slide, const size_t size)
+{
+    return requested() && ioReady && NRed::singleton().getAttributes().isRenoir()
+           && verifiedImage(slide, size, x5000UUID);
+}
 
 void X5000Memory::patchMetalBudgetPage(const char* const file, const UInt64 offset, const void* const page)
 {

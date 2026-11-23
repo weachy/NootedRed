@@ -33,8 +33,9 @@ descriptor through `newResourceWithClientBuffer`. The policy checks that the res
 layout, comes from a client buffer, belongs to the same GPU task, and that the task has a per-task page table. The
 native upload and synchronization code then writes the data into the unified memory primary.
 
-With unified memory on, special allocations keep the native VRAM allocator and the extended `allocateLargeBlocks`
-is not installed. The existing OpenGL low-VRAM budget fix stays as the fallback.
+When unified memory installs on AMDRadeonX5000, special allocations keep the native VRAM allocator and the extended
+`allocateLargeBlocks` is not installed. If it does not install (unsupported build or device), the extended allocator
+is installed as without the boot argument. The existing OpenGL low-VRAM budget fix stays as the fallback.
 
 ## Residency and reclaim
 
@@ -76,15 +77,14 @@ barrier wait fell to 0.06 ms, but WindowServer kernel CPU time per run rose from
 the light animation from 16% to 34%. A write-combined mapping caused GPU page protection faults. Linux amdgpu also
 updates the graphics page tables of Renoir with SDMA.
 
-Runs of single-page PTE updates are coalesced for unified memory backings. Other GPUs driven by `AMDRadeonX5000`,
-such as a Vega card next to the APU, keep the native writer. Inside `AMDHWVMContext::mapVA`, single-entry updates
-of consecutive PTEs from `mapVMPT` are staged and written as one SDMA `WRITE_LINEAR` packet with two dwords per
-entry, as in amdgpu's `sdma_v4_0_vm_write_pte`. The thread flushes its staged entries before any other reservation or commit on
-the same command pool and when the outermost `mapVMPT` returns, so the pool holds every packet when `mapVA` ends.
-If a large reservation fails, the entries go to the native single-entry writer. SDMA stays the only page table
-writer, and `unmapVA` keeps the native path. A 64 MiB texture needs about 190,000 dwords of PTE packets. The GPU job
-wait on the page table barrier drops from about 11 ms to 2-3 ms. Counters: `pte_batches`, `pte_batched_entries`,
-`pte_fallbacks`.
+Runs of single-page PTE updates are coalesced for unified memory backings. Other GPUs driven by `AMDRadeonX5000`, such
+as a Vega card next to the APU, keep the native writer. Inside `AMDHWVMContext::mapVA`, single-entry updates of
+consecutive PTEs from `mapVMPT` are staged and written as one SDMA `WRITE_LINEAR` packet with two dwords per entry, as
+in amdgpu's `sdma_v4_0_vm_write_pte`. The thread flushes its staged entries before any other reservation or commit on
+the same command pool and when the outermost `mapVMPT` returns, so the pool holds every packet when `mapVA` ends. If a
+large reservation fails, the entries go to the native single-entry writer. SDMA stays the only page table writer, and
+`unmapVA` keeps the native path. A 64 MiB texture needs about 190,000 dwords of PTE packets. The GPU job wait on the
+page table barrier drops from about 11 ms to 2-3 ms. Counters: `pte_batches`, `pte_batched_entries`, `pte_fallbacks`.
 
 ## Mapping reuse
 
@@ -198,8 +198,13 @@ WindowServer kernel CPU time. Wiring a new large texture happens under the accel
 create/release loop, WindowServer was blocked on that lock for 151 ms in total (longest 26.6 ms). With the pool and
 hand-back it was 17 ms (longest 3.1 ms).
 
+If any route of the pooled path (the shared release, prune or PTE release route) cannot be verified, no pool is
+created and every backing takes the pageable path. Natively returned descriptors are keyed by task, and without the
+re-keying a later task at the same address could receive them.
+
 Counters: `pool_allocations` (backings served by the pool), `pool_returns`, `pool_return_pieces`,
-`pool_return_skips`, `pool_large_requests` (requests above 24 MiB), `pool_rekeyed` and `pool_state`.
+`pool_return_skips` (dying backings the hand-back checks declined; they are freed the native way),
+`pool_large_requests` (requests above 24 MiB), `pool_rekeyed` and `pool_state`.
 
 `pageon` keeps the driver's native VRAM staging when it needs a temporary copy. A pageable staging route was
 removed, because the native staging branch was never reached during the animation benchmark and all probes.
@@ -216,10 +221,12 @@ and PTE coalescing are on by default with it. To roll back, remove the argument.
   Renoir-family GPU`). While active, `NRedUnifiedMemoryPoolBuckets` is `large` or `native`, and
   `NRedUnifiedMemoryHandBack` and `NRedUnifiedMemoryPTECoalescing` show whether those parts are on.
 - The read-only `debug.nred_uma` sysctls report the state and the counters the probes use. `active` is `1` once the
-  driver routes are installed, and `pool_state` reads `none` until the pool exists. `pool_large_requests`,
-  `pool_returns` and `pte_batches` grow only while the large buckets, hand-back and PTE coalescing are in use.
-  NootedRed also logs `Creating the native buffer pool` and `Large buffer pool buckets installed`, but on the test
-  machine these lines did not reach the unified log.
+  driver routes are installed. `pool_state` reads `none` until the first pooled allocation or hand-back samples the
+  pool. `pool_large_requests`, `pool_returns` and `pte_batches` grow only while the large buckets, hand-back and PTE
+  coalescing are in use. `allocation_failures` counts pageable backings that could not be allocated, and
+  `scanout_denials` counts system memory resources refused for direct scanout.
+- NootedRed also logs `Creating the native buffer pool` and `Pooled hand-back on, buffer pool buckets large`, but on
+  the test machine these lines did not reach the unified log.
 - `nred-uma-wired-mib=<MiB>` lowers the residency budget, for example `768` to trigger native reclaim in tests.
   Below `4096` it also keeps the native pool buckets.
 
@@ -263,6 +270,8 @@ sysctl debug.nred_uma
   resolution, then reads them back. Combine it with `--surface-ipc` to cover IOSurfaces mapped into two processes
   before the reconnect. Check on the panel that the picture was visible before unplugging and that the desktop
   comes back and updates.
+- `--single-dispatch` (with `--groups 36` or more) reads 36 render targets (576 MiB) in one compute dispatch, so a
+  single command references more than a 512 MiB carve-out.
 - `--baseline` runs the readback without unified memory, for a boot without `-NRedUnifiedMemory`.
 
 The driver counters are per device and include other processes on the same device.
@@ -319,10 +328,10 @@ Test machine: Renoir `0x1636`, 64 GiB RAM, 4K 10-bit DisplayPort display, macOS 
 
 ### This branch (2026-11-23)
 
-Kext `FE9FAF85`, built from commit `23b1302` of this branch, in two boots: one without `-NRedUnifiedMemory`, one
-with it. In the second boot the pool and coalescing were switched off for the middle phase with runtime switches
-that a later commit removed. All runs start a few minutes after login, and such runs differ by about 5 points
-between boots.
+Kext `FE9FAF85`, built from the pool and coalescing commit of this branch, in two boots: one without
+`-NRedUnifiedMemory`, one with it. In the second boot the pool and coalescing were switched off for the middle phase
+with runtime switches that a later commit removed. All runs start a few minutes after login, and such runs differ by
+about 5 points between boots.
 
 | | flag off | on | on, pool and coalescing off |
 | --- | --- | --- | --- |
@@ -337,18 +346,19 @@ between boots.
 - Without the flag, the `debug.nred_uma` sysctls are absent, the Metal and OpenGL baseline readbacks pass, and the
   GPU was not reset. Creating a texture is faster in the carve-out because nothing has to be wired, but the
   animations run into the full carve-out.
-- With the flag, the defaults read `1 1 1` and all probes passed, including the 736-group pressure case. The
+- With the flag, the pool, hand-back and coalescing were on and all probes passed, including the 736-group pressure
+  case. The
   cross-process check found the marker in 0 of 8 textures while the same-process control saw reuse in 4 of 4.
   `pool_return_skips` and `pte_fallbacks` stayed at 0. Accelerator wired memory (live resources, without idle pool
   descriptors) was 438 MB after 60 s idle and 449 MB after the probes.
 
-The build without the switches (kext `4D2DE009`, commit `13942cd`) was checked in one more boot with the flag on:
+The build without the switches (kext `4D2DE009`) was checked in one more boot with the flag on:
 64 MiB create to release 7.94 ms, 16 MiB 2.23 ms, all probes passed including the pressure case, and the
 cross-process check found 0 of 8 markers with 4 of 4 in the control. In that boot 2727 backings were handed back
 and one was skipped: `returnPooledDescriptors` declined it (purgeable state, an extra reference or an attached
 resource), and the backing was freed the native way instead.
 
-The build that picks the buckets by RAM (kext `84A993E8`, commit `b620a28`) was checked in two more boots, both with
+The build that picks the buckets by RAM (kext `84A993E8`) was checked in two more boots, both with
 the flag on. The external display had gone offline the evening before, after display sleep, and was not detected in
 these boots, so WindowServer ran on a virtual 1280x1024 display. The probes are valid; the animation runs recorded
 no display transactions and are not reported.
@@ -366,8 +376,8 @@ All probes passed in both boots: readback with surfaces, cross-process IOSurface
 Managed resources, OpenGL smoke, VBO and full cases, a 5 GiB reclaim run against the 4 GiB budget, and the 23 GiB
 pressure case with the default budget. `pool_return_skips` and `pte_fallbacks` stayed at 0.
 
-The build that limits PTE coalescing to unified memory backings and publishes the registry state (kext `EE30E22B`,
-commit `71d9eeb`) was checked in one boot with default boot arguments. The registry showed `active`, `large`, and
+The build that limits PTE coalescing to unified memory backings and publishes the registry state (kext `EE30E22B`)
+was checked in one boot with default boot arguments. The registry showed `active`, `large`, and
 hand-back and coalescing on. 64 MiB create to release took 7.89 ms and 16 MiB 2.08 ms, about 178,000 coalesced
 packets were written, and the cross-process check found 0 of 8 markers (control 4 of 4). The managed, OpenGL and
 23 GiB pressure probes passed. The purgeable probe failed once while the external display came back online during
