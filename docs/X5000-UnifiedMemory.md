@@ -1,74 +1,225 @@
-# X5000 统一内存接入
+# X5000 Unified Memory (Renoir)
 
-## 应用如何用上
+With `-NRedUnifiedMemory`, the Renoir accelerator places textures, IOSurface device caches and data buffers in
+pageable system memory instead of the firmware carve-out (512 MiB on the test machine). Metal, OpenGL and
+WindowServer keep using the normal system APIs. The code is in `NootedRed/X5000Memory.cpp`, `X5000Memory.hpp` and
+`X5000MemoryPolicy.hpp`. The probes and the policy test are in `tools/`.
 
-NootedRed 启动时接入 `IOAcceleratorFamily2` 的资源分配和 `AMDRadeonX5000` 的 GPU 映射。Metal、OpenGL 和 WindowServer 照常调用系统 API。符合条件的缓冲区、纹理和离屏表面由 `IOAccelSysMemory` 提供可分页系统内存 backing，X5000 为对应 GPU 任务保留 GPU VA，并在提交时准备 backing。原生离屏缓存和 IOSurface 设备缓存共用放置策略，该策略检查任务页表、资源布局和系统内存描述符。IOSurface 纹理别名跟随同一个缓存拥有者，沿用原生 CPU/GPU 同步。直接 scanout、外部设备布局和由内核创建独立辅助描述符的分配走硬件原生路径。Metal 驱动附在普通纹理分配内、通过同一 GPU VA 访问的 DCC 数据随纹理一起分页。
+The feature is off by default. It installs only on Renoir-family devices, and only when the loaded
+`IOAcceleratorFamily2` (UUID `6C4A16B1-66DC-3A8B-9F0B-D3E027B16EB1`) and `AMDRadeonX5000` match macOS 26.7.2
+(`25G332`). On any other build it logs `Unsupported ... ABI` and the native behavior stays in place.
 
-OpenGL 的线性顶点缓冲区也可以走可分页主分配。驱动通过 `newResourceWithClientBuffer` 导入原生系统内存描述符。放置策略核对资源无纹理格式和布局、来源是客户端缓冲区、GPU 任务归属匹配且已建立每任务页表。满足这些条件时，原生上传及同步逻辑把数据写入统一内存主分配。
+## Placement
 
-达到驻留预算时，原生 LRU 只回收没有正在准备的引用且 GPU 事件已结束的系统内存。`IOAccelSysMemory::unwire` 撤掉 PTE，保留映射对象与 GPU VA，再解除对物理页的锁定。后续提交可以把同一 backing 重新映射到原 GPU VA。资源级 `pageoff` 涉及 backing 迁移和 blit，有独立的验收项。
+NootedRed hooks resource allocation in `IOAcceleratorFamily2` and GPU mapping in `AMDRadeonX5000`. Eligible primary
+allocations get an `IOAccelSysMemory` backing of pageable system memory. X5000 reserves the GPU VA in the task's page
+table and prepares (wires) the backing at submission. One placement policy covers native offscreen caches and
+IOSurface device caches. It checks the task page table, the resource layout and the system memory descriptor.
+IOSurface texture aliases follow the cache owner and keep the native CPU/GPU synchronization.
 
-应用同步请求 `Volatile` 或 `Empty` 时，原生资源方法先处理保留状态和缓存有效位。`Empty` 要求立即丢弃：没有 prepare 引用且 GPU 事件全部结束时，统一内存调用原生 `unwire` 撤掉 PTE 并释放物理页。`Volatile` 只表示允许在内存压力下丢弃，统一内存保留 wired backing，由原生 LRU 在驻留预算压力时回收，避免 WindowServer 在窗口/全屏过渡中刚标记 `Volatile` 又立即重新 `wire`。`purge_unwires` 记录由 `Empty` 请求触发的解除锁页次数。
+These allocations stay on the native carve-out path:
 
-本机 `25G332` 的 `IOAcceleratorFamily2`（UUID `6C4A16B1-66DC-3A8B-9F0B-D3E027B16EB1`）中，该钩子的调用点位于 `set_resource_purgeable` 的 `lock_busy` 和 `unlock_busy` 之间。原生 LRU 的非阻塞回收路径也在 `unwire` 前检查 prepare 计数和 GPU 事件完成状态。
+- direct scanout surfaces. `getDisplayPipeTransactionFlip` also refuses a system memory surface, because an offscreen
+  IOSurface cache can reach a flip;
+- external device layouts;
+- allocations for which the kernel creates separate auxiliary descriptors, such as OpenGL MSAA and depth/stencil;
+- fixed-address resources.
 
-Metal 客户端用 wired 上限的四分之三作为建议工作集，命令分段阈值取建议工作集的一半，供多个命令和系统图形客户端共享驻留余量。OpenGL 通过同一个设备配置接口取得命令资源列表的预算，按建议工作集的一半计算。两个预算只发布给已启用统一内存的目标 Renoir 设备，物理 carve-out 容量单独报告。OpenGL 设备没有收到预算时，资源列表使用原有兼容策略。
+DCC metadata that the Metal driver places inside a normal texture allocation, and reaches through the same GPU VA,
+pages together with the texture.
 
-`mac-gfx-research/AppleIntelTGLGraphics_hlil.c` 中，`IGMemoryManager` 分别管理保留内存、全局 GTT 和页表节点池。`IGPagePool` 为 `IGHardwarePerProcessPageTable64` 供给页表页，`IGAccelSysMemory` 管理资源的系统内存 backing，`IGAccelMemoryMap` 分别分配 GPU VA 和提交页表。X5000 路径沿用这个分工，分别接入 macOS 的可分页描述符和 AMD 的每任务页表。Intel 驱动在提交映射时由 CPU 写系统内存中的页表，TLB 失效命令随同一条命令流发出。
+OpenGL linear vertex buffers can also use a pageable primary allocation. The driver imports a native system memory
+descriptor through `newResourceWithClientBuffer`. The policy checks that the resource has no texture format or
+layout, comes from a client buffer, belongs to the same GPU task, and that the task has a per-task page table. The
+native upload and synchronization code then writes the data into the unified memory primary.
 
-### 页表
+With unified memory on, special allocations keep the native VRAM allocator and the extended `allocateLargeBlocks`
+is not installed. The existing OpenGL low-VRAM budget fix stays as the fallback.
 
-页表保留在原生 carve-out 中，由 `AMDHWVMM` 分配，并经 SDMA 更新。X5000 用 `PTE_PDE` 命令写页表项，一条命令覆盖一段物理连续的内存。可分页系统内存逐页分散，每页需要一条命令。WindowServer 不断删除并重建引用同一 IOSurface 缓存的资源。同一任务对同一 backing 只有一个 `IOAccelMemoryMap`，由引用它的资源共用，最后一个资源删除时映射随之释放，下一个资源再新建。`commit_pte` 和 `release_pte` 每次都写入或清除整个映射。2026 年 11 月 22 日的跟踪中，WindowServer 每秒向页表队列提交约 900 个写满的命令缓冲区。轻量动画期间，图形提交在调度器中停留的中位数为 6.5 ms，其中约一半在等页表屏障。关闭统一内存时，WindowServer 的 GPU 工作在提交后约 0.05 ms 开始执行。
+## Residency and reclaim
 
-同日试验过由 CPU 写系统内存中的叶页表。`AMDHWVMContext::clearWithDMA` 的异步清零会覆盖先完成的 CPU 写入，因此叶页的全部写入都要由 CPU 完成。GPU 读页表时不探查 CPU 缓存，写回缓存的叶页需要逐行刷新。逐行刷新后屏障等待降至 0.06 ms，但 WindowServer 的内核 CPU 时间从每轮 6.2 s 增至 11.7 s，轻量动画的长帧比例由 16% 升至 34%。写合并映射出现 GPU 页保护错误。Linux amdgpu 在 Renoir 上同样用 SDMA 更新图形任务的页表，因此该方案已移除，相关数据位于 `build/uma-cpupt3-20261122` 和 `build/uma-wcpt-20261122`。
+When the residency budget is reached, the native LRU reclaims only system memory that has no pending prepare
+reference and whose GPU events have completed. `IOAccelSysMemory::unwire` removes the PTEs, keeps the mapping object
+and the GPU VA, and unwires the pages. A later submission maps the same backing back to the same GPU VA.
+Resource-level `pageoff` involves backing migration and blits and is tested separately.
 
-映射复用见下文。仍需新建的散页映射由统一内存合并写入。线程进入 `AMDHWVMContext::mapVA` 后，`mapVMPT` 内对连续页表项的单项更新先暂存，再写成一条 SDMA `WRITE_LINEAR` 命令，每项 2 个双字，做法同 amdgpu 的 `sdma_v4_0_vm_write_pte`。同一线程在该命令池上的其他预留或提交之前、最外层 `mapVMPT` 返回时都先写出暂存项，因此 `mapVA` 结束更新时池内已有全部命令。大命令预留失败时逐项交给原生写入。SDMA 仍是唯一的页表写入者，撤销映射（`unmapVA`）照旧走原生写入。64 MiB 纹理的页表命令约 19 万个双字，GPU 任务在调度器中等页表屏障约 11 ms；合并后这段等待降至 2–3 ms。`pte_batches`、`pte_batched_entries` 和 `pte_fallbacks` 记录合并写入。
+For purgeable requests the native resource methods first handle the retained state and the cache valid bits.
 
-### 原生缓冲池
+- `Empty` asks for an immediate discard. When the backing has no prepare reference and all GPU events have
+  completed, unified memory calls the native `unwire`, which removes the PTEs and releases the pages
+  (`purge_unwires`).
+- `Volatile` only allows a discard under memory pressure. The backing stays wired and the native LRU reclaims it
+  when the residency budget requires it. WindowServer marks surfaces `Volatile` during window and full-screen
+  transitions and often uses them again right away, so unwiring them at once would cause a rewire.
 
-`IOAcceleratorFamily2` 为以系统内存为主存储的 GPU 提供 `IOAccelBufferMemoryDescriptorPool2`。`IOGraphicsAccelerator2::start` 只在驱动配置的 `0xc90` 第 21 位置位时建池，AMD 驱动不置该位。统一内存在同一检查点为 Renoir 加速器建池，不改动该配置位，因此其他依赖该位的原生行为保持不变。
+In `25G332` the hook sits between `lock_busy` and `unlock_busy` in `set_resource_purgeable`. The native non-blocking
+LRU path also checks the prepare count and the GPU events before `unwire`.
 
-原生池按五档缓存已锁页的可分页、可丢弃描述符，每档预填 24 块，单次请求上限是首档块大小乘以 24。原生首档为 1 MiB，上限 24 MiB，而 WindowServer 在 10-bit 全屏切换时新建的半浮点纹理为 25–64 MiB。统一内存在 `IOAcceleratorFamily2` 加载时、建池之前改写档位表 `sWiredPoolInfo` 和 `sPurgeablePoolInfo`，五档改为 4 MiB、1 MiB、256 KiB、64 KiB 和 4 KiB，上限变为 96 MiB。请求在栈上最多拼 64 个描述符且原生代码不检查边界，新档位下 96 MiB 以内最多 47 个。改写前核对 `initWithAccelerator` 与 `newWiredDescriptorsWithLength` 中的取表指令、预填常量、上限判断和栈数组大小，任一不符则保持原生档位；后续检查失败时写回原表。统一内存的主分配和数据缓冲区经 `IOAccelSysMemory::withOptions` 的原生池路径取得预先锁页的描述符组合。超出上限或池中无可用描述符时走原有可分页路径。非统一内存的系统内存分配不经过池。池的补充和清零由原生定时器在加速器锁内完成，每处理一块检查一次等锁者。
+## Budgets
 
-原生只在 `IOAccelSysMemory::orphanIt` 中把描述符退回池，而池化 backing 几乎都在 `IOAccelMemory::release` 中结束：映射事件完成后，它直接调用 `pruneOrphanedMappings`，随后释放 backing。统一内存在该调用点（`release+0xa6`）和自己的 `orphanIt` 路由中接管：清理孤儿映射前给 backing 加一次锁页计数，避免最后一次 `release_pte` 把整组描述符解锁；收集这些映射撤销页表时 `AMDHWVMContext` 的页表更新事件（`context+0x40`，SDMA 页表队列上覆盖清表和 TLB 失效的 stamp）；backing 确定销毁时按 `orphanIt` 的做法调用 `releaseDescriptors`，把描述符连同该事件放回池中。同一任务可以直接复用这些脏描述符，事件随新资源继承；交给其他任务前，原生定时器要等事件完成并清零。任务的 `IOAccelShared2` 释放时，统一内存先把该任务名下的脏描述符改挂到 `kernel_task`，此后只能清零后复用，避免新任务复用同一任务地址时取到旧内容。每个 backing 只退回一次。空闲时首档常驻约 24–32 块，加上其他档位共约 190 MiB 锁页，另约 190 MiB 以 Volatile 状态保留，可由 VM 回收。
+Metal clients get three quarters of the wired limit as the recommended working set, and half of that as the command
+segmentation threshold, so several command buffers and the system graphics clients share the headroom. OpenGL gets
+its command resource list budget, half of the recommended working set, through the same device config interface.
+Both budgets are published only for the Renoir device with unified memory on. The physical carve-out size is
+reported separately. An OpenGL device that does not receive a budget keeps the existing compatibility policy.
 
-改动前，WindowServer 每次创建或销毁窗口缓存都要新建可分页内存、逐页缺页清零并锁页，释放时再解锁。2026 年 11 月 22 日的内核栈采样中，锁页和解锁分别占 WindowServer 内核 CPU 时间的 15.5% 和 13.5%。新建大纹理时的锁页发生在加速器锁内：跑 64 MiB 和 16 MiB 的创建释放时，WindowServer 在这把锁上累计阻塞 151 ms，单次最长 26.6 ms；启用池和退回后分别为 17 ms 和 3.1 ms。`pool_allocations` 记录由池直接提供的 backing 数，`pool_returns`、`pool_return_pieces` 和 `pool_return_skips` 记录退回，`pool_large_requests` 记录 24 MiB 以上的池请求，`pool_rekeyed` 记录改挂的脏描述符，`pool_state` 给出各档锁页、可丢弃和脏描述符数。
+## Page tables
 
-### 映射复用
+Page tables stay in the carve-out. `AMDHWVMM` allocates them and SDMA updates them. X5000 writes them with `PTE_PDE`
+packets, one packet per physically contiguous range. Pageable system memory is scattered page by page, so each page
+needs its own packet.
 
-`IOAccelMemoryMap` 的页表项提交后会给所属 backing 增加一次锁页引用，`release_pte` 时减去。WindowServer 删除资源时，该任务对同一 backing 的最后一个映射随之释放，页表项被清除，锁页引用归零后 backing 立即解锁。几十毫秒后新资源引用同一 IOSurface 缓存，又要新建映射、分配 GPU VA、重新锁页并重写全部页表项。2026 年 11 月 22 日的跟踪中，25 秒内 3228 次解锁有 3043 次来自这种映射释放。
+A CPU-written leaf page table was tried and dropped. The asynchronous clear in `AMDHWVMContext::clearWithDMA`
+overwrites CPU writes that finish earlier, so every leaf write would have to come from the CPU. The GPU does not
+snoop the CPU cache for page tables, so write-back leaf pages need a flush per cache line. With the flushes the
+barrier wait fell to 0.06 ms, but WindowServer kernel CPU time per run rose from 6.2 s to 11.7 s and long frames in
+the light animation from 16% to 34%. A write-combined mapping caused GPU page protection faults. Linux amdgpu also
+updates the graphics page tables of Renoir with SDMA.
 
-`IOAcceleratorFamily2` 已有对应机制。`IOAccelMemory::setFlags(2)` 置位后，`IOAccelMemoryMap::release` 把任务的最后一个映射连同 GPU VA 和已提交的页表项移到任务的孤儿列表。`createMappingInTaskAtAddressLength` 为同一任务重新映射同一 backing 时直接取回该映射，`prepare` 见页表项仍有效便不再提交。AMD 驱动不开启这一机制，统一内存为纹理、表面缓存和数据缓冲区的主 backing 开启。
+Runs of single-page PTE updates are coalesced. Inside `AMDHWVMContext::mapVA`, single-entry updates of consecutive
+PTEs from `mapVMPT` are staged and written as one SDMA `WRITE_LINEAR` packet with two dwords per entry, as in
+amdgpu's `sdma_v4_0_vm_write_pte`. The thread flushes its staged entries before any other reservation or commit on
+the same command pool and when the outermost `mapVMPT` returns, so the pool holds every packet when `mapVA` ends.
+If a large reservation fails, the entries go to the native single-entry writer. SDMA stays the only page table
+writer, and `unmapVA` keeps the native path. A 64 MiB texture needs about 190,000 dwords of PTE packets. The GPU job
+wait on the page table barrier drops from about 11 ms to 2-3 ms. Counters: `pte_batches`, `pte_batched_entries`,
+`pte_fallbacks`.
 
-不置该标志时，原生代码也会把 GPU 工作尚未完成的映射移入孤儿列表，置位后空闲映射同样保留。
+## Mapping reuse
 
-孤儿映射保留锁页引用，回收沿用原生路径。GART 回收器每 250 ms 检查一次，按 20 s、10 s、5 s 三档空闲时间解锁不再使用的 backing，三档分别在锁页总量超过 32 MiB、内存的 1/16 和 1/8 时生效。`unwire` 清除该 backing 全部映射的页表项，包括孤儿映射，映射对象和 GPU VA 保留到复活或释放。统一内存对非 IOSurface 纹理和数据缓冲区的 `Empty` 请求，在 prepare 计数为零且 GPU 事件完成时立即经 `unwire` 解锁，其余情况由原生代码记录状态。任务 GPU VA 不足时，`freeWaitToAllocGPUAddress` 先回收孤儿映射。长期存活的 backing 的孤儿映射没有单独的数量或时间上限，GPU VA 保留到 backing 释放、VA 不足或任务退出。
+A committed `IOAccelMemoryMap` holds a wire reference on its backing until `release_pte`. WindowServer keeps deleting
+and re-creating resources that refer to the same IOSurface cache. A task has one map per backing, shared by the
+resources that use it. Deleting the last resource freed the map, cleared the PTEs and unwired the backing. Tens of
+milliseconds later the next resource allocated a new map and GPU VA, wired the backing again and rewrote every PTE.
+In a 25 s trace on 2026-11-22, 3043 of 3228 unwires came from this.
 
-backing 只剩孤儿映射引用时，已无对象能复活这些映射，原生代码调用 `IOAccelSysMemory::orphanIt`。池化 backing 在这里把描述符退回池中，而孤儿映射的页表项可能仍然有效。统一内存在调用 `orphanIt` 前，按 `IOAccelMemory::release` 的做法先释放 GPU 事件已完成的孤儿映射。若全部释放，backing 随之销毁，不再进入孤儿池。仍有 GPU 工作的映射按原生规则保留。同一任务可以先取回这些描述符，并继承合并后的 GPU 事件，该事件只覆盖旧的 GPU 工作，旧页表项的清除和 TLB 失效顺序尚未实测。原生驱动对忙碌映射本来就走这条路径。2026 年 11 月 22 日在未置位的构建上跟踪 12 秒，WindowServer 取回孤儿映射 1560 次，其中 1527 次页表项仍然有效。
+`IOAcceleratorFamily2` already has a mechanism for it. After `IOAccelMemory::setFlags(2)`,
+`IOAccelMemoryMap::release` moves the task's last map, with its GPU VA and committed PTEs, to the task's orphan
+list. `createMappingInTaskAtAddressLength` revives it when the same task maps the same backing again, and `prepare`
+skips the commit while the PTEs are still valid. The AMD driver does not use this. Unified memory enables it for the
+primary backings of textures, surface caches and data buffers. Without the flag, the native code already orphans
+maps whose GPU work has not finished.
 
-映射查找只按任务匹配，不比较请求的 GPU 地址。原生代码为固定地址建立映射后会清除该标志，但已有的孤儿映射仍可能被取回。统一内存在固定地址请求前先释放该 backing 中 GPU 事件已完成的孤儿映射。统一内存的主分配本身不接受指定地址的资源。
+Orphans keep their wire reference and are reclaimed by the native paths. The GART collector runs every 250 ms and
+unwires backings idle for 20 s, 10 s or 5 s once total wired memory exceeds 32 MiB, 1/16 or 1/8 of RAM. `unwire`
+clears the PTEs of every map of the backing, orphans included. The map objects and the GPU VA remain until they are
+revived or freed. When a task runs short of GPU VA, `freeWaitToAllocGPUAddress` frees orphans first. Orphans of a
+long-lived backing have no separate count or age limit.
 
-2026 年 11 月 22 日 kext `8C62ED5A` 单次开机验收（`build/uma-mapreuse-20261122`），与当天开启统一内存的旧构建相比：每轮动画测试的页表提交由 4741 次降至 1686 次，WindowServer 的页表命令缓冲区由 33758 个降至 4519 个，中位长度由 4080 降至 602 个双字。轻量动画中图形提交的调度停留时间中位数由 6.47 ms 降至 0.01 ms，p90 由 18.5 ms 降至 0.50 ms。超过 25 ms 的帧间隔比例：轻量动画 2.0%（旧构建约 15%，关闭统一内存 2.5%），调度中心和全屏 16.9%（旧构建约 26%，关闭统一内存 54%），全部系统场景 7.3%（旧构建约 20%）。锁页总量测试期间最高约 490 MB，23 GiB 压力探针后回落到 2 MB。全部正确性探针通过，未出现 GPU 重置。
+Two native paths need extra handling:
 
-池中的 backing 收到 `Empty` 请求时同样立即解锁。描述符退回池时，原生代码丢弃已清空的描述符。
+- When only orphans reference a backing, the native code calls `IOAccelSysMemory::orphanIt`. For a pooled backing
+  this returns the descriptors to the pool while orphan PTEs may still be valid. Unified memory first releases the
+  orphans whose GPU events have completed, as `IOAccelMemory::release` does. If all of them go, the backing is
+  destroyed instead of orphaned. Busy maps stay orphaned, as in the native code. The same task can then take the
+  descriptors back and inherits the merged GPU event. That event covers the old GPU work. The ordering against the
+  clear of the old PTEs and the TLB invalidation has not been measured.
+- Orphan lookup matches the task only, not the requested GPU address. The native code clears the flag after it
+  creates a fixed-address map, but an existing orphan could still be revived. Unified memory releases the idle
+  orphans of the backing before a fixed-address request. Unified memory primaries never hold fixed-address
+  resources.
 
-`pageon` 需要临时复制时沿用驱动原生的显存 staging。2026 年 11 月 22 日在动画测试和全部探针期间跟踪 `pageon`，其 staging 分支一次也未进入，此前 138 份计数器记录中可分页 staging 同样从未触发，因此该路由已移除。
+On 2026-11-22 (kext `8C62ED5A`), compared with the unified memory build without mapping reuse: PTE commits per
+animation run fell from 4741 to 1686, WindowServer page table command buffers from 33758 to 4519 (median length 4080
+to 602 dwords), and the median scheduler hold of graphics submissions in the light animation from 6.47 ms to
+0.01 ms (p90 18.5 ms to 0.50 ms).
 
-## 启动配置
+## Native buffer pool
 
-该版本的路由限于 Renoir 和 macOS 构建 `25G332` 对应的两个 kext UUID。本机从系统 EFI 的 `EFI/OC/Kexts/NootedRed-UMA.kext` 启动，`Kernel → Add` 中将 `Lilu.kext` 排在它前面。
+For GPUs that use system memory as primary storage, `IOAcceleratorFamily2` provides
+`IOAccelBufferMemoryDescriptorPool2`. `IOGraphicsAccelerator2::start` creates it only when bit 21 of the driver
+config dword at `0xc90` is set, and the AMD driver does not set it. Unified memory creates the pool for the Renoir
+accelerator at the same check without changing the config bit, so the other native behavior tied to that bit stays
+unchanged.
 
-日用配置只需要 `-NRedUnifiedMemory`，扩展池、描述符退回和页表合并写入随之默认启用。`debug.nred_uma.active` 为 `1` 时驱动路由已安装，系统日志出现 `Creating the native buffer pool` 表示池已建立，`Large buffer pool buckets installed` 表示档位表已改写。每项功能只在其路由的入口确认已被改写后生效，否则自动关闭并保留原生行为。排查问题时可在运行中用 root 关闭单项：`debug.nred_uma.pool_large=0` 让 24 MiB 以上的请求改走可分页路径，`pool_return=0` 停止退回描述符，`pte_coalesce=0` 恢复逐项写页表；读出的值反映实际状态，重启后恢复默认。档位表在建池时生效，运行中不变。固件回滚入口为 `F9 → Boot from EFI File → \EFI\NRedBackup\OpenCore.efi`。
+### Buckets
 
-本机按默认配置使用原生驻留预算。预算回归测试可给测试 EFI 加 `nred-uma-wired-mib=768`，用较小的工作集触发原生回收。
+The pool keeps wired, pageable, purgeable descriptors in five buckets. The pool timer refills each bucket to 24
+descriptors (a constant in `initWithAccelerator`), and a request is capped at 24 times the first bucket size. The
+native first bucket is 1 MiB, so the cap is 24 MiB. WindowServer's 10-bit full-screen half-float textures are
+25-64 MiB.
 
-启用 `-NRedUnifiedMemory` 时，特殊分配沿用原生显存分配器，不安装扩展的 `allocateLargeBlocks`。OpenGL 的上游低显存预算修正提供兼容回退。旧版 RAM 分类放置、Metal 显存预算覆盖和 4K scanout 布局实验见分支 `codex/gpu-page-lifecycle-20261115` 的提交 `075a5d1`。
+Before the pool is created, unified memory rewrites `sWiredPoolInfo` and `sPurgeablePoolInfo` to buckets of 4 MiB,
+1 MiB, 256 KiB, 64 KiB and 4 KiB, which raises the cap to 96 MiB. A request gathers at most 64 descriptors in a stack
+array that the native code does not bounds-check. With the new buckets a request up to 96 MiB needs at most 47. The
+rewrite first verifies the table loads, the prefill constant, the cap check and the stack array size in
+`initWithAccelerator` and `newWiredDescriptorsWithLength`. On any mismatch the native buckets stay, and a later
+failed check writes the original tables back. Larger requests, or requests the pool cannot serve, take the existing
+pageable path. System memory allocations outside unified memory do not use the pool. Refill and zeroing run on the
+native timer under the accelerator lock, which checks for waiters after each descriptor.
 
-## 实机验收
+### Hand-back
 
-每轮记录 macOS 构建、源码提交及工作区改动、`kmutil showloaded` 中的 kext UUID、启动参数和测试前后计数器。下文引用的 `build/` 日志保存在本机，由 Git 忽略。
+Natively, descriptors return to the pool only from `IOAccelSysMemory::orphanIt`. Pooled backings almost always end
+in `IOAccelMemory::release` instead: once the mapping events complete, it calls `pruneOrphanedMappings` and frees
+the backing. Unified memory takes over that call site (`release+0xa6`) and its own `orphanIt` route:
 
-在仓库根目录构建探针并运行小规模读回。
+- it adds a wire reference before the prune, so the last `release_pte` does not unwire the whole descriptor set;
+- it collects the page table update event of the `AMDHWVMContext` whose mappings were released (`context+0x40`, the
+  SDMA stamp that covers the PTE clear and the TLB invalidation);
+- when the backing is destroyed, it calls `releaseDescriptors` as `orphanIt` does and returns the descriptors with
+  that event.
+
+The same task can reuse these dirty descriptors directly and inherits the event. Another task gets them only after
+the native timer has waited for the event and zeroed them. When a task's `IOAccelShared2` is released, unified
+memory re-keys that task's dirty descriptors to `kernel_task`. They are then zeroed before any reuse, so a new task
+that gets the same task address cannot receive old contents. Each backing is returned once.
+
+An `Empty` request on a pooled backing also unwires at once. The native code drops emptied descriptors when they
+return to the pool.
+
+### Footprint
+
+`releaseDescriptors` keeps a returned descriptor while its bucket holds fewer than its wired capacity plus its
+purgeable capacity. The capacities are the native ones, and the new 4 MiB bucket gets 32 wired and 32 purgeable.
+The pool can therefore keep about 400 MiB. On the test machine after a day of use, `pool_state` read
+`29/32/0 64/52/0 32/6/0 32/0/0 22/12/0` (wired/purgeable/dirty per bucket): about 190 MiB wired and 180 MiB
+purgeable.
+
+Only the purgeable part can be reclaimed by the VM. The timer refills buckets up to 24 but does not trim wired
+descriptors above that, and accelerator wired memory stayed at 436-455 MB after the 23 GiB pressure probe. That is
+0.3% of 64 GiB, and would be about 2.3% of an 8 GiB machine. A RAM-based cap is not implemented yet.
+
+### Effect
+
+Before the pool, each window cache create or destroy allocated pageable memory, faulted and zeroed it page by page,
+wired it, and unwired it on release. In a kernel stack sample on 2026-11-22, wire and unwire took 15.5% and 13.5% of
+WindowServer kernel CPU time. Wiring a new large texture happens under the accelerator lock. In a 64 MiB and 16 MiB
+create/release loop, WindowServer was blocked on that lock for 151 ms in total (longest 26.6 ms). With the pool and
+hand-back it was 17 ms (longest 3.1 ms).
+
+Counters: `pool_allocations` (backings served by the pool), `pool_returns`, `pool_return_pieces`,
+`pool_return_skips`, `pool_large_requests` (requests above 24 MiB), `pool_rekeyed` and `pool_state`.
+
+`pageon` keeps the driver's native VRAM staging when it needs a temporary copy. A pageable staging route was
+removed, because the native staging branch was never reached during the animation benchmark and all probes.
+
+## Configuration
+
+Add `-NRedUnifiedMemory` to the boot arguments. Lilu must load before NootedRed. The large pool buckets, hand-back
+and PTE coalescing are on by default with it. To roll back, remove the argument.
+
+- `debug.nred_uma.active` is `1` once the driver routes are installed. `debug.nred_uma.pool_state` reads `none`
+  until the pool exists, and `debug.nred_uma.pool_large` reads `1` only when the large bucket tables are installed.
+  NootedRed also logs `Creating the native buffer pool` and `Large buffer pool buckets installed`, but on the test
+  machine these lines did not reach the unified log, so use the sysctls to check.
+- Each part acts only after it has verified that its routes are in place. Otherwise it turns itself off and keeps
+  the native behavior.
+- These sysctls switch a part off at runtime (root). Reads report the effective state, and a reboot restores the
+  defaults:
+  - `debug.nred_uma.pool_large=0`: requests above 24 MiB take the pageable path;
+  - `debug.nred_uma.pool_return=0`: stop returning descriptors to the pool;
+  - `debug.nred_uma.pte_coalesce=0`: write PTEs one entry at a time.
+
+  The bucket tables are set when the pool is created and do not change at runtime.
+- `nred-uma-wired-mib=<MiB>` lowers the residency budget, for example `768` to trigger native reclaim in tests.
+
+## Testing
+
+Record for every run: the macOS build, the source commit and any local changes, the kext UUID from
+`kmutil showloaded`, the boot arguments, and `sysctl debug.nred_uma` before and after.
+
+Build the Metal probe and run a small readback from the repository root:
 
 ```sh
 xcrun clang -fobjc-arc -O2 -Wall -Wextra -Werror \
@@ -79,15 +230,35 @@ sysctl debug.nred_uma
 /tmp/x5000_uma_probe --groups 1 --require-budget --require-surfaces --surface-ipc --layouts
 ```
 
-保持 4K 桌面活动，运行 `/tmp/x5000_uma_probe --groups 36 --require-budget` 验证容量。用 768 MiB 驻留预算再运行 `/tmp/x5000_uma_probe --groups 36 --idle 10 --require-budget --require-reclaim --require-surfaces --surface-ipc` 验证回收。探针保留私有缓冲区和渲染目标，检查 `bytes_live` 增长超过 512 MiB 并逐字节校验 GPU 读回。回收测试要求 `same_va_recommits` 增长，并核对缓冲区 GPU VA。本机对象级核验脚本位于 `build/x5000-unified-memory-boot/reclaim-lifecycle.d`，追踪相同 backing 的 PTE 移除、解除锁页、重新锁页和原 VA 提交。`--require-surfaces` 检查可分页缓存计数。`--surface-ipc` 在施加内存压力前将同一 IOSurface 映射到两个进程，两边保留原纹理直到压力解除，并校验 GPU 写入和 CPU 重写后的可见性。`--layouts` 验证私有 heap 的缓冲区、颜色纹理和深度纹理，并验证带深度和模板附件的 4x MSAA resolve。驱动计数器按设备汇总。
+- Capacity: with a 4K desktop active, `--groups 36 --require-budget`.
+- Reclaim: boot with `nred-uma-wired-mib=768` and run
+  `--groups 36 --idle 10 --require-budget --require-reclaim --require-surfaces --surface-ipc`. The probe keeps
+  private buffers and render targets, checks that `bytes_live` grows by more than 512 MiB and verifies the GPU
+  readback byte by byte. Reclaim also requires `same_va_recommits` to grow and checks the buffer GPU VAs.
+- `--require-surfaces` checks the pageable cache counters. `--surface-ipc` maps one IOSurface into two processes
+  before the pressure, keeps the textures in both until the pressure ends, and checks GPU writes and CPU rewrites
+  from both sides.
+- `--layouts` covers private heap buffers, color and depth textures, and a 4x MSAA resolve with depth and stencil
+  attachments.
+- `--managed` uses `MTLStorageModeManaged` buffers and textures: CPU write, GPU readback, CPU sync after a GPU write,
+  and a second upload into the same resource.
+- `--purgeable` checks Metal purgeable states and their recovery, requires a rewrite and readback at the same buffer
+  GPU VA after `Empty`, and requires `purge_unwires` to grow. AMD Metal turns a `Volatile` request on a private
+  render target into `NonVolatile`; the probe then checks that the contents were kept.
+- `--seed` sets the first check byte, so parallel processes can use different data to check task isolation at the
+  same GPU VA.
+- `--hotplug 300` keeps the resources while the main external display goes offline and comes back at its original
+  resolution, then reads them back. Combine it with `--surface-ipc` to cover IOSurfaces mapped into two processes
+  before the reconnect. Check on the panel that the picture was visible before unplugging and that the desktop
+  comes back and updates.
+- `--baseline` runs the readback without unified memory, for a boot without `-NRedUnifiedMemory`.
 
-`--managed` 使用 `MTLStorageModeManaged` 缓冲区和纹理，校验 CPU 写入、GPU 读回、GPU 修改后的 CPU 同步，以及对原资源的再次上传。`--seed` 设置分配后的首个校验字节，便于并行进程用不同的数据验证相同 GPU VA 的任务隔离。
+The driver counters are per device and include other processes on the same device.
 
-`--purgeable` 校验 Metal 的可丢弃状态及其恢复，检查 `Empty` 后能在同一缓冲区 GPU VA 重写并读回，并要求 `purge_unwires` 增长。配合 `--managed` 验证 CPU 与 GPU 两份 backing。AMD Metal 在跟踪中把私有渲染目标的 `Volatile` 请求转换为 `NonVolatile`，探针对这一情况校验内容保留。
-
-`--hotplug 300` 保留原资源，等待外接主显示器离线再恢复到原分辨率，然后进行 GPU 读回。配合 `--surface-ipc` 同时验证重连前已在两个进程建立的 IOSurface 映射。外屏验收还需现场确认拔线前持续有画面、重连后桌面恢复，并且能看到画面变化。
-
-OpenGL 探针用单次绘制同时采样五张纹理，验证超过旧列表预算的命令和多组资源读回。正式用例在活动桌面下保留 816 MiB 的纹理，每次绘制引用 272 MiB。探针要求两个预算接入点生效、设备收到新预算、GPU 完成读回，并观察到超过 512 MiB 的 pageable 主 backing 增量。`--smoke` 用较小的纹理检查接入。
+The OpenGL probe samples five textures in one draw, which covers a command larger than the old resource list
+budget and several resource groups. The full case keeps 816 MiB of textures on an active desktop with 272 MiB per
+draw. It requires both budget hooks, the new device budget, a completed GPU readback and more than 512 MiB of
+pageable primary backing. `--smoke` uses smaller textures.
 
 ```sh
 xcrun clang -std=c17 -DGL_SILENCE_DEPRECATION -O2 -Wall -Wextra -Werror \
@@ -99,58 +270,110 @@ codesign -s - /tmp/x5000_uma_gl_probe
 /tmp/x5000_uma_gl_probe
 ```
 
-`--buffers` 为九个 64 MiB VBO 分别写入并读回首尾标记。对纹理模式或 `--buffers` 加 `--wait-for-pressure` 时，探针保留原资源，收到标准输入的一行空行后重新读取。VBO 用例随后从 CPU 更新原缓冲区并校验 GPU 可见性。驻留验证需要配合映射跟踪核对每个 backing，统计接口的计数包含同一设备上的其他进程。
+`--buffers` writes nine 64 MiB VBOs and reads back their first and last markers. With `--wait-for-pressure` the
+probe keeps the resources and reads them again after an empty line on standard input. The VBO case then updates the
+buffers from the CPU and checks that the GPU sees the update.
 
-### 合并后的验收状态
+`python3 tools/test_x5000_memory_policy.py` checks the placement policy, the residency state transitions and the
+budget calculation on the host.
 
-新构建需重跑本节全部用例，并观察到 `pool_allocations` 增长。以下实机记录对应各自标注的旧构建。
+## Results
 
-新构建的实机验收需重跑本节读回和回收用例。整机睡眠恢复、实际 GPU 重置和从可见桌面开始的外屏热插拔，都应保留原资源并在恢复后校验读回。
+Test machine: Renoir `0x1636`, 64 GiB RAM, 4K 10-bit DisplayPort display, macOS 26.7.2 (`25G332`).
 
-`python3 tools/test_x5000_memory_policy.py` 检查放置策略、驻留状态转换和预算计算。物理热插拔和实际 GPU 重置需要另外实测。
+### This branch (2026-11-23)
 
-### 扩展池、退回与页表合并写入验收
+Kext `FE9FAF85`, built from this branch, in two boots: one without `-NRedUnifiedMemory`, one with it. In the second
+boot the pool and coalescing were switched off at runtime for the middle phase. All runs start a few minutes after
+login, and such runs differ by about 5 points between boots.
 
-2026 年 11 月 23 日 18:01 CST 从系统 EFI 启动候选 kext `5DAA2EEC`，同一次开机内交替切换 `pool_large`/`pool_return` 和 `pte_coalesce`，记录位于 `build/uma-daily-20261123/boot`。日用版只去掉了开发用的开关。
+| | flag off | on | on, pool and coalescing off |
+| --- | --- | --- | --- |
+| 64 MiB texture create, first use, release (median) | 2.52 ms | 8.14 / 8.12 ms | 33.0 ms |
+| 16 MiB texture create, first use, release (median) | 0.85 ms | 2.18 / 2.16 ms | 8.27 ms |
+| Frames above 25 ms, full-screen enter | 76.8% | 12.9 / 15.3% | 46.3% |
+| Frames above 25 ms, full-screen exit | 71.7% | 4.8 / 4.2% | 6.2% |
+| Frames above 25 ms, Mission Control enter | 51.6% | 12.5 / 9.1% | 11.3% |
+| Frames above 25 ms, Mission Control exit | 57.1% | 6.7 / 24.4% | 47.2% |
+| Frames above 25 ms, all scenes without scrolling | 27.8% | 6.4 / 7.5% | 13.7% |
 
-- 64 MiB 私有纹理创建、首次使用并释放的中位数：全部关闭 33.5/35.9 ms，只开池 18 ms，只开合并写入 24 ms，全部开启 8.2/8.4 ms。16 MiB 对应 8.2/8.7、5.5、5.6 和 2.1/2.2 ms。
-- 10-bit 4K 桌面动画中超过 25 ms 的帧间隔：全屏进入 40.3/39.2% 降至 13.9/15.3%，退出调度中心 63/57% 降至 33/41%，不含滚动的全部场景 19.2/18.6% 降至 12.7/12.8%。进入调度中心在各配置下均为 41–46%，瓶颈在 GPU 排队。
-- 每轮约 1930 个 backing 退回池，`pool_return_skips` 和 `pte_fallbacks` 为零。WindowServer 的大纹理锁页由每轮约 1.2 s 降至十几毫秒，24 MiB 以上请求的描述符约 10% 需新建。
-- 跨进程检查：一个进程写入 8 张带特征值的 64 MiB 私有纹理后退出，另一个进程新建同尺寸纹理并读回，未出现特征值。同一进程内的对照读到复用（4 张中 2–4 张），说明检查能看到复用的内容。
-- 全部探针通过，包括 23 GiB 压力。空闲 60 秒后脏描述符清空，压力后加速器锁页回落到 436 MB。
+- Without the flag, the `debug.nred_uma` sysctls are absent, the Metal and OpenGL baseline readbacks pass, and the
+  GPU was not reset. Creating a texture is faster in the carve-out because nothing has to be wired, but the
+  animations run into the full carve-out.
+- With the flag, the defaults read `1 1 1` and all probes passed, including the 736-group pressure case. The
+  cross-process check found the marker in 0 of 8 textures while the same-process control saw reuse in 4 of 4.
+  `pool_return_skips` and `pte_fallbacks` stayed at 0. Accelerator wired memory was 438 MB after 60 s idle and
+  449 MB after the probes.
 
-同一次开机里以 carve-out 放置做对照（测量时让该进程的资源走原生显存），统一内存的缓冲区读带宽为 97%，纹理读写 94–99%，运算持平，16/32/64 MiB 纹理创建到释放为 2.3/4.7/8.0 ms 对 0.85/1.35/2.75 ms。carve-out 运行已占满约 500 MiB 并出现换出和回收等待，统一内存的 1 GiB 缓冲区读带宽为 36 GB/s。
+### Pool, hand-back and PTE coalescing (2026-11-23)
 
-依赖访问延迟高 17–22%，原因在地址翻译。统一内存的页表项为系统内存、探查 CPU 缓存（`0x77`），fragment 基本为 0，每项覆盖 4 KiB；carve-out 为显存页表项（`0x71`），fragment 1–4，最大覆盖 64 KiB。按页顺序访问 64 MiB（几乎每次访问都落到内存，约 64 次访问才有一次 TLB 缺失）时两者相同（0.98），每次访问换一个 4 KiB 页时统一内存慢 41%，跳 64 KiB 时慢 47%。64 MiB 私有缓冲区拷贝慢约 16%，读端和写端各约 5–8%。消除这部分差距需要至少 64 KiB 对齐的物理连续 backing，使 `mapVMPT` 生成 fragment，这类 backing 在资源存活期间不能被换出。
+Kext `5DAA2EEC`, one boot, switching `pool_large`/`pool_return` and `pte_coalesce` at runtime. The final build only
+removed development switches.
 
-尚待实测：带资源的整机睡眠恢复、从可见桌面开始的外屏热插拔、实际 GPU 重置和长时间混合使用。
+- 64 MiB private texture create, first use and release, median: all off 33.5/35.9 ms, pool only 18 ms,
+  coalescing only 24 ms, all on 8.2/8.4 ms. 16 MiB: 8.2/8.7, 5.5, 5.6 and 2.1/2.2 ms.
+- Frame intervals above 25 ms on the 10-bit 4K desktop: full-screen enter 40.3/39.2% to 13.9/15.3%, Mission Control
+  exit 63/57% to 33/41%, all scenes without scrolling 19.2/18.6% to 12.7/12.8%. Mission Control enter stays at
+  41-46% in every configuration; the bottleneck is GPU queueing.
+- About 1930 backings are returned per run. `pool_return_skips` and `pte_fallbacks` stay at 0. WindowServer's wire
+  time for large textures fell from about 1.2 s per run to tens of milliseconds. About 10% of the descriptors for
+  requests above 24 MiB had to be created.
+- Isolation: one process writes 8 marked 64 MiB private textures and exits, then another process creates textures of
+  the same size and reads them. No marker was found. A control in the same process saw reused contents (2-4 of 4),
+  which shows the check can see reuse.
+- All probes passed, including the 23 GiB pressure case. Dirty descriptors drained after 60 s idle, and accelerator
+  wired memory fell to 436 MB after the pressure.
 
-### 早期资源 backing 验收
+### Against the carve-out
 
-2026 年 11 月 21 日 00:01 CST 从系统 EFI 启动，kext UUID 为 `F7C4DF32-3BEC-396C-873E-0278F5CAA553`，macOS 构建为 `25G332`。`debug.nred_uma.active` 为 `1`，原生驻留上限为 22 GiB，Metal 建议工作集为 16.5 GiB。
+In the same boot, with the measured process's resources forced onto the native carve-out: buffer read bandwidth
+was 97% of the carve-out, texture reads and writes 94-99%, and ALU throughput the same. Create to release of a
+16/32/64 MiB texture took 2.3/4.7/8.0 ms against 0.85/1.35/2.75 ms. The carve-out runs filled about 500 MiB of VRAM
+and hit page-offs and reclaim waits. With unified memory a 1 GiB buffer reads at 36 GB/s.
 
-本次验收日志位于 `build/x5000-unified-memory-boot/qa-F7C4DF32`。
+Dependent-load latency is 17-22% higher because of address translation. Unified memory PTEs are system, snooped
+entries (`0x77`) with fragment 0 in most cases, so each covers 4 KiB. Carve-out PTEs (`0x71`) use fragments 1-4,
+up to 64 KiB. Walking 64 MiB in page order (a DRAM miss per load and about one TLB miss per 64 loads) shows no
+difference (0.98). Moving to a new 4 KiB page on every load is 41% slower, and 64 KiB hops are 47% slower. A 64 MiB
+private buffer copy is about 16% slower, 5-8% on each of the read and write sides. Closing this gap needs physically
+contiguous backing aligned to at least 64 KiB, so that `mapVMPT` emits fragments, and such backing cannot be paged
+out while the resource is alive.
 
-- 在原生驻留上限下运行 23 GiB Metal 工作集，同时保留 816 MiB OpenGL 纹理、576 MiB VBO 和跨进程 IOSurface。736 个私有缓冲区、736 个渲染目标、15 张 GL 纹理、9 个 VBO 及同一 IOSurface 的 3 个映射均观察到 PTE 移除、解锁、重锁及在原任务和 GPU VA 提交。GPU 读回和跨进程读写校验均通过，分配失败计数为零。`object-validation.log`、`metal-pressure-workload.log`、`gl-vbo-workload.log` 和 `gl-texture-workload.log`
-- 九个 VBO 的原生客户端导入描述符均完成锁页、解锁及后续上传所需的重锁。内存压力后读取九个原缓冲区，再从 CPU 更新首尾标记，GPU 读回全部通过。`client-buffer-validation.log` 和 `client-buffer-workload.log`
-- 同时保留八个 Metal `Managed` 缓冲区和八张 `Managed` 纹理。施加驻留压力后，16 个主映射均恢复到原任务和 GPU VA，GPU 读回、同步到 CPU 和重新上传均通过。`managed-validation.log` 和 `managed-pressure-workload.log`
-- 20 个 Metal 进程在各自的任务页表中映射相同的 GPU VA，并分别读回不同内容。GFX 和 MM VM hub 都观察到 VMID 被不同任务复用，原生驱动在新分配完成前生成失效请求。`vmid-validation.log` 和 `vmid-workload.log`
-- 4K 桌面完成分辨率切换，提交了 96 帧全屏 Metal drawable。WindowServer 的离屏主映射使用系统内存，采集到的 775 次扫描输出面绑定均使用显存。4K HEVC 播放通过。显示电源状态从 `4` 降到 `1` 后恢复至 `4`，WindowServer 进程持续运行，熄屏前创建的 GPU 资源和跨进程 IOSurface 均通过读回。`display-and-layout-workload.log`、`special-placement.log`、`video-workload.log` 和 `display-power-workload.log`
-- 4K 可显示 IOSurface 使用原生显存，使用相同尺寸的离屏 IOSurface 作为对照时走可分页系统内存。两组 GPU 读回均通过。`scanout-surface-trace.log` 和 `scanout-surface-workload.log`
-- OpenGL 4x MSAA 和深度模板用例中，带独立辅助描述符的主分配使用原生显存。Metal 私有 heap 的缓冲区、颜色和深度纹理、4x MSAA resolve 和跨进程 IOSurface 双向读写均通过。`special-placement.log` 和 `postboot-regression.log`
-- Metal 的 2048² 颜色纹理附带 64 KiB 内联 DCC 元数据。跟踪确认整个主分配使用可分页系统内存，GPU 读回通过。`metal-dcc.log` 和 `metal-dcc-workload.log`
-- OpenGL 的 `GL_STORAGE_CACHED_APPLE` 和 `GL_STORAGE_SHARED_APPLE` 用例均经过原生客户端描述符和可分页主 backing，首尾像素读回通过。`gl-client-storage-trace.log`、`gl-client-storage-cache-workload.log` 和 `gl-client-storage-shared-workload.log`
+### Earlier object-level checks (2026-11-21)
 
-2026 年 11 月 21 日约 06:58 CST 的热插拔试验中，用户在拔线前已看到黑屏，外屏画面验收未通过。防止空闲熄屏的断言在等待拔线期间有效。系统记录同一 framebuffer pipe 离线及重新上线，重新识别到同一台 4K 显示器。重连后四组 Metal `Managed` 缓冲区和纹理及跨进程 IOSurface 均通过读回，WindowServer 和系统继续运行。黑屏起点及拔线前的 DP 链路状态尚未采集。`hotplug-u843RQ/trace.log`、`hotplug-u843RQ/workload.log` 和 `hotplug-u843RQ/display-events.log`
+Kext `F7C4DF32`, before the pool and mapping reuse:
 
-重连后的变色窗口测试中，驱动提交并完成了 711 次显示事务，记录的 scanout 绑定全部使用显存。随后进行一次短暂熄屏和唤醒，显示电源状态恢复到 `4`，DP 接收端恢复四条 HBR3 通道锁定，显存翻帧继续。两轮变色测试各有 31 帧收到呈现时间戳，首帧报告时间为 `0`。面板上的实际画面仍待现场确认。`hotplug-u843RQ/presentation-trace.log`、`hotplug-u843RQ/display-link.log`、`hotplug-u843RQ/display-wake-trace.log` 和 `hotplug-u843RQ/display-wake-workload.log`
+- A 23 GiB Metal working set at the native residency limit, while 816 MiB of OpenGL textures, 576 MiB of VBOs and a
+  cross-process IOSurface were kept. 736 private buffers, 736 render targets, 15 GL textures, 9 VBOs and three
+  mappings of the same IOSurface each went through PTE removal, unwire, rewire and commit at the original task and
+  GPU VA. All readbacks passed and no allocation failed.
+- The nine VBOs' imported client descriptors were wired, unwired and rewired for later uploads, and passed readback
+  and CPU updates after pressure.
+- Eight Managed buffers and eight Managed textures came back to their original task and GPU VA after pressure.
+- 20 Metal processes mapped the same GPU VA in their own page tables and read back different contents. Both the GFX
+  and MM VM hubs reused VMIDs across tasks, and the native driver issued the invalidation before each new
+  allocation completed.
+- After a 4K resolution change and 96 full-screen Metal drawables, WindowServer's offscreen primaries used system
+  memory and all 775 recorded scanout bindings used VRAM. 4K HEVC playback worked. Resources created before a
+  display power drop from state 4 to 1 read back correctly after it returned to 4.
+- A displayable 4K IOSurface used VRAM, and an offscreen IOSurface of the same size used pageable system memory.
+- OpenGL 4x MSAA and depth/stencil primaries with separate auxiliary descriptors used VRAM. A 2048x2048 Metal color
+  texture with 64 KiB of inline DCC metadata was paged as a whole. `GL_STORAGE_CACHED_APPLE` and
+  `GL_STORAGE_SHARED_APPLE` went through the native client descriptor and a pageable primary.
+- Hot-plug of the 4K DisplayPort display: after reconnecting, Managed resources and the cross-process IOSurface read
+  back correctly and WindowServer kept running. The panel stayed dark during that test because its DDC brightness
+  had been set to 0. A hot-plug starting from a visible desktop has not been repeated.
 
-Apple 图形诊断保留的 HDCP 认证启动事件从 06:31:27 CST 起每约 3.2 秒出现一次，重连后仍在出现。07:14 CST 的接收端 HDCP `RxStatus` 值为 `0x10`，对应加密同步失效。07:19 CST 起的约一分钟观察中，30 次接收端采样均为四条 DP 通道锁定且 HDCP 错误位清零，90 帧变色图案中 89 帧收到呈现时间戳，分配失败与 scanout 拒绝计数均为零。该状态与面板黑屏的时间关系仍待现场复现。`hotplug-u843RQ/graphics-diagnose.log`、`hotplug-u843RQ/physical-observation.log` 和 `hotplug-u843RQ/physical-observation-frames.log`
+## Limitations and open items
 
-07:31 CST 用户报告 Dell 仍黑屏，摇杆菜单没有出现。此时系统显示电源状态为 `4`，识别到 4K 外屏，图形诊断报告四条 DP 通道锁定及 HDCP `RxStatus=0x10`。显示器断电再接回后，驱动重新识别到同一显示器，随后接收端 HDCP 状态为 `0x00`。临时切到 1080p 并自动恢复 4K，实际像素时钟从 533.25 MHz 降至 159.84 MHz，再回到原值。Metal、深度纹理和跨进程 IOSurface 的 GPU 读回均通过。仍需现场确认面板能否显示自身菜单及桌面。`hotplug-u843RQ/black-live.KR1unx`
-
-07:46 CST 用户仍报告黑屏。系统截图有正常的非黑像素，四条 DP 通道锁定，HDCP `RxStatus=0x00`。Dell 通过 DDC/CI 报告亮度为 `0/100`。07:48 CST 将亮度调到 `50/100`，即时读回和 07:49 CST 复查均为 `50/100`。用户随后确认能看到桌面。UMA 在同一次启动中保持开启，分配失败和 scanout 拒绝计数均为零。仍需完成一次从可见桌面开始的热插拔验收。`hotplug-u843RQ/black-live.KR1unx/ddc-brightness-restoration.log`
-
-对照配置 `hotplug-u843RQ/uma-off-config.plist` 从本机 EFI 配置生成，仅移除 `-NRedUnifiedMemory`，仍使用同一份 kext。该配置已写入 `EFI/OC/config.uma-off.plist` 并通过 `ocvalidate`。OpenCore 仍从 `EFI/OC/config.plist` 启动。关闭该开关时 X5000 会回到兼容显存分配路径，等待实机对照。
-
-本轮 IOSurface 经过 `pageoff` 和 `pageon`，copy kind `8` 的 staging 标志均为 `0`。分辨率切换和全屏 4K drawable 触发了 scanout DCC 资格检查。实际启用 DCC 的扫描输出、整机睡眠恢复和 GPU reset 尚待实机覆盖。上一版整机睡眠试验记录了 `kPMPCIUnsupported`，试验后恢复原电源设置。`qa-F7C4DF32/residency-edges.log`、`system-sleep-kernel-7E844CDE.log` 和 `system-sleep-isolated-7E844CDE.log`
+- Not yet validated: system sleep and wake with live resources, hot-plug starting from a visible desktop, a real
+  GPU reset, and days of mixed use.
+- Only `25G332` is supported. Every other build turns the feature off.
+- Other Renoir-family device IDs take the same code path but have not been tested. Raven, Raven2 and Picasso are
+  excluded.
+- The pool keeps about 190 MiB wired when idle and does not shrink under memory pressure (see Footprint).
+- 4 KiB PTEs cost 17-22% in dependent-load latency compared with the carve-out.
+- Mission Control enter differs between boots (41-46% long frames in the 2026-11-23 afternoon boot, 9-13% in the
+  boot of this branch) and does not depend on the pool or coalescing. Earlier traces placed it in GPU queueing.
+- The 10-bit half-float composition load is not a memory management problem. With an 8-bit framebuffer, long
+  frames in full-screen enter fall from 47% to 10% on the same machine.
