@@ -36,6 +36,21 @@ namespace
     constexpr char poolFactorySymbol[] = "__ZN34IOAccelBufferMemoryDescriptorPool229newWiredDescriptorsWithLengthEyPjP4taskP12IOAccelEventbPb";
     constexpr char acceleratorStartSymbol[] = "__ZN22IOGraphicsAccelerator25startEP9IOService";
     constexpr char poolNewSymbol[] = "__ZN34IOAccelBufferMemoryDescriptorPool2nwEm";
+    constexpr char poolInitSymbol[] = "__ZN34IOAccelBufferMemoryDescriptorPool219initWithAcceleratorEP22IOGraphicsAccelerator2";
+    constexpr char poolReleaseSymbol[] =
+        "__ZN34IOAccelBufferMemoryDescriptorPool218releaseDescriptorsEPP24IOBufferMemoryDescriptorjP4taskP12IOAccelEvent";
+    constexpr char poolKickSymbol[] = "__ZN22IOGraphicsAccelerator219kickMemoryPoolTimerEv";
+    constexpr char eventMachineSymbol[] = "__ZNK13IOAccelMemory15getEventMachineEv";
+    constexpr char mergeEventsSymbol[] = "__ZN13IOAccelMemory20merge_mapping_eventsEP12IOAccelEvent";
+    constexpr char sharedReleaseSymbol[] = "__ZN25IOAccelOrphanedMemoryPool13sharedReleaseEP14IOAccelShared2";
+    constexpr char memoryReleaseSymbol[] = "__ZNK13IOAccelMemory7releaseEv";
+    constexpr char pteUpdateSymbol[] = "__ZN29AMDRadeonX5000_AMDHWVMContext36updateContiguousPTEsWithDMAUsingAddrEyyyyy";
+    constexpr char mapVMPTSymbol[] = "__ZN29AMDRadeonX5000_AMDHWVMContext7mapVMPTEP12AMD_VMPT_CTL15eAMD_VMPT_LEVELjyyy";
+    constexpr char mapVASymbol[] =
+        "__ZN29AMDRadeonX5000_AMDHWVMContext5mapVAEyP13IOAccelMemoryyyN24AMDRadeonX5000_IAMDHWVMM10VmMapFlagsE";
+    constexpr char poolReserveSymbol[] = "__ZN35AMDRadeonX5000_AMDCommandBufferPool17getBufferStartPtrEj";
+    constexpr char poolCommitSymbol[] = "__ZN35AMDRadeonX5000_AMDCommandBufferPool15setBufferEndPtrEPj";
+    constexpr char poolSubmitSymbol[] = "__ZN35AMDRadeonX5000_AMDCommandBufferPool12submitBufferEy";
     constexpr char clientBufferSymbol[] =
         "__ZN16IOAccelSysMemory16withClientBufferEP22IOGraphicsAccelerator2P4taskP14IOAccelShared2yy";
     constexpr char freeSymbol[] = "__ZN16IOAccelSysMemory4freeEv";
@@ -108,6 +123,7 @@ namespace
     constexpr UInt32 configSeparateWorkingSet = 1U << 31;
     constexpr size_t sharedTask = 0x88;
     constexpr size_t mappingMemory = 0x18;
+    constexpr size_t mappingAccelerator = 0x88;
     constexpr size_t mappingTask = 0x90;
     constexpr size_t mappingGPUAddress = 0x98;
     constexpr size_t taskPageTable = 0x260;
@@ -147,6 +163,70 @@ namespace
     // pruneOrphanedMappings walks the mapping array: movswq 0x5a(%rdi), %r15.
     constexpr size_t memoryMappingCount = 0x5A;
     constexpr UInt8 pruneMappingCount[] = {0x4C, 0x0F, 0xBF, 0x7F, 0x5A};
+
+    // Native buffer pool. IOAccelSysMemory::orphanIt hands a pooled backing's descriptors back with
+    // releaseDescriptors(pool = accel+0xc30 if accel+0x9bc, memory+0xf8, memory+0x100, *(shared+0x80) or kernel_task,
+    // merged mapping events) and then clears flag 0x800, so the later unwire does not mark them Volatile.
+    constexpr size_t memoryAccelerator = 0x28;
+    constexpr size_t memoryShared = 0x30;
+    constexpr size_t memoryResource = 0x38;
+    constexpr size_t memoryDescriptors = 0xF8;
+    constexpr size_t memoryDescriptorCount = 0x100;
+    constexpr size_t sharedPoolTask = 0x80;
+    constexpr size_t acceleratorPoolEnabled = 0x9BC;
+    constexpr size_t acceleratorPool = 0xC30;
+    constexpr UInt32 orphanedPurgeable = 1U << 11;
+    constexpr UInt32 nonVolatileState = 2;
+    constexpr UInt32 volatileState = 3;
+    // Slots are offsets from the object's vptr (vtable symbol + 0x10). Verified live through an AMDAccelSysMemory
+    // vptr: 0x1c0 orphanIt, 0x1d0 increment_wire_count (called from commit_pte+0x51), 0x1d8 decrement_wire_count
+    // (release_pte+0x72); event machine 0x140 initEvent, 0x1b0 copyEvent, 0x1b8 mergeEvent.
+    constexpr size_t incrementWireSlot = 0x1D0;
+    constexpr size_t decrementWireSlot = 0x1D8;
+    constexpr size_t eventInitSlot = 0x140;
+    // merge_mapping_events and the pool's dirty hit call this slot as mergeEvent(machine, source, destination).
+    constexpr size_t eventMergeSlot = 0x1B8;
+    // AMDHWVMContext::getPageTableUpdateEvent returns context+0x40. After unmapVA returns it holds the VMPT queue
+    // (software channel 15) stamp of the buffer that carries the PTE clear and the VM invalidation.
+    constexpr size_t contextUpdateEvent = 0x40;
+    constexpr size_t sharedAccelerator = 0x78;
+    constexpr size_t poolDirtySlots = 0x110;
+    constexpr size_t poolDirtyMask = 0x120;
+    constexpr size_t poolDirtySlotBytes = 0x10;
+    constexpr size_t poolDirtyEvents = 0x118;
+    // IOAccelMemory::release: once only orphaned mappings are left and their events are done it retains, calls
+    // pruneOrphanedMappings at +0xa6 and tail-calls release. This, not orphanIt, is how almost every pooled backing
+    // ends; orphanIt only runs while mapping events are still pending.
+    constexpr size_t releasePruneCall = 0xA6;
+    constexpr UInt8 releasePruneTail[] = {0x48, 0x8B, 0x0B, 0x48, 0x83, 0xC1, 0x28};
+    constexpr size_t eventBytes = 0x40;
+    constexpr size_t poolBuckets = 5;
+    constexpr size_t poolWiredCount = 0x28;
+    constexpr size_t poolPurgeableCount = 0xA0;
+    constexpr size_t poolBucketStride = 0x18;
+    constexpr size_t poolDirtyCount = 0x128;
+    constexpr size_t poolDirtyStride = 0x20;
+    // initWithAccelerator reads (shift, capacity) per bucket from sWiredPoolInfo and sPurgeablePoolInfo through
+    // leaq disp(%rip), %rcx and stores a fixed prefill of 24 (movabsq $0x1800000000). newWiredDescriptorsWithLength
+    // caps a request at prefill << shift of the first bucket and gathers at most 64 descriptors in a stack array
+    // (memset 0x200). With the native first bucket of 1 MiB the cap is 24 MiB.
+    constexpr size_t poolInfoLoad = 0x6B;
+    constexpr size_t poolPurgeableLoad = 0x127;
+    constexpr size_t poolPrefillStore = 0x5C;
+    constexpr UInt8 poolInfoLea[] = {0x48, 0x8D, 0x0D};
+    constexpr UInt8 poolPrefill[] = {0x48, 0xB8, 0, 0, 0, 0, 0x18, 0, 0, 0};
+    constexpr size_t poolCapCheck = 0x36;
+    constexpr UInt8 poolCap[] = {0x8A, 0x4F, 0x34, 0x8B, 0x7F, 0x2C, 0xD3, 0xE7, 0x31, 0xC0, 0x48, 0x39, 0xFE};
+    constexpr size_t poolStackClear = 0x62;
+    constexpr UInt8 poolStack[] = {0x48, 0x8D, 0xBD, 0xD0, 0xFD, 0xFF, 0xFF, 0xBA, 0x00, 0x02, 0x00, 0x00};
+    constexpr UInt32 nativeWiredInfo[15] = {20, 64, 24, 18, 32, 24, 16, 32, 24, 14, 32, 24, 12, 32, 24};
+    constexpr UInt32 nativePurgeableInfo[15] = {20, 64, 0, 18, 16, 0, 16, 16, 0, 14, 16, 0, 12, 16, 0};
+    // A 4 MiB first bucket raises the cap to 96 MiB (24 << 22), which covers WindowServer's 10-bit full-screen
+    // textures (25-64 MiB). The worst case below the cap is 23 + 3 + 3 + 3 + 15 = 47 descriptors. The 16 KiB bucket
+    // is dropped, so remainders below 64 KiB use 4 KiB pieces. Idle wired memory: 24-32 x 4 MiB in the first bucket.
+    constexpr UInt32 largeWiredInfo[15] = {22, 32, 24, 20, 64, 24, 18, 32, 24, 16, 32, 24, 12, 32, 24};
+    constexpr UInt32 largePurgeableInfo[15] = {22, 32, 0, 20, 64, 0, 18, 16, 0, 16, 16, 0, 12, 16, 0};
+    constexpr UInt64 nativePoolLimit = 24ULL << 20;
     constexpr UInt8 nativeSystemHead[] = {0x49, 0x8B, 0x8E, 0xC8, 0, 0, 0};
     constexpr UInt8 primaryOptionsHead[] = {0x0F, 0xBA, 0xE0, 0x1E, 0xB8, 0x63, 0x03, 0, 0,
                                             0x41, 0xB8, 0x33, 0, 0, 0, 0x44, 0x0F, 0x43, 0xC0};
@@ -260,6 +340,30 @@ namespace
     void (*unwireMemory)(OSObject*){nullptr};
     void (*setMemoryFlags)(OSObject*, UInt32){nullptr};
     void (*pruneOrphanedMappings)(OSObject*){nullptr};
+    void (*releasePoolDescriptors)(void*, void*, UInt32, void*, void*){nullptr};
+    void (*kickPoolTimer)(IOService*){nullptr};
+    void* (*getEventMachine)(const OSObject*){nullptr};
+    void (*mergeMappingEvents)(OSObject*, void*){nullptr};
+    bool largePoolInstalled{false};
+    // Set only when the shared release and prune routes were verified in place; pool_return cannot be enabled before.
+    bool poolReturnAvailable{false};
+    // The prune collector reads the VMPT event from the routed releaseFromGPUPageTable; verified in installX5000.
+    bool releasePTERouted{false};
+    // On by default; each takes effect only when its routes were verified. Runtime off switches: sysctl.
+    UInt32 poolReturnEnabled{1};
+    UInt32 poolLargeEnabled{1};
+    void* activePool{nullptr};
+    mach_vm_address_t originalSharedRelease{0};
+    mach_vm_address_t originalPrune{0};
+    mach_vm_address_t releasePruneReturn{0};
+    // Pool occupancy sampled under the accelerator lock (wired/purgeable/dirty per bucket), read by the sysctl.
+    UInt32 poolSnapshot[poolBuckets][3]{};
+    // VMPT events of the PTE releases done while a pooled backing's orphaned mappings are pruned (orphanBacking or
+    // pruneFromRelease). Owned by the thread that holds the accelerator lock.
+    thread_t pruneOwner{nullptr};
+    void* pruneMachine{nullptr};
+    IOService* pruneAccelerator{nullptr};
+    alignas(8) UInt8 pruneEvent[eventBytes]{};
     mach_vm_address_t primaryFactoryReturn{0};
     mach_vm_address_t purgeRequestReturn{0};
     mach_vm_address_t originalDataAllocator{0};
@@ -279,6 +383,11 @@ namespace
 
     UInt64 pageableRequests{0};
     UInt64 pooledAllocations{0};
+    UInt64 poolReturns{0};
+    UInt64 poolReturnPieces{0};
+    UInt64 poolReturnSkips{0};
+    UInt64 poolLargeRequests{0};
+    UInt64 poolRekeyed{0};
     UInt64 allocationFailures{0};
     UInt64 bufferAllocations{0};
     UInt64 textureAllocations{0};
@@ -324,6 +433,7 @@ namespace
         Residency residency;
         TaskMapping* mappings{nullptr};
         UInt64 evictionEpoch{0};
+        bool poolReturned{false};
     };
 
     IOSimpleLock* backingLock{nullptr};
@@ -423,6 +533,7 @@ namespace
             return BackingKind::Native;
         }
 
+
         X5000Memory::Requirements usage{};
         usage.kind = static_cast<ResourceKind>(getMember<UInt8>(resource, resourceType));
         auto* const ownerTask = shared != nullptr ? getMember<void*>(shared, sharedTask) : nullptr;
@@ -456,6 +567,12 @@ namespace
         return CompatTarget::parseMachOIdentity(image, reinterpret_cast<const UInt8*>(start), length)
                && memcmp(image.uuid, expected, sizeof(expected)) == 0;
     }
+
+    struct EntryHead
+    {
+        mach_vm_address_t address{0};
+        UInt8 bytes[8]{};
+    };
 
     struct Image
     {
@@ -499,6 +616,24 @@ namespace
             const auto result = patcher.routeMultipleLong(id, routes, count, start, size);
             patcher.clearError();
             return result;
+        }
+
+        // Lilu can report success after writing the trampoline without the jump; compare the entry before and after.
+        EntryHead head(const char* const symbol) const
+        {
+            EntryHead entry{resolve(symbol)};
+            if (entry.address != 0 && contains(entry.address, sizeof(entry.bytes))) {
+                memcpy(entry.bytes, reinterpret_cast<const void*>(entry.address), sizeof(entry.bytes));
+            } else {
+                entry.address = 0;
+            }
+            return entry;
+        }
+
+        static bool patched(const EntryHead& entry)
+        {
+            return entry.address != 0
+                   && memcmp(reinterpret_cast<const void*>(entry.address), entry.bytes, sizeof(entry.bytes)) != 0;
         }
 
         template <typename Function>
@@ -636,6 +771,9 @@ namespace
         return primaryBackingForResource(resource, shared);
     }
 
+    void* ownedPool(IOService* accelerator);
+    void samplePool(void* pool);
+
     OSObject* newPageableBacking(IOService* const accelerator, void* const task, void* const shared,
         void* const resource, const UInt32 options, const UInt64 size, const bool unshared, const BackingKind kind,
         const UInt64 alignment)
@@ -646,8 +784,13 @@ namespace
             increment(allocationFailures);
             return nullptr;
         }
-        auto* const memory =
-            static_cast<OSObject*>(allocatePooled(accelerator, task, shared, resource, options, size, unshared));
+        const bool large = size > nativePoolLimit;
+        const bool pooled = !large || (largePoolInstalled && __atomic_load_n(&poolLargeEnabled, __ATOMIC_RELAXED) != 0);
+        if (large && pooled) { increment(poolLargeRequests); }
+        auto* const memory = static_cast<OSObject*>(
+            pooled ? allocatePooled(accelerator, task, shared, resource, options, size, unshared)
+                   : reinterpret_cast<void* (*)(IOService*, void*, void*, void*, UInt32, UInt64, bool)>(
+                         nredUnifiedOriginalFactory)(accelerator, task, shared, resource, options, size, unshared));
         if (memory == nullptr) {
             IOFree(backing, sizeof(Backing));
             increment(allocationFailures);
@@ -672,7 +815,10 @@ namespace
         // Pool backings arrive wired; the native wired notification ran before the backing was registered.
         const auto flags = getMember<UInt32>(memory, memoryFlags);
         const auto residency = (flags & wiredMemory) != 0 ? Residency::Wired : Residency::Cold;
-        if ((flags & pooledMemory) != 0) { increment(pooledAllocations); }
+        if ((flags & pooledMemory) != 0) {
+            increment(pooledAllocations);
+            samplePool(ownedPool(accelerator));
+        }
         IOSimpleLockLock(backingLock);
         auto& bucket = bucketFor(memory);
         *backing = {memory, bucket, getMember<UInt64>(memory, memorySize), residency};
@@ -857,10 +1003,188 @@ namespace
         FunctionCast(freeBacking, originalFree)(memory);
     }
 
+    template <typename Function>
+    Function virtualSlot(const void* const object, const size_t slot)
+    {
+        return reinterpret_cast<Function>((*static_cast<void* const* const*>(object))[slot / sizeof(void*)]);
+    }
+
+    // Caller holds the accelerator lock.
+    void samplePool(void* const pool)
+    {
+        if (pool == nullptr) { return; }
+        __atomic_store_n(&activePool, pool, __ATOMIC_RELEASE);
+        for (size_t bucket = 0; bucket < poolBuckets; bucket++) {
+            __atomic_store_n(&poolSnapshot[bucket][0], getMember<UInt32>(pool, poolWiredCount + bucket * poolBucketStride),
+                             __ATOMIC_RELAXED);
+            __atomic_store_n(&poolSnapshot[bucket][1],
+                             getMember<UInt32>(pool, poolPurgeableCount + bucket * poolBucketStride), __ATOMIC_RELAXED);
+            __atomic_store_n(&poolSnapshot[bucket][2], getMember<UInt32>(pool, poolDirtyCount + bucket * poolDirtyStride),
+                             __ATOMIC_RELAXED);
+        }
+    }
+
+    void* ownedPool(IOService* const accelerator)
+    {
+        return accelerator != nullptr && ownsAccelerator(accelerator)
+                       && getMember<UInt32>(accelerator, acceleratorPoolEnabled) != 0
+                   ? getMember<void*>(accelerator, acceleratorPool)
+                   : nullptr;
+    }
+
+    // Dirty pool slots are matched by the raw task pointer. IOAccelShared2::free releases its orphan pools here (under
+    // the accelerator lock) before it drops its task reference, so the task's dirty slots are re-keyed to kernel_task
+    // first. Kernel requests never take dirty slots, so those pieces are reused only after the pool timer zero-fills
+    // them, and a later task at the same address cannot receive them.
+    void releaseShared(void* const orphanPool, void* const shared)
+    {
+        auto* const pool = shared != nullptr && largePoolInstalled
+                               ? ownedPool(getMember<IOService*>(shared, sharedAccelerator))
+                               : nullptr;
+        if (pool != nullptr) {
+            auto* const task = getMember<void*>(shared, sharedPoolTask);
+            for (size_t bucket = 0; task != nullptr && bucket < poolBuckets; bucket++) {
+                auto* const slots = getMember<UInt8*>(pool, poolDirtySlots + bucket * poolDirtyStride);
+                auto mask = getMember<UInt64>(pool, poolDirtyMask + bucket * poolDirtyStride);
+                while (slots != nullptr && mask != 0) {
+                    const auto slot = static_cast<size_t>(__builtin_ctzll(mask));
+                    mask &= mask - 1;
+                    auto& owner = *reinterpret_cast<void**>(slots + slot * poolDirtySlotBytes + sizeof(void*));
+                    if (owner == task) {
+                        owner = kernel_task;
+                        increment(poolRekeyed);
+                    }
+                }
+            }
+            samplePool(pool);
+        }
+        FunctionCast(releaseShared, originalSharedRelease)(orphanPool, shared);
+    }
+
+    // Native orphanIt merges only the events of the mappings that are left. The PTE releases of the pruned ones are
+    // added to the dirty slots that now hold this backing's descriptors. Caller holds the accelerator lock.
+    void addPruneEventToSlots(OSObject* const memory)
+    {
+        auto* const pool = ownedPool(getMember<IOService*>(memory, memoryAccelerator));
+        auto* const descriptors = getMember<void* const*>(memory, memoryDescriptors);
+        const auto count = getMember<UInt32>(memory, memoryDescriptorCount);
+        if (pool == nullptr || descriptors == nullptr || count == 0) { return; }
+        for (size_t bucket = 0; bucket < poolBuckets; bucket++) {
+            auto* const slots = getMember<UInt8*>(pool, poolDirtySlots + bucket * poolDirtyStride);
+            auto* const events = getMember<UInt8*>(pool, poolDirtyEvents + bucket * poolDirtyStride);
+            auto mask = getMember<UInt64>(pool, poolDirtyMask + bucket * poolDirtyStride);
+            while (slots != nullptr && events != nullptr && mask != 0) {
+                const auto slot = static_cast<size_t>(__builtin_ctzll(mask));
+                mask &= mask - 1;
+                auto* const descriptor = *reinterpret_cast<void**>(slots + slot * poolDirtySlotBytes);
+                for (UInt32 index = 0; index < count; index++) {
+                    if (descriptors[index] != descriptor) { continue; }
+                    virtualSlot<void (*)(void*, void*, void*)>(pruneMachine, eventMergeSlot)(
+                        pruneMachine, pruneEvent, events + slot * eventBytes);
+                    break;
+                }
+            }
+        }
+        samplePool(pool);
+    }
+
+    // Marks a backing's descriptors as handed back (by us or by native orphanIt). Returns false if they already were.
+    bool claimPoolReturn(void* const memory)
+    {
+        bool claimed = false;
+        IOSimpleLockLock(backingLock);
+        if (auto* const backing = *findBacking(memory); backing != nullptr && !backing->poolReturned) {
+            backing->poolReturned = true;
+            claimed = true;
+        }
+        IOSimpleLockUnlock(backingLock);
+        return claimed;
+    }
+
+    // Holds a wired pooled backing while its orphaned mappings are pruned, so that the last release_pte does not
+    // unwire every piece just before the backing is destroyed.
+    bool holdsPooledWire(OSObject* const memory)
+    {
+        if (!largePoolInstalled || !poolReturnAvailable || !releasePTERouted
+            || __atomic_load_n(&poolReturnEnabled, __ATOMIC_RELAXED) == 0)
+        {
+            return false;
+        }
+        const auto flags = getMember<UInt32>(memory, memoryFlags);
+        if ((flags & (pooledMemory | wiredMemory)) != (pooledMemory | wiredMemory)) { return false; }
+        virtualSlot<void (*)(OSObject*)>(memory, incrementWireSlot)(memory);
+        return true;
+    }
+
+    // Same hand-back as IOAccelSysMemory::orphanIt, for a pooled backing whose orphaned mappings were all idle and
+    // released. orphanIt runs after IOAccelMemory::release dropped its reference, so once the orphans are gone only
+    // orphanBacking's own reference is left and the backing is destroyed when it drops it. Same-task reuse inherits the merged
+    // mapping events; other tasks get the pieces after the pool timer zero-fills them once the events complete.
+    bool returnPooledDescriptors(OSObject* const memory, const UInt32 dyingRetainCount)
+    {
+        auto* const accelerator = getMember<IOService*>(memory, memoryAccelerator);
+        auto* const descriptors = getMember<void*>(memory, memoryDescriptors);
+        const auto count = getMember<UInt32>(memory, memoryDescriptorCount);
+        auto& flags = getMember<UInt32>(memory, memoryFlags);
+        const auto state = (flags >> purgeableShift) & purgeableMask;
+        auto* const pool = ownedPool(accelerator);
+        if (pool == nullptr || descriptors == nullptr || count == 0 || state > volatileState
+            || memory->getRetainCount() != static_cast<int>(dyingRetainCount)
+            || getMember<void*>(memory, memoryResource) != nullptr || !claimPoolReturn(memory))
+        {
+            return false;
+        }
+        // pruneEvent already holds the VMPT stamps of the PTE releases; add the events of any mapping left.
+        auto* const event = pruneEvent;
+        mergeMappingEvents(memory, event);
+        auto* const shared = getMember<void*>(memory, memoryShared);
+        auto* const task = shared != nullptr ? getMember<void*>(shared, sharedPoolTask) : static_cast<void*>(kernel_task);
+        // The dying backing must not re-apply a purgeable state to pieces that now belong to the pool.
+        flags = (flags & ~(orphanedPurgeable | (purgeableMask << purgeableShift))) | (nonVolatileState << purgeableShift);
+        releasePoolDescriptors(pool, descriptors, count, task, event);
+        kickPoolTimer(accelerator);
+        samplePool(pool);
+        increment(poolReturns);
+        increment(poolReturnPieces, count);
+        return true;
+    }
+
     // A backing is orphaned once only orphaned mappings reference it. Nothing can revive them any more, and a pooled
     // backing hands its pages back to the pool here, so idle mappings are released first, as in IOAccelMemory::release.
     // Mappings with GPU work still pending stay orphaned under the native rules. The gate is the registry rather than
     // the kept-mappings flag, because a fixed-address mapping clears the flag while earlier orphans remain.
+    // Starts collecting the VMPT events of the PTE releases done by the coming prune and holds the backing wired.
+    // Returns false (nothing held) unless the backing is a wired pooled one and the collector is free.
+    bool beginPooledPrune(OSObject* const memory)
+    {
+        // The collector is used under the accelerator lock; the exchange keeps a second thread out regardless.
+        thread_t expected = nullptr;
+        auto* const machine = largePoolInstalled && poolReturnAvailable && releasePTERouted
+                                      && __atomic_load_n(&poolReturnEnabled, __ATOMIC_RELAXED) != 0
+                                  ? getEventMachine(memory)
+                                  : nullptr;
+        const bool collecting = machine != nullptr
+                                && __atomic_compare_exchange_n(&pruneOwner, &expected, current_thread(), false,
+                                                               __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+        const bool held = collecting && holdsPooledWire(memory);
+        if (held) {
+            pruneAccelerator = getMember<IOService*>(memory, memoryAccelerator);
+            pruneMachine = machine;
+            memset(pruneEvent, 0xAA, sizeof(pruneEvent));
+            virtualSlot<void (*)(void*, void*)>(pruneMachine, eventInitSlot)(pruneMachine, pruneEvent);
+        } else if (collecting) {
+            __atomic_store_n(&pruneOwner, nullptr, __ATOMIC_RELEASE);
+        }
+        return held;
+    }
+
+    void endPooledPrune()
+    {
+        pruneMachine = nullptr;
+        pruneAccelerator = nullptr;
+        __atomic_store_n(&pruneOwner, nullptr, __ATOMIC_RELEASE);
+    }
+
     void orphanBacking(OSObject* const memory)
     {
         const auto orphan = FunctionCast(orphanBacking, originalOrphan);
@@ -869,9 +1193,47 @@ namespace
             return;
         }
         memory->retain();
+        const bool held = beginPooledPrune(memory);
         pruneOrphanedMappings(memory);
-        if (getMember<SInt16>(memory, memoryMappingCount) > 0) { orphan(memory); }
+        if (getMember<SInt16>(memory, memoryMappingCount) > 0) {
+            if (held) { virtualSlot<void (*)(OSObject*)>(memory, decrementWireSlot)(memory); }
+            // Native orphanIt hands a pooled backing's descriptors back itself. If they already went back, clearing the
+            // pooled flag makes orphanIt skip releaseDescriptors.
+            if ((getMember<UInt32>(memory, memoryFlags) & pooledMemory) != 0 && !claimPoolReturn(memory)) {
+                getMember<UInt32>(memory, memoryFlags) &= ~pooledMemory;
+            }
+            orphan(memory);
+            if (held) { addPruneEventToSlots(memory); }
+        } else if (held) {
+            // orphanIt runs after IOAccelMemory::release dropped its reference: only ours is left.
+            if (!returnPooledDescriptors(memory, 1)) { increment(poolReturnSkips); }
+            virtualSlot<void (*)(OSObject*)>(memory, decrementWireSlot)(memory);
+        }
+        if (held) { endPooledPrune(); }
         memory->release();
+    }
+
+    // Route of IOAccelMemory::pruneOrphanedMappings. Only the call from IOAccelMemory::release is handled: that caller
+    // holds one temporary reference across the prune and drops it right after, so the backing dies when the prune
+    // leaves no mapping and that reference is the only one.
+    void pruneFromRelease(OSObject* const memory)
+    {
+        const auto original = FunctionCast(pruneFromRelease, originalPrune);
+        if (reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0)) != releasePruneReturn || !ready()
+            || !isManaged(memory))
+        {
+            original(memory);
+            return;
+        }
+        const bool held = beginPooledPrune(memory);
+        original(memory);
+        if (held) {
+            if (getMember<SInt16>(memory, memoryMappingCount) == 0 && !returnPooledDescriptors(memory, 1)) {
+                increment(poolReturnSkips);
+            }
+            virtualSlot<void (*)(OSObject*)>(memory, decrementWireSlot)(memory);
+            endPooledPrune();
+        }
     }
 
     // The mapping lookup returns a task's orphaned mapping without comparing the requested address. Idle orphans are
@@ -935,6 +1297,18 @@ namespace
     {
         const auto result = FunctionCast(releaseMappingPTE, originalReleasePTE)(mapping);
         if (!result || !ready()) { return result; }
+        if (__atomic_load_n(&pruneOwner, __ATOMIC_ACQUIRE) == current_thread() && pruneMachine != nullptr
+            && getMember<IOService*>(mapping, mappingAccelerator) == pruneAccelerator)
+        {
+            auto* const task = getMember<void*>(mapping, mappingTask);
+            auto* const context = task != nullptr && (getMember<UInt8>(task, taskFlags) & perTaskPageTable) != 0
+                                      ? getMember<UInt8*>(task, taskPageTable)
+                                      : nullptr;
+            if (context != nullptr) {
+                virtualSlot<void (*)(void*, void*, void*)>(pruneMachine, eventMergeSlot)(
+                    pruneMachine, context + contextUpdateEvent, pruneEvent);
+            }
+        }
 
         IOSimpleLockLock(backingLock);
         if (auto* const backing = *findBacking(getMember<void*>(mapping, mappingMemory))) {
@@ -1000,6 +1374,158 @@ namespace
                                                   savedFlip);
     }
 
+    // Page-table write coalescing. mapVMPT calls AMDHWVMContext::updateContiguousPTEsWithDMAUsingAddr once per
+    // physical segment, and pageable memory gives one 4 KiB page per segment (mostly physically descending), so every
+    // page costs one 10-dword SDMA PTE_PDE packet. A thread entering AMDHWVMContext::mapVA claims the coalescing scope;
+    // inside it, runs of single-entry updates for consecutive page-table entries are collected and written as one SDMA
+    // WRITE_LINEAR packet with explicit entries (2 dwords each), as amdgpu's sdma_v4_0_vm_write_pte does. The run is
+    // written before any other reservation or submission the thread makes on the pool and whenever the outermost
+    // mapVMPT returns, i.e. before mapVA ends the update (endVMPTUpdate skips an empty pool). mapVA calls were never
+    // seen overlapping (828 calls, at most one active). SDMA stays the only page-table writer.
+    constexpr UInt32 sdmaWriteLinear = 2;  // SDMA_OP_WRITE, SDMA_SUBOP_WRITE_LINEAR = 0
+    constexpr UInt32 pteBatchMax = 128;
+
+    struct PTEBatch
+    {
+        void* context{nullptr};
+        void* pool{nullptr};
+        UInt64 firstEntry{0};
+        UInt64 flags{0};
+        UInt32 count{0};
+        UInt64 addresses[pteBatchMax]{};
+    };
+
+    UInt32 pteCoalesce{1};
+    thread_t pteOwner{nullptr};  // thread inside the outermost coalescing mapVMPT call
+    UInt32 pteDepth{0};          // mapVMPT nesting of pteOwner; only pteOwner reads or writes it and pteBatch
+    PTEBatch pteBatch{};
+    mach_vm_address_t originalPTEUpdate{0};
+    mach_vm_address_t originalMapVMPT{0};
+    mach_vm_address_t originalMapVA{0};
+    mach_vm_address_t originalPoolReserve{0};
+    mach_vm_address_t originalPoolSubmit{0};
+    void (*poolCommit)(void*, UInt32*){nullptr};
+    UInt64 pteBatches{0};
+    UInt64 pteBatchedEntries{0};
+    UInt64 pteDirectCalls{0};
+    UInt64 pteFallbacks{0};
+
+    bool ownsPTEBatch() { return __atomic_load_n(&pteOwner, __ATOMIC_ACQUIRE) == current_thread(); }
+
+    void writePTEsNative(void* const context, const UInt64 entry, const UInt64 count, const UInt64 addr,
+                         const UInt64 flags, const UInt64 step)
+    {
+        using Update = void (*)(void*, UInt64, UInt64, UInt64, UInt64, UInt64);
+        reinterpret_cast<Update>(originalPTEUpdate)(context, entry, count, addr, flags, step);
+    }
+
+    // Writes the owner's pending run into its pool. If the pool cannot take the packet, the entries go through the
+    // native writer one by one, so nothing is dropped.
+    void flushPTEBatch()
+    {
+        if (pteBatch.count == 0) { return; }
+        const auto count = pteBatch.count;
+        pteBatch.count = 0;
+        using Reserve = UInt32* (*)(void*, UInt32);
+        const UInt32 dwords = 4 + 2 * count;
+        auto* const out = reinterpret_cast<Reserve>(originalPoolReserve)(pteBatch.pool, dwords);
+        if (out == nullptr) {
+            increment(pteFallbacks);
+            for (UInt32 i = 0; i < count; i++) {
+                writePTEsNative(pteBatch.context, pteBatch.firstEntry + 8ULL * i, 1, pteBatch.addresses[i], pteBatch.flags,
+                                PAGE_SIZE);
+            }
+            return;
+        }
+        out[0] = sdmaWriteLinear;
+        out[1] = static_cast<UInt32>(pteBatch.firstEntry);
+        out[2] = static_cast<UInt32>(pteBatch.firstEntry >> 32);
+        out[3] = 2 * count - 1;
+        for (UInt32 i = 0; i < count; i++) {
+            const auto value = pteBatch.addresses[i] | pteBatch.flags;
+            out[4 + 2 * i] = static_cast<UInt32>(value);
+            out[5 + 2 * i] = static_cast<UInt32>(value >> 32);
+        }
+        poolCommit(pteBatch.pool, out + dwords);
+        increment(pteBatches);
+        increment(pteBatchedEntries, count);
+    }
+
+    // AMDHWVMContext::updateContiguousPTEsWithDMAUsingAddr(entry, count, addr, flags, increment). Only updates made
+    // inside mapVMPT by the scope owner are collected.
+    void updatePTEs(void* const context, const UInt64 entry, const UInt64 count, const UInt64 addr, const UInt64 flags,
+                    const UInt64 step)
+    {
+        if (!ownsPTEBatch() || pteDepth == 0) {
+            writePTEsNative(context, entry, count, addr, flags, step);
+            return;
+        }
+        auto* const pool = getMember<void*>(context, 0x30);
+        if (count == 1 && (entry & 7) == 0) {
+            const bool extends = pteBatch.count != 0 && pteBatch.context == context && pteBatch.pool == pool
+                                 && pteBatch.flags == flags && pteBatch.count < pteBatchMax
+                                 && entry == pteBatch.firstEntry + 8ULL * pteBatch.count;
+            if (!extends) {
+                flushPTEBatch();
+                pteBatch.context = context;
+                pteBatch.pool = pool;
+                pteBatch.firstEntry = entry;
+                pteBatch.flags = flags;
+            }
+            pteBatch.addresses[pteBatch.count++] = addr;
+            return;
+        }
+        flushPTEBatch();
+        increment(pteDirectCalls);
+        writePTEsNative(context, entry, count, addr, flags, step);
+    }
+
+    // AMDHWVMContext::mapVA(va, memory, offset, length, flags): claims the coalescing scope for this thread.
+    UInt64 mapVA(void* const context, const UInt64 va, void* const memory, const UInt64 offset, const UInt64 length,
+                 const UInt32 flags)
+    {
+        const auto original = FunctionCast(mapVA, originalMapVA);
+        thread_t expected = nullptr;
+        const bool owner = __atomic_load_n(&pteCoalesce, __ATOMIC_RELAXED) != 0
+                           && __atomic_compare_exchange_n(&pteOwner, &expected, current_thread(), false,
+                                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        if (owner) { pteDepth = 0; }
+        const auto result = original(context, va, memory, offset, length, flags);
+        if (owner) {
+            flushPTEBatch();  // normally already empty: the outermost mapVMPT return flushed it
+            __atomic_store_n(&pteOwner, static_cast<thread_t>(nullptr), __ATOMIC_RELEASE);
+        }
+        return result;
+    }
+
+    // AMDHWVMContext::mapVMPT (recursive): the run is flushed whenever the outermost call returns.
+    UInt64 mapVMPT(void* const context, void* const control, const UInt32 level, const UInt32 index, const UInt64 a,
+                   const UInt64 b, const UInt64 c)
+    {
+        const auto original = FunctionCast(mapVMPT, originalMapVMPT);
+        const bool owner = ownsPTEBatch();
+        if (owner) { pteDepth++; }
+        const auto result = original(context, control, level, index, a, b, c);
+        if (owner && --pteDepth == 0) { flushPTEBatch(); }
+        return result;
+    }
+
+    // AMDCommandBufferPool::getBufferStartPtr: anything else this thread writes to the pool goes after the run.
+    // Only the owner thread touches the run, so the owner check comes first.
+    UInt32* reservePoolHook(void* const pool, const UInt32 dwords)
+    {
+        if (ownsPTEBatch() && pteBatch.count != 0 && pteBatch.pool == pool) { flushPTEBatch(); }
+        using Reserve = UInt32* (*)(void*, UInt32);
+        return reinterpret_cast<Reserve>(originalPoolReserve)(pool, dwords);
+    }
+
+    // AMDCommandBufferPool::submitBuffer: a run of this pool belongs to the buffer being submitted.
+    void submitPoolHook(void* const pool, const UInt64 stamp)
+    {
+        if (ownsPTEBatch() && pteBatch.count != 0 && pteBatch.pool == pool) { flushPTEBatch(); }
+        FunctionCast(submitPoolHook, originalPoolSubmit)(pool, stamp);
+    }
+
     SYSCTL_NODE(_debug, OID_AUTO, nred_uma, CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, "X5000 unified memory");
     SYSCTL_OID(_debug_nred_uma, OID_AUTO, active, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, &active, 0,
                sysctl_handle_int, "IU", "Unified memory routes installed");
@@ -1034,7 +1560,77 @@ namespace
     UMA_COUNTER(gl_command_budget_kib, glBudgetKiB, "OpenGL command resource budget in KiB");
     UMA_COUNTER(gl_budget_sites, glBudgetSites, "OpenGL budget adapter sites observed");
     UMA_COUNTER(gl_budget_queries, glBudgetQueries, "OpenGL device configurations with a system memory budget");
+    UMA_COUNTER(pool_returns, poolReturns, "Destroyed pooled backings whose descriptors went back to the pool");
+    UMA_COUNTER(pool_return_pieces, poolReturnPieces, "Descriptors handed back to the pool on destruction");
+    UMA_COUNTER(pool_return_skips, poolReturnSkips, "Destroyed wired pooled backings not handed back");
+    UMA_COUNTER(pool_large_requests, poolLargeRequests, "Backings above 24 MiB requested from the pool");
+    UMA_COUNTER(pool_rekeyed, poolRekeyed, "Dirty pool slots handed to kernel_task when their task released a shared");
+    UMA_COUNTER(pte_batches, pteBatches, "SDMA WRITE_LINEAR packets written for coalesced page-table entries");
+    UMA_COUNTER(pte_batched_entries, pteBatchedEntries, "Page-table entries written through coalesced packets");
+    UMA_COUNTER(pte_direct_calls, pteDirectCalls, "Page-table updates passed to the native packet writer while coalescing");
+    UMA_COUNTER(pte_fallbacks, pteFallbacks, "Coalesced runs written entry by entry because the pool was full");
 #undef UMA_COUNTER
+
+    int handlePoolSwitch(struct sysctl_oid* oidp, void* arg1, int, struct sysctl_req* req)
+    {
+        auto* const target = static_cast<UInt32*>(arg1);
+        // Reads report the effective state: on only when the feature's routes were verified.
+        const bool available = largePoolInstalled && (target != &poolReturnEnabled || (poolReturnAvailable && releasePTERouted));
+        int value = available && __atomic_load_n(target, __ATOMIC_RELAXED) != 0 ? 1 : 0;
+        const auto error = sysctl_handle_int(oidp, &value, 0, req);
+        if (error != 0 || req->newptr == USER_ADDR_NULL) { return error; }
+        if (value != 0 && value != 1) { return EINVAL; }
+        if (value == 1
+            && ((target == &poolReturnEnabled && (!poolReturnAvailable || !releasePTERouted)) || !largePoolInstalled))
+        {
+            return ENOTSUP;
+        }
+        __atomic_store_n(target, static_cast<UInt32>(value), __ATOMIC_RELAXED);
+        return 0;
+    }
+    SYSCTL_PROC(_debug_nred_uma, OID_AUTO, pool_return, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &poolReturnEnabled,
+                0, handlePoolSwitch, "I", "Hand pooled descriptors back when a backing is destroyed");
+    SYSCTL_PROC(_debug_nred_uma, OID_AUTO, pool_large, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &poolLargeEnabled,
+                0, handlePoolSwitch, "I", "Serve backings above 24 MiB from the pool");
+
+    int handlePTECoalesce(struct sysctl_oid* const oidp, void*, int, struct sysctl_req* const req)
+    {
+        int value = poolCommit != nullptr && __atomic_load_n(&pteCoalesce, __ATOMIC_RELAXED) != 0 ? 1 : 0;
+        const auto error = sysctl_handle_int(oidp, &value, 0, req);
+        if (error != 0 || req->newptr == USER_ADDR_NULL) { return error; }
+        if (value != 0 && value != 1) { return EINVAL; }
+        if (originalPTEUpdate == 0 || originalMapVMPT == 0 || originalMapVA == 0 || originalPoolReserve == 0
+            || originalPoolSubmit == 0 || poolCommit == nullptr)
+        {
+            return ENODEV;
+        }
+        __atomic_store_n(&pteCoalesce, static_cast<UInt32>(value), __ATOMIC_RELAXED);
+        return 0;
+    }
+    SYSCTL_PROC(_debug_nred_uma, OID_AUTO, pte_coalesce, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0,
+                handlePTECoalesce, "I", "Write runs of single-page PTE updates as one SDMA WRITE_LINEAR packet");
+
+
+    // Bucket occupancy of the native pool (wired clean, purgeable clean, dirty per bucket), as last sampled under the
+    // accelerator lock by a pooled allocation, a hand-back or a shared release.
+    int handlePoolState(struct sysctl_oid* oidp, void*, int, struct sysctl_req* req)
+    {
+        char text[160] = "none";
+        if (__atomic_load_n(&activePool, __ATOMIC_ACQUIRE) != nullptr) {
+            size_t used = 0;
+            for (size_t bucket = 0; bucket < poolBuckets && used < sizeof(text); bucket++) {
+                const auto written = snprintf(text + used, sizeof(text) - used, "%s%u/%u/%u", bucket ? " " : "",
+                    __atomic_load_n(&poolSnapshot[bucket][0], __ATOMIC_RELAXED),
+                    __atomic_load_n(&poolSnapshot[bucket][1], __ATOMIC_RELAXED),
+                    __atomic_load_n(&poolSnapshot[bucket][2], __ATOMIC_RELAXED));
+                if (written < 0) { break; }
+                used += static_cast<size_t>(written);
+            }
+        }
+        return sysctl_handle_string(oidp, text, sizeof(text), req);
+    }
+    SYSCTL_PROC(_debug_nred_uma, OID_AUTO, pool_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
+                handlePoolState, "A", "Pool wired/purgeable/dirty descriptors per bucket");
 
     void activate()
     {
@@ -1054,11 +1650,77 @@ namespace
             &sysctl__debug_nred_uma_metal_working_set, &sysctl__debug_nred_uma_metal_budget_pages,
             &sysctl__debug_nred_uma_metal_budget_queries,
             &sysctl__debug_nred_uma_gl_command_budget_kib, &sysctl__debug_nred_uma_gl_budget_sites,
-            &sysctl__debug_nred_uma_gl_budget_queries,
+            &sysctl__debug_nred_uma_gl_budget_queries, &sysctl__debug_nred_uma_pool_returns,
+            &sysctl__debug_nred_uma_pool_return_pieces, &sysctl__debug_nred_uma_pool_return_skips,
+            &sysctl__debug_nred_uma_pool_large_requests, &sysctl__debug_nred_uma_pool_return,
+            &sysctl__debug_nred_uma_pool_large, &sysctl__debug_nred_uma_pool_state, &sysctl__debug_nred_uma_pool_rekeyed,
+            &sysctl__debug_nred_uma_pte_coalesce, &sysctl__debug_nred_uma_pte_batches,
+            &sysctl__debug_nred_uma_pte_batched_entries, &sysctl__debug_nred_uma_pte_direct_calls,
+            &sysctl__debug_nred_uma_pte_fallbacks,
         };
         for (auto* const control : controls) { sysctl_register_oid(control); }
         __atomic_store_n(&active, 1, __ATOMIC_RELEASE);
         SYSLOG("UnifiedMemory", "Installed X5000 pageable backing, residency budget, and display routes");
+    }
+
+    UInt32* poolWiredTable{nullptr};
+    UInt32* poolPurgeableTable{nullptr};
+
+    // Puts the native tables back if a later check fails before the pool exists.
+    void restoreNativePoolBuckets()
+    {
+        if (poolWiredTable == nullptr || poolPurgeableTable == nullptr) { return; }
+        if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
+            SYSLOG("UnifiedMemory", "Could not restore the native buffer pool buckets");
+            return;
+        }
+        memcpy(poolWiredTable, nativeWiredInfo, sizeof(nativeWiredInfo));
+        memcpy(poolPurgeableTable, nativePurgeableInfo, sizeof(nativePurgeableInfo));
+        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+        SYSLOG("UnifiedMemory", "Native buffer pool buckets restored");
+    }
+
+    // Rewrites the pool bucket tables before IOGraphicsAccelerator2::start creates the pool. Returns false without
+    // writing when any byte differs from 25G332.
+    bool installLargePoolBuckets(const Image& image)
+    {
+        const auto init = image.resolve(poolInitSymbol);
+        const auto request = image.resolve(poolFactorySymbol);
+        if (init == 0 || request == 0 || !image.matches(init + poolInfoLoad, poolInfoLea)
+            || !image.matches(init + poolPurgeableLoad, poolInfoLea) || !image.matches(init + poolPrefillStore, poolPrefill)
+            || !image.matches(request + poolCapCheck, poolCap) || !image.matches(request + poolStackClear, poolStack))
+        {
+            return false;
+        }
+        const auto target = [&](const size_t load) {
+            SInt32 relative{};
+            memcpy(&relative, reinterpret_cast<const void*>(init + load + 3), sizeof(relative));
+            return init + load + 7 + static_cast<mach_vm_address_t>(static_cast<SInt64>(relative));
+        };
+        auto* const wired = reinterpret_cast<UInt32*>(target(poolInfoLoad));
+        auto* const purgeable = reinterpret_cast<UInt32*>(target(poolPurgeableLoad));
+        if (!image.contains(reinterpret_cast<mach_vm_address_t>(wired), sizeof(nativeWiredInfo))
+            || !image.contains(reinterpret_cast<mach_vm_address_t>(purgeable), sizeof(nativePurgeableInfo))
+            || memcmp(wired, nativeWiredInfo, sizeof(nativeWiredInfo)) != 0
+            || memcmp(purgeable, nativePurgeableInfo, sizeof(nativePurgeableInfo)) != 0
+            || MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS)
+        {
+            return false;
+        }
+        memcpy(wired, largeWiredInfo, sizeof(largeWiredInfo));
+        memcpy(purgeable, largePurgeableInfo, sizeof(largePurgeableInfo));
+        const bool written = memcmp(wired, largeWiredInfo, sizeof(largeWiredInfo)) == 0
+                             && memcmp(purgeable, largePurgeableInfo, sizeof(largePurgeableInfo)) == 0;
+        if (!written) {
+            memcpy(wired, nativeWiredInfo, sizeof(nativeWiredInfo));
+            memcpy(purgeable, nativePurgeableInfo, sizeof(nativePurgeableInfo));
+        }
+        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+        if (written) {
+            poolWiredTable = wired;
+            poolPurgeableTable = purgeable;
+        }
+        return written;
     }
 
     bool installIOAccel(const Image& image)
@@ -1125,6 +1787,18 @@ namespace
         unwireMemory = FunctionCast(unwireMemory, unwire);
         setMemoryFlags = FunctionCast(setMemoryFlags, setFlags);
         pruneOrphanedMappings = FunctionCast(pruneOrphanedMappings, prune);
+        const auto poolRelease = image.resolve(poolReleaseSymbol);
+        const auto poolKick = image.resolve(poolKickSymbol);
+        const auto eventMachine = image.resolve(eventMachineSymbol);
+        const auto mergeEvents = image.resolve(mergeEventsSymbol);
+        if (poolRelease != 0 && poolKick != 0 && eventMachine != 0 && mergeEvents != 0) {
+            releasePoolDescriptors = FunctionCast(releasePoolDescriptors, poolRelease);
+            kickPoolTimer = FunctionCast(kickPoolTimer, poolKick);
+            getEventMachine = FunctionCast(getEventMachine, eventMachine);
+            mergeMappingEvents = FunctionCast(mergeMappingEvents, mergeEvents);
+            largePoolInstalled = installLargePoolBuckets(image);
+        }
+        SYSLOG("UnifiedMemory", "Large buffer pool buckets %s", largePoolInstalled ? "installed" : "not installed");
         nredUnifiedPrimaryNative = primary + primaryGateOffset + sizeof(primaryGate);
         nredUnifiedPrimarySystem = primary + primaryNativeSystem;
         nredUnifiedBufferResume = buffer + bufferFactoryCall + 5;
@@ -1145,6 +1819,49 @@ namespace
             {orphanSymbol, orphanBacking, originalOrphan},
             {mapAtSymbol, mapAtAddress, originalMapAt},
         };
+        const auto memoryRelease = image.resolve(memoryReleaseSymbol);
+        const auto sharedReleaseEntry = image.resolve(sharedReleaseSymbol);
+        UInt8 sharedHead[8]{}, pruneHead[8]{};
+        if (sharedReleaseEntry != 0 && image.contains(sharedReleaseEntry, sizeof(sharedHead))
+            && image.contains(prune, sizeof(pruneHead)))
+        {
+            memcpy(sharedHead, reinterpret_cast<const void*>(sharedReleaseEntry), sizeof(sharedHead));
+            memcpy(pruneHead, reinterpret_cast<const void*>(prune), sizeof(pruneHead));
+        } else if (largePoolInstalled) {
+            largePoolInstalled = false;
+            restoreNativePoolBuckets();
+        }
+        if (largePoolInstalled
+            && (memoryRelease == 0 || !image.calls(memoryRelease + releasePruneCall, prune)
+                || !image.matches(memoryRelease + releasePruneCall + 5, releasePruneTail)))
+        {
+            largePoolInstalled = false;
+            restoreNativePoolBuckets();
+            SYSLOG("UnifiedMemory", "IOAccelMemory::release does not match; pooled hand-back disabled");
+        }
+        if (largePoolInstalled) {
+            releasePruneReturn = memoryRelease + releasePruneCall + 5;
+            KernelPatcher::RouteRequest shared[] = {
+                {sharedReleaseSymbol, releaseShared, originalSharedRelease},
+                {pruneSymbol, pruneFromRelease, originalPrune},
+            };
+            const bool installed = image.install(shared, arrsize(shared)) && originalSharedRelease != 0
+                                   && originalPrune != 0;
+            // Lilu can report success after writing the trampoline without the jump; require both entries patched.
+            const bool patched = memcmp(reinterpret_cast<const void*>(sharedReleaseEntry), sharedHead, sizeof(sharedHead)) != 0
+                                 && memcmp(reinterpret_cast<const void*>(prune), pruneHead, sizeof(pruneHead)) != 0;
+            poolReturnAvailable = installed && patched;
+            if (!poolReturnAvailable) {
+                // Without the re-keying, dirty slots must not be produced at all.
+                __atomic_store_n(&poolReturnEnabled, 0, __ATOMIC_RELAXED);
+                largePoolInstalled = false;
+                restoreNativePoolBuckets();
+                SYSLOG("UnifiedMemory", "Shared release or prune route failed; pooled hand-back disabled");
+                poolReturnAvailable = false;
+            }
+            // NootedRed's own prune calls (orphanBacking, mapAtAddress) bypass the route.
+            if (originalPrune != 0) { pruneOrphanedMappings = FunctionCast(pruneOrphanedMappings, originalPrune); }
+        }
         return image.install(routes, arrsize(routes)) && image.branch(limit, getWiredBudget)
                && image.branch(factory + poolGateOffset, poolBranch)
                && image.branch(start + poolCreateGateOffset, poolCreateBranch)
@@ -1178,6 +1895,7 @@ namespace
         acceleratorClass = reinterpret_cast<const OSMetaClass*>(accelerator);
         sysMemoryClass = reinterpret_cast<const OSMetaClass*>(sysMemory);
         getAllocationParameters = FunctionCast(getAllocationParameters, parameters);
+        const auto releaseHead = image.head(releasePTESymbol);
         KernelPatcher::RouteRequest routes[] = {
             {flipSymbol, getFlip, originalFlip},
             {mapInitSymbol, initMapping, originalMapInit},
@@ -1185,7 +1903,40 @@ namespace
             {commitSymbol, commitMapping, originalCommit},
             {releasePTESymbol, releaseMappingPTE, originalReleasePTE},
         };
-        return image.install(routes, arrsize(routes));
+        if (!image.install(routes, arrsize(routes))) { return false; }
+        releasePTERouted = Image::patched(releaseHead) && originalReleasePTE != 0;
+
+        // Optional: page-table write coalescing. A failure leaves it unavailable and changes nothing else.
+        const auto commitFn = image.resolve(poolCommitSymbol);
+        const EntryHead pteHeads[] = {image.head(poolReserveSymbol), image.head(poolSubmitSymbol),
+                                      image.head(pteUpdateSymbol), image.head(mapVMPTSymbol), image.head(mapVASymbol)};
+        bool pteReady = false;
+        if (commitFn != 0) {
+            poolCommit = reinterpret_cast<void (*)(void*, UInt32*)>(commitFn);
+            KernelPatcher::RouteRequest pteRoutes[] = {
+                {poolReserveSymbol, reservePoolHook, originalPoolReserve},
+                {poolSubmitSymbol, submitPoolHook, originalPoolSubmit},
+                {pteUpdateSymbol, updatePTEs, originalPTEUpdate},
+                {mapVMPTSymbol, mapVMPT, originalMapVMPT},
+                {mapVASymbol, mapVA, originalMapVA},
+            };
+            pteReady = image.install(pteRoutes, arrsize(pteRoutes)) && originalPoolReserve != 0 && originalPoolSubmit != 0
+                       && originalPTEUpdate != 0 && originalMapVMPT != 0 && originalMapVA != 0;
+            for (const auto& entry : pteHeads) { pteReady = pteReady && Image::patched(entry); }
+        }
+        if (!pteReady) {
+            // Routes that did get installed pass everything through while coalescing is off.
+            poolCommit = nullptr;
+            __atomic_store_n(&pteCoalesce, 0, __ATOMIC_RELAXED);
+            SYSLOG("UnifiedMemory", "Page-table write coalescing unavailable");
+        }
+        if (!releasePTERouted && largePoolInstalled) {
+            // X5000 loads before its accelerator starts, so the pool does not exist yet.
+            largePoolInstalled = false;
+            restoreNativePoolBuckets();
+            SYSLOG("UnifiedMemory", "PTE release route not verified; large buffer pool disabled");
+        }
+        return true;
     }
 }
 

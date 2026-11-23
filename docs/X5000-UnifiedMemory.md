@@ -22,15 +22,17 @@ Metal 客户端用 wired 上限的四分之三作为建议工作集，命令分�
 
 同日试验过由 CPU 写系统内存中的叶页表。`AMDHWVMContext::clearWithDMA` 的异步清零会覆盖先完成的 CPU 写入，因此叶页的全部写入都要由 CPU 完成。GPU 读页表时不探查 CPU 缓存，写回缓存的叶页需要逐行刷新。逐行刷新后屏障等待降至 0.06 ms，但 WindowServer 的内核 CPU 时间从每轮 6.2 s 增至 11.7 s，轻量动画的长帧比例由 16% 升至 34%。写合并映射出现 GPU 页保护错误。Linux amdgpu 在 Renoir 上同样用 SDMA 更新图形任务的页表，因此该方案已移除，相关数据位于 `build/uma-cpupt3-20261122` 和 `build/uma-wcpt-20261122`。
 
-映射复用见下文。仍需新建的散页映射，后续可在 `mapVMPT` 的叶循环内合并为 `WRITE_LINEAR` 命令。
+映射复用见下文。仍需新建的散页映射由统一内存合并写入。线程进入 `AMDHWVMContext::mapVA` 后，`mapVMPT` 内对连续页表项的单项更新先暂存，再写成一条 SDMA `WRITE_LINEAR` 命令，每项 2 个双字，做法同 amdgpu 的 `sdma_v4_0_vm_write_pte`。同一线程在该命令池上的其他预留或提交之前、最外层 `mapVMPT` 返回时都先写出暂存项，因此 `mapVA` 结束更新时池内已有全部命令。大命令预留失败时逐项交给原生写入。SDMA 仍是唯一的页表写入者，撤销映射（`unmapVA`）照旧走原生写入。64 MiB 纹理的页表命令约 19 万个双字，GPU 任务在调度器中等页表屏障约 11 ms；合并后这段等待降至 2–3 ms。`pte_batches`、`pte_batched_entries` 和 `pte_fallbacks` 记录合并写入。
 
 ### 原生缓冲池
 
 `IOAcceleratorFamily2` 为以系统内存为主存储的 GPU 提供 `IOAccelBufferMemoryDescriptorPool2`。`IOGraphicsAccelerator2::start` 只在驱动配置的 `0xc90` 第 21 位置位时建池，AMD 驱动不置该位。统一内存在同一检查点为 Renoir 加速器建池，不改动该配置位，因此其他依赖该位的原生行为保持不变。
 
-池按 1 MiB、256 KiB、64 KiB、16 KiB 和 4 KiB 五档缓存已锁页的可分页、可丢弃描述符，单次请求上限 24 MiB。统一内存的主分配和数据缓冲区经 `IOAccelSysMemory::withOptions` 的原生池路径取得预先锁页的描述符组合。资源释放时，`orphanIt` 把描述符连同所属任务和最后的 GPU 事件放回池中，同一任务复用时无需重新清零。超出上限或池中无可用描述符时走原有可分页路径。非统一内存的系统内存分配不经过池。池的补充由原生定时器在加速器锁内完成。
+原生池按五档缓存已锁页的可分页、可丢弃描述符，每档预填 24 块，单次请求上限是首档块大小乘以 24。原生首档为 1 MiB，上限 24 MiB，而 WindowServer 在 10-bit 全屏切换时新建的半浮点纹理为 25–64 MiB。统一内存在 `IOAcceleratorFamily2` 加载时、建池之前改写档位表 `sWiredPoolInfo` 和 `sPurgeablePoolInfo`，五档改为 4 MiB、1 MiB、256 KiB、64 KiB 和 4 KiB，上限变为 96 MiB。请求在栈上最多拼 64 个描述符且原生代码不检查边界，新档位下 96 MiB 以内最多 47 个。改写前核对 `initWithAccelerator` 与 `newWiredDescriptorsWithLength` 中的取表指令、预填常量、上限判断和栈数组大小，任一不符则保持原生档位；后续检查失败时写回原表。统一内存的主分配和数据缓冲区经 `IOAccelSysMemory::withOptions` 的原生池路径取得预先锁页的描述符组合。超出上限或池中无可用描述符时走原有可分页路径。非统一内存的系统内存分配不经过池。池的补充和清零由原生定时器在加速器锁内完成，每处理一块检查一次等锁者。
 
-改动前，WindowServer 每次创建或销毁窗口缓存都要新建可分页内存、逐页缺页清零并锁页，释放时再解锁。2026 年 11 月 22 日的内核栈采样中，锁页和解锁分别占 WindowServer 内核 CPU 时间的 15.5% 和 13.5%。`pool_allocations` 记录由池直接提供的 backing 数。
+原生只在 `IOAccelSysMemory::orphanIt` 中把描述符退回池，而池化 backing 几乎都在 `IOAccelMemory::release` 中结束：映射事件完成后，它直接调用 `pruneOrphanedMappings`，随后释放 backing。统一内存在该调用点（`release+0xa6`）和自己的 `orphanIt` 路由中接管：清理孤儿映射前给 backing 加一次锁页计数，避免最后一次 `release_pte` 把整组描述符解锁；收集这些映射撤销页表时 `AMDHWVMContext` 的页表更新事件（`context+0x40`，SDMA 页表队列上覆盖清表和 TLB 失效的 stamp）；backing 确定销毁时按 `orphanIt` 的做法调用 `releaseDescriptors`，把描述符连同该事件放回池中。同一任务可以直接复用这些脏描述符，事件随新资源继承；交给其他任务前，原生定时器要等事件完成并清零。任务的 `IOAccelShared2` 释放时，统一内存先把该任务名下的脏描述符改挂到 `kernel_task`，此后只能清零后复用，避免新任务复用同一任务地址时取到旧内容。每个 backing 只退回一次。空闲时首档常驻约 24–32 块，加上其他档位共约 190 MiB 锁页，另约 190 MiB 以 Volatile 状态保留，可由 VM 回收。
+
+改动前，WindowServer 每次创建或销毁窗口缓存都要新建可分页内存、逐页缺页清零并锁页，释放时再解锁。2026 年 11 月 22 日的内核栈采样中，锁页和解锁分别占 WindowServer 内核 CPU 时间的 15.5% 和 13.5%。新建大纹理时的锁页发生在加速器锁内：跑 64 MiB 和 16 MiB 的创建释放时，WindowServer 在这把锁上累计阻塞 151 ms，单次最长 26.6 ms；启用池和退回后分别为 17 ms 和 3.1 ms。`pool_allocations` 记录由池直接提供的 backing 数，`pool_returns`、`pool_return_pieces` 和 `pool_return_skips` 记录退回，`pool_large_requests` 记录 24 MiB 以上的池请求，`pool_rekeyed` 记录改挂的脏描述符，`pool_state` 给出各档锁页、可丢弃和脏描述符数。
 
 ### 映射复用
 
@@ -54,9 +56,9 @@ backing 只剩孤儿映射引用时，已无对象能复活这些映射，原生
 
 ## 启动配置
 
-该版本的路由限于 Renoir 和 macOS 构建 `25G332` 对应的两个 kext UUID。本机从系统 EFI 的 `EFI/OC/Kexts/NootedRed-MappingReuse.kext` 启动，`Kernel → Add` 中将 `Lilu.kext` 排在它前面。
+该版本的路由限于 Renoir 和 macOS 构建 `25G332` 对应的两个 kext UUID。本机从系统 EFI 的 `EFI/OC/Kexts/NootedRed-UMA.kext` 启动，`Kernel → Add` 中将 `Lilu.kext` 排在它前面。
 
-日用配置使用 `-NRedUnifiedMemory`。`debug.nred_uma.active` 为 `1` 时驱动路由已安装，系统日志出现 `Creating the native buffer pool` 表示池已建立。固件回滚入口为 `F9 → Boot from EFI File → \EFI\NRedBackup\OpenCore.efi`。
+日用配置只需要 `-NRedUnifiedMemory`，扩展池、描述符退回和页表合并写入随之默认启用。`debug.nred_uma.active` 为 `1` 时驱动路由已安装，系统日志出现 `Creating the native buffer pool` 表示池已建立，`Large buffer pool buckets installed` 表示档位表已改写。每项功能只在其路由的入口确认已被改写后生效，否则自动关闭并保留原生行为。排查问题时可在运行中用 root 关闭单项：`debug.nred_uma.pool_large=0` 让 24 MiB 以上的请求改走可分页路径，`pool_return=0` 停止退回描述符，`pte_coalesce=0` 恢复逐项写页表；读出的值反映实际状态，重启后恢复默认。档位表在建池时生效，运行中不变。固件回滚入口为 `F9 → Boot from EFI File → \EFI\NRedBackup\OpenCore.efi`。
 
 本机按默认配置使用原生驻留预算。预算回归测试可给测试 EFI 加 `nred-uma-wired-mib=768`，用较小的工作集触发原生回收。
 
@@ -106,6 +108,22 @@ codesign -s - /tmp/x5000_uma_gl_probe
 新构建的实机验收需重跑本节读回和回收用例。整机睡眠恢复、实际 GPU 重置和从可见桌面开始的外屏热插拔，都应保留原资源并在恢复后校验读回。
 
 `python3 tools/test_x5000_memory_policy.py` 检查放置策略、驻留状态转换和预算计算。物理热插拔和实际 GPU 重置需要另外实测。
+
+### 扩展池、退回与页表合并写入验收
+
+2026 年 11 月 23 日 18:01 CST 从系统 EFI 启动候选 kext `5DAA2EEC`，同一次开机内交替切换 `pool_large`/`pool_return` 和 `pte_coalesce`，记录位于 `build/uma-daily-20261123/boot`。日用版只去掉了开发用的开关。
+
+- 64 MiB 私有纹理创建、首次使用并释放的中位数：全部关闭 33.5/35.9 ms，只开池 18 ms，只开合并写入 24 ms，全部开启 8.2/8.4 ms。16 MiB 对应 8.2/8.7、5.5、5.6 和 2.1/2.2 ms。
+- 10-bit 4K 桌面动画中超过 25 ms 的帧间隔：全屏进入 40.3/39.2% 降至 13.9/15.3%，退出调度中心 63/57% 降至 33/41%，不含滚动的全部场景 19.2/18.6% 降至 12.7/12.8%。进入调度中心在各配置下均为 41–46%，瓶颈在 GPU 排队。
+- 每轮约 1930 个 backing 退回池，`pool_return_skips` 和 `pte_fallbacks` 为零。WindowServer 的大纹理锁页由每轮约 1.2 s 降至十几毫秒，24 MiB 以上请求的描述符约 10% 需新建。
+- 跨进程检查：一个进程写入 8 张带特征值的 64 MiB 私有纹理后退出，另一个进程新建同尺寸纹理并读回，未出现特征值。同一进程内的对照读到复用（4 张中 2–4 张），说明检查能看到复用的内容。
+- 全部探针通过，包括 23 GiB 压力。空闲 60 秒后脏描述符清空，压力后加速器锁页回落到 436 MB。
+
+同一次开机里以 carve-out 放置做对照（测量时让该进程的资源走原生显存），统一内存的缓冲区读带宽为 97%，纹理读写 94–99%，运算持平，16/32/64 MiB 纹理创建到释放为 2.3/4.7/8.0 ms 对 0.85/1.35/2.75 ms。carve-out 运行已占满约 500 MiB 并出现换出和回收等待，统一内存的 1 GiB 缓冲区读带宽为 36 GB/s。
+
+依赖访问延迟高 17–22%，原因在地址翻译。统一内存的页表项为系统内存、探查 CPU 缓存（`0x77`），fragment 基本为 0，每项覆盖 4 KiB；carve-out 为显存页表项（`0x71`），fragment 1–4，最大覆盖 64 KiB。按页顺序访问 64 MiB（几乎每次访问都落到内存，约 64 次访问才有一次 TLB 缺失）时两者相同（0.98），每次访问换一个 4 KiB 页时统一内存慢 41%，跳 64 KiB 时慢 47%。64 MiB 私有缓冲区拷贝慢约 16%，读端和写端各约 5–8%。消除这部分差距需要至少 64 KiB 对齐的物理连续 backing，使 `mapVMPT` 生成 fragment，这类 backing 在资源存活期间不能被换出。
+
+尚待实测：带资源的整机睡眠恢复、从可见桌面开始的外屏热插拔、实际 GPU 重置和长时间混合使用。
 
 ### 早期资源 backing 验收
 
