@@ -89,10 +89,22 @@ void testBudgets() {
     assert(glCommandBudgetKiB(UINT64_MAX, page) == UINT32_MAX);
 }
 
+void testPoolBuckets() {
+    assert(!largePoolBuckets(0, 0));
+    assert(!largePoolBuckets(8 * GiB, 0));
+    assert(!largePoolBuckets(8 * GiB - 512 * MiB, 0));
+    assert(largePoolBuckets(16 * GiB - 512 * MiB, 0));
+    assert(largePoolBuckets(64 * GiB, 0));
+    assert(largePoolBuckets(64 * GiB, 4096));
+    assert(!largePoolBuckets(64 * GiB, 4095));
+    assert(!largePoolBuckets(64 * GiB, 768));
+}
+
 int main() {
     testPlacement();
     testResidency();
     testBudgets();
+    testPoolBuckets();
     std::puts("memory policy checks passed");
 }
 """

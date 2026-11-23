@@ -1,3 +1,5 @@
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl3.h>
 #include <err.h>
@@ -24,6 +26,26 @@ static uint64_t counter(const char *name)
     if (sysctlbyname(name, &value, &size, NULL, 0) != 0) { err(1, "%s", name); }
     if (size != sizeof(value)) { errx(1, "Unexpected counter size for %s", name); }
     return value;
+}
+
+// Size of the firmware carve-out, from the VRAM,totalMB property NootedRed publishes on the GPU. Falls back to 512 MiB.
+static uint64_t carveOutBytes(void)
+{
+    uint64_t bytes = 512 * (uint64_t)MiB;
+    const io_service_t service =
+        IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AMDRadeonX5000_AMDVega10GraphicsAccelerator"));
+    if (service == IO_OBJECT_NULL) { return bytes; }
+    const CFTypeRef value = IORegistryEntrySearchCFProperty(service, kIOServicePlane, CFSTR("VRAM,totalMB"),
+                                                            kCFAllocatorDefault,
+                                                            kIORegistryIterateRecursively | kIORegistryIterateParents);
+    int64_t megabytes = 0;
+    if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()
+        && CFNumberGetValue((CFNumberRef)value, kCFNumberSInt64Type, &megabytes) && megabytes > 0) {
+        bytes = (uint64_t)megabytes * MiB;
+    }
+    if (value != NULL) { CFRelease(value); }
+    IOObjectRelease(service);
+    return bytes;
 }
 
 static void checkGL(const char *stage)
@@ -307,9 +329,12 @@ int main(int argc, char **argv)
     }
     const uint64_t queries = baseline ? 0 : counter("debug.nred_uma.gl_budget_queries");
     const bool small = baseline || smoke || layouts;
-    const unsigned groupCount = small ? 1 : retainedGroups;
     const GLsizei edge = small ? 256 : 4096;
     const uint64_t drawBytes = (uint64_t)edge * edge * 4 * (texturesPerDraw - 1) + (uint64_t)edge * edge;
+    // The full case keeps at least retainedGroups groups and at least 256 MiB more than the carve-out.
+    const uint64_t carveOut = carveOutBytes();
+    const uint64_t neededGroups = (carveOut + 256 * (uint64_t)MiB + drawBytes - 1) / drawBytes;
+    const unsigned groupCount = small ? 1 : neededGroups > retainedGroups ? (unsigned)neededGroups : retainedGroups;
 
     const CGLPixelFormatAttribute attributes[] = {
         kCGLPFAAccelerated, kCGLPFANoRecovery, kCGLPFAOpenGLProfile,
@@ -336,13 +361,15 @@ int main(int argc, char **argv)
         CGLReleaseContext(context);
         return 0;
     }
-    printf("%s, %.1f MiB per draw, %.1f MiB across %u groups\n", renderer, (double)drawBytes / MiB,
-           (double)drawBytes * groupCount / MiB, groupCount);
+    printf("%s, carve-out %llu MiB, %.1f MiB per draw, %.1f MiB across %u groups\n", renderer,
+           (unsigned long long)(carveOut / MiB), (double)drawBytes / MiB, (double)drawBytes * groupCount / MiB,
+           groupCount);
     fflush(stdout);
 
     const uint64_t beforeBytes = baseline ? 0 : counter("debug.nred_uma.bytes_live");
     const uint64_t beforeCommits = baseline ? 0 : counter("debug.nred_uma.task_commits");
-    GLuint textures[retainedGroups][texturesPerDraw] = {{0}};
+    GLuint (*textures)[texturesPerDraw] = calloc(groupCount, sizeof(*textures));
+    if (textures == NULL) { errx(1, "Could not allocate %u texture groups", groupCount); }
     GLuint framebuffer = 0, output = 0, vertices = 0;
     glGenFramebuffers(1, &framebuffer);
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
@@ -372,7 +399,7 @@ int main(int argc, char **argv)
                (double)budgetKiB / 1024, (double)growth / MiB);
         if (counter("debug.nred_uma.gl_budget_sites") != 3 || counter("debug.nred_uma.gl_budget_queries") <= queries
             || budgetKiB <= drawBytes / 1024 || counter("debug.nred_uma.task_commits") <= beforeCommits
-            || (!small && growth <= 512 * (uint64_t)MiB)) {
+            || (!small && growth <= carveOut)) {
             errx(1, "The OpenGL workload did not demonstrate the unified budget and pageable primary backing");
         }
     }
@@ -388,6 +415,7 @@ int main(int argc, char **argv)
     glDeleteFramebuffers(1, &framebuffer);
     glDeleteTextures(1, &output);
     for (unsigned group = 0; group < groupCount; ++group) { glDeleteTextures(texturesPerDraw, textures[group]); }
+    free(textures);
     if (layouts) { verifyMultisampleFramebuffer(); }
     CGLSetCurrentContext(NULL);
     CGLReleaseContext(context);

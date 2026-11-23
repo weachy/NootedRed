@@ -1,5 +1,6 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
+#import <IOKit/IOKitLib.h>
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
@@ -65,6 +66,26 @@ static ResidencySnapshot snapshot(void)
         counter("debug.nred_uma.mapping_va_changes"),
         counter("debug.nred_uma.mapping_tracking_failures"),
     };
+}
+
+// Size of the firmware carve-out, from the VRAM,totalMB property NootedRed publishes on the GPU. Falls back to 512 MiB.
+static uint64_t carveOutBytes(id<MTLDevice> device)
+{
+    uint64_t bytes = 512 * (uint64_t)MiB;
+    const io_registry_entry_t entry =
+        IOServiceGetMatchingService(kIOMainPortDefault, IORegistryEntryIDMatching(device.registryID));
+    if (entry == IO_OBJECT_NULL) { return bytes; }
+    const CFTypeRef value = IORegistryEntrySearchCFProperty(entry, kIOServicePlane, CFSTR("VRAM,totalMB"),
+                                                            kCFAllocatorDefault,
+                                                            kIORegistryIterateRecursively | kIORegistryIterateParents);
+    int64_t megabytes = 0;
+    if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()
+        && CFNumberGetValue((CFNumberRef)value, kCFNumberSInt64Type, &megabytes) && megabytes > 0) {
+        bytes = (uint64_t)megabytes * MiB;
+    }
+    if (value != NULL) { CFRelease(value); }
+    IOObjectRelease(entry);
+    return bytes;
 }
 
 static uint64_t metalField(id<MTLDevice> device, const char *name)
@@ -727,6 +748,12 @@ int main(int argc, char **argv)
                device.name.UTF8String, (unsigned long)(groups * payload * 2 / MiB),
                managed ? "managed" : "private",
                (unsigned long long)(device.recommendedMaxWorkingSetSize / MiB));
+        const uint64_t carveOut = carveOutBytes(device);
+        printf("Carve-out %llu MiB\n", (unsigned long long)(carveOut / MiB));
+        if (!baseline && groups > 1 && groups * payload * 2 <= carveOut) {
+            printf("The working set fits in the carve-out; use more than %llu groups to test beyond it\n",
+                   (unsigned long long)(carveOut / (payload * 2)));
+        }
         printf("First resource sample %lu\n", (unsigned long)seed);
         if (requireBudget) { verifyBudget(device); }
         fflush(stdout);
@@ -828,7 +855,7 @@ int main(int argc, char **argv)
                    (unsigned long long)(after.mappingAddressChanges - before.mappingAddressChanges),
                    (unsigned long long)(after.mappingTrackingFailures - before.mappingTrackingFailures));
             if (after.textures == before.textures || after.commits == before.commits
-                || (groups * payload * 2 > 512 * MiB && primaryGrowth <= 512 * MiB)) {
+                || (groups * payload * 2 > carveOut && primaryGrowth <= carveOut)) {
                 errx(1, "Insufficient managed primary backing or per-task GPU mappings");
             }
             if (requireReclaim && (after.evictions == before.evictions

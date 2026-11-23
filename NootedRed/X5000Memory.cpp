@@ -344,7 +344,11 @@ namespace
     void (*kickPoolTimer)(IOService*){nullptr};
     void* (*getEventMachine)(const OSObject*){nullptr};
     void (*mergeMappingEvents)(OSObject*, void*){nullptr};
-    bool largePoolInstalled{false};
+    // The pooled path (pool requests, hand-back, re-keying) is installed. Requires the shared release, prune and
+    // PTE release routes.
+    bool pooledHandBack{false};
+    // The 4 MiB bucket tables are installed, so requests up to 96 MiB come from the pool.
+    bool largeBuckets{false};
     // Set only when the shared release and prune routes were verified in place; hand-back stays off before.
     bool poolReturnAvailable{false};
     // The prune collector reads the VMPT event from the routed releaseFromGPUPageTable; verified in installX5000.
@@ -782,7 +786,7 @@ namespace
             return nullptr;
         }
         const bool large = size > nativePoolLimit;
-        const bool pooled = !large || largePoolInstalled;
+        const bool pooled = !large || largeBuckets;
         if (large && pooled) { increment(poolLargeRequests); }
         auto* const memory = static_cast<OSObject*>(
             pooled ? allocatePooled(accelerator, task, shared, resource, options, size, unshared)
@@ -1035,7 +1039,7 @@ namespace
     // them, and a later task at the same address cannot receive them.
     void releaseShared(void* const orphanPool, void* const shared)
     {
-        auto* const pool = shared != nullptr && largePoolInstalled
+        auto* const pool = shared != nullptr && pooledHandBack
                                ? ownedPool(getMember<IOService*>(shared, sharedAccelerator))
                                : nullptr;
         if (pool != nullptr) {
@@ -1102,7 +1106,7 @@ namespace
     // unwire every piece just before the backing is destroyed.
     bool holdsPooledWire(OSObject* const memory)
     {
-        if (!largePoolInstalled || !poolReturnAvailable || !releasePTERouted) { return false; }
+        if (!pooledHandBack || !poolReturnAvailable || !releasePTERouted) { return false; }
         const auto flags = getMember<UInt32>(memory, memoryFlags);
         if ((flags & (pooledMemory | wiredMemory)) != (pooledMemory | wiredMemory)) { return false; }
         virtualSlot<void (*)(OSObject*)>(memory, incrementWireSlot)(memory);
@@ -1153,7 +1157,7 @@ namespace
         // The collector is used under the accelerator lock; the exchange keeps a second thread out regardless.
         thread_t expected = nullptr;
         auto* const machine =
-            largePoolInstalled && poolReturnAvailable && releasePTERouted ? getEventMachine(memory) : nullptr;
+            pooledHandBack && poolReturnAvailable && releasePTERouted ? getEventMachine(memory) : nullptr;
         const bool collecting = machine != nullptr
                                 && __atomic_compare_exchange_n(&pruneOwner, &expected, current_thread(), false,
                                                                __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
@@ -1630,6 +1634,29 @@ namespace
         SYSLOG("UnifiedMemory", "Native buffer pool buckets restored");
     }
 
+    void disablePooledPath(const char* const reason)
+    {
+        pooledHandBack = false;
+        if (largeBuckets) {
+            largeBuckets = false;
+            restoreNativePoolBuckets();
+        }
+        SYSLOG("UnifiedMemory", "%s", reason);
+    }
+
+    // The large buckets keep up to about 200 MiB wired; machines with less RAM, or a lowered residency budget, keep
+    // the native buckets.
+    bool wantsLargeBuckets(const Image& image)
+    {
+        const auto maxMem = image.patcher.solveSymbol(KernelPatcher::KernelID, "_max_mem");
+        image.patcher.clearError();
+        const uint64_t physical = maxMem != 0 ? *reinterpret_cast<const uint64_t*>(maxMem) : 0;
+        const bool wanted = X5000Memory::largePoolBuckets(physical, requestedBudgetMiB);
+        SYSLOG("UnifiedMemory", "%llu MiB RAM, budget override %u MiB: %s buffer pool buckets", physical >> 20,
+               requestedBudgetMiB, wanted ? "large" : "native");
+        return wanted;
+    }
+
     // Rewrites the pool bucket tables before IOGraphicsAccelerator2::start creates the pool. Returns false without
     // writing when any byte differs from 25G332.
     bool installLargePoolBuckets(const Image& image)
@@ -1746,9 +1773,15 @@ namespace
             kickPoolTimer = FunctionCast(kickPoolTimer, poolKick);
             getEventMachine = FunctionCast(getEventMachine, eventMachine);
             mergeMappingEvents = FunctionCast(mergeMappingEvents, mergeEvents);
-            largePoolInstalled = installLargePoolBuckets(image);
+            pooledHandBack = true;
+            if (wantsLargeBuckets(image)) {
+                // A mismatch in the pool code turns the whole pooled path off.
+                largeBuckets = installLargePoolBuckets(image);
+                pooledHandBack = largeBuckets;
+            }
         }
-        SYSLOG("UnifiedMemory", "Large buffer pool buckets %s", largePoolInstalled ? "installed" : "not installed");
+        SYSLOG("UnifiedMemory", "Pooled hand-back %s, buffer pool buckets %s", pooledHandBack ? "on" : "off",
+               largeBuckets ? "large" : "native");
         nredUnifiedPrimaryNative = primary + primaryGateOffset + sizeof(primaryGate);
         nredUnifiedPrimarySystem = primary + primaryNativeSystem;
         nredUnifiedBufferResume = buffer + bufferFactoryCall + 5;
@@ -1777,19 +1810,16 @@ namespace
         {
             memcpy(sharedHead, reinterpret_cast<const void*>(sharedReleaseEntry), sizeof(sharedHead));
             memcpy(pruneHead, reinterpret_cast<const void*>(prune), sizeof(pruneHead));
-        } else if (largePoolInstalled) {
-            largePoolInstalled = false;
-            restoreNativePoolBuckets();
+        } else if (pooledHandBack) {
+            disablePooledPath("Shared release or prune entry not found; pooled hand-back disabled");
         }
-        if (largePoolInstalled
+        if (pooledHandBack
             && (memoryRelease == 0 || !image.calls(memoryRelease + releasePruneCall, prune)
                 || !image.matches(memoryRelease + releasePruneCall + 5, releasePruneTail)))
         {
-            largePoolInstalled = false;
-            restoreNativePoolBuckets();
-            SYSLOG("UnifiedMemory", "IOAccelMemory::release does not match; pooled hand-back disabled");
+            disablePooledPath("IOAccelMemory::release does not match; pooled hand-back disabled");
         }
-        if (largePoolInstalled) {
+        if (pooledHandBack) {
             releasePruneReturn = memoryRelease + releasePruneCall + 5;
             KernelPatcher::RouteRequest shared[] = {
                 {sharedReleaseSymbol, releaseShared, originalSharedRelease},
@@ -1803,10 +1833,7 @@ namespace
             poolReturnAvailable = installed && patched;
             if (!poolReturnAvailable) {
                 // Without the re-keying, dirty slots must not be produced at all.
-                largePoolInstalled = false;
-                restoreNativePoolBuckets();
-                SYSLOG("UnifiedMemory", "Shared release or prune route failed; pooled hand-back disabled");
-                poolReturnAvailable = false;
+                disablePooledPath("Shared release or prune route failed; pooled hand-back disabled");
             }
             // NootedRed's own prune calls (orphanBacking, mapAtAddress) bypass the route.
             if (originalPrune != 0) { pruneOrphanedMappings = FunctionCast(pruneOrphanedMappings, originalPrune); }
@@ -1879,11 +1906,9 @@ namespace
             __atomic_store_n(&pteCoalesce, 0, __ATOMIC_RELAXED);
             SYSLOG("UnifiedMemory", "Page-table write coalescing unavailable");
         }
-        if (!releasePTERouted && largePoolInstalled) {
+        if (!releasePTERouted && pooledHandBack) {
             // X5000 loads before its accelerator starts, so the pool does not exist yet.
-            largePoolInstalled = false;
-            restoreNativePoolBuckets();
-            SYSLOG("UnifiedMemory", "PTE release route not verified; large buffer pool disabled");
+            disablePooledPath("PTE release route not verified; pooled hand-back disabled");
         }
         return true;
     }

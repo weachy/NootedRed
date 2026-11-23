@@ -139,8 +139,11 @@ descriptors (a constant in `initWithAccelerator`), and a request is capped at 24
 native first bucket is 1 MiB, so the cap is 24 MiB. WindowServer's 10-bit full-screen half-float textures are
 25-64 MiB.
 
-Before the pool is created, unified memory rewrites `sWiredPoolInfo` and `sPurgeablePoolInfo` to buckets of 4 MiB,
-1 MiB, 256 KiB, 64 KiB and 4 KiB, which raises the cap to 96 MiB. A request gathers at most 64 descriptors in a stack
+On machines with 16 GB of RAM or more (reported RAM of at least 12 GiB, since firmware may subtract the carve-out),
+and unless `nred-uma-wired-mib` lowers the residency budget below 4 GiB, unified memory rewrites `sWiredPoolInfo`
+and `sPurgeablePoolInfo` before the pool is created. The new buckets are 4 MiB, 1 MiB, 256 KiB, 64 KiB and 4 KiB,
+which raises the cap to 96 MiB. Smaller machines keep the native buckets with hand-back, and their requests above
+24 MiB take the pageable path. A request gathers at most 64 descriptors in a stack
 array that the native code does not bounds-check. With the new buckets a request up to 96 MiB needs at most 47. The
 rewrite first verifies the table loads, the prefill constant, the cap check and the stack array size in
 `initWithAccelerator` and `newWiredDescriptorsWithLength`. On any mismatch the native buckets stay, and a later
@@ -171,14 +174,20 @@ return to the pool.
 ### Footprint
 
 `releaseDescriptors` keeps a returned descriptor while its bucket holds fewer than its wired capacity plus its
-purgeable capacity. The capacities are the native ones, and the new 4 MiB bucket gets 32 wired and 32 purgeable.
-The pool can therefore keep about 400 MiB. On the test machine after a day of use, `pool_state` read
-`29/32/0 64/52/0 32/6/0 32/0/0 22/12/0` (wired/purgeable/dirty per bucket): about 190 MiB wired and 180 MiB
-purgeable.
+purgeable capacity. The timer refills each bucket to 24 descriptors but does not trim wired descriptors above that,
+and only the purgeable part can be reclaimed by the VM.
 
-Only the purgeable part can be reclaimed by the VM. The timer refills buckets up to 24 but does not trim wired
-descriptors above that, and accelerator wired memory stayed at 436-455 MB after the 23 GiB pressure probe. That is
-0.3% of 64 GiB, and would be about 2.3% of an 8 GiB machine. A RAM-based cap is not implemented yet.
+| | Wired at the refill level | Kept at most (wired + purgeable) |
+| --- | --- | --- |
+| Large buckets (16 GB and more) | about 128 MiB | about 200 + 200 MiB |
+| Native buckets | about 32 MiB | about 75 + 70 MiB |
+
+The capacities are the native ones, and the new 4 MiB bucket gets 32 wired and 32 purgeable. On the test machine
+after a day of use, `pool_state` read `29/32/0 64/52/0 32/6/0 32/0/0 22/12/0` (wired/purgeable/dirty per bucket):
+about 190 MiB wired and 180 MiB purgeable. Right after the 23 GiB pressure probe the large-bucket pool still held
+about 200 MiB wired (`32/32/0 64/24/0 32/12/0 32/16/0 24/0/0`). With the native buckets it held about 75 MiB wired
+(`64/32/0 32/16/0 30/16/0 30/7/0 32/4/0`) after a 5 GiB reclaim run at a 4 GiB budget. `bytes_total_wired` does not
+count idle pool descriptors. 190 MiB is 0.3% of 64 GiB and about 1.2% of 16 GiB.
 
 ### Effect
 
@@ -207,6 +216,7 @@ and PTE coalescing are on by default with it. To roll back, remove the argument.
   NootedRed also logs `Creating the native buffer pool` and `Large buffer pool buckets installed`, but on the test
   machine these lines did not reach the unified log.
 - `nred-uma-wired-mib=<MiB>` lowers the residency budget, for example `768` to trigger native reclaim in tests.
+  Below `4096` it also keeps the native pool buckets.
 
 ## Testing
 
@@ -217,17 +227,20 @@ Build the Metal probe and run a small readback from the repository root:
 
 ```sh
 xcrun clang -fobjc-arc -O2 -Wall -Wextra -Werror \
-  -framework Foundation -framework CoreGraphics -framework IOSurface -framework Metal \
+  -framework Foundation -framework CoreGraphics -framework IOKit -framework IOSurface -framework Metal \
   tools/x5000_uma_probe.m -o /tmp/x5000_uma_probe
 codesign -s - /tmp/x5000_uma_probe
 sysctl debug.nred_uma
 /tmp/x5000_uma_probe --groups 1 --require-budget --require-surfaces --surface-ipc --layouts
 ```
 
-- Capacity: with a 4K desktop active, `--groups 36 --require-budget`.
+- The probe reads the carve-out size from the `VRAM,totalMB` property on the GPU (512 MiB if it is missing). Each
+  group holds 32 MiB, so pick `--groups` above carve-out / 32 MiB; the probe prints a note when the working set
+  still fits in the carve-out.
+- Capacity: with a 4K desktop active, `--groups 36 --require-budget` (for a 512 MiB carve-out).
 - Reclaim: boot with `nred-uma-wired-mib=768` and run
   `--groups 36 --idle 10 --require-budget --require-reclaim --require-surfaces --surface-ipc`. The probe keeps
-  private buffers and render targets, checks that `bytes_live` grows by more than 512 MiB and verifies the GPU
+  private buffers and render targets, checks that `bytes_live` grows by more than the carve-out and verifies the GPU
   readback byte by byte. Reclaim also requires `same_va_recommits` to grow and checks the buffer GPU VAs.
 - `--require-surfaces` checks the pageable cache counters. `--surface-ipc` maps one IOSurface into two processes
   before the pressure, keeps the textures in both until the pressure ends, and checks GPU writes and CPU rewrites
@@ -250,13 +263,13 @@ sysctl debug.nred_uma
 The driver counters are per device and include other processes on the same device.
 
 The OpenGL probe samples five textures in one draw, which covers a command larger than the old resource list
-budget and several resource groups. The full case keeps 816 MiB of textures on an active desktop with 272 MiB per
-draw. It requires both budget hooks, the new device budget, a completed GPU readback and more than 512 MiB of
-pageable primary backing. `--smoke` uses smaller textures.
+budget and several resource groups. The full case keeps groups of 272 MiB, at least three and at least 256 MiB more
+than the carve-out (816 MiB for 512 MiB). It requires both budget hooks, the new device budget, a completed GPU
+readback and more pageable primary backing than the carve-out. `--smoke` uses smaller textures.
 
 ```sh
 xcrun clang -std=c17 -DGL_SILENCE_DEPRECATION -O2 -Wall -Wextra -Werror \
-  -framework OpenGL tools/x5000_uma_gl_probe.c -o /tmp/x5000_uma_gl_probe
+  -framework CoreFoundation -framework IOKit -framework OpenGL tools/x5000_uma_gl_probe.c -o /tmp/x5000_uma_gl_probe
 codesign -s - /tmp/x5000_uma_gl_probe
 /tmp/x5000_uma_gl_probe --smoke
 /tmp/x5000_uma_gl_probe --layouts
@@ -268,8 +281,22 @@ codesign -s - /tmp/x5000_uma_gl_probe
 probe keeps the resources and reads them again after an empty line on standard input. The VBO case then updates the
 buffers from the CPU and checks that the GPU sees the update.
 
+The cross-process check writes marked 64 MiB private textures in one process and looks for the marker in new
+textures of another process. The `both` run is the control and should see reuse within one process.
+
+```sh
+xcrun swiftc -O tools/x5000_uma_leakcheck.swift -o /tmp/x5000_uma_leakcheck
+codesign -s - /tmp/x5000_uma_leakcheck
+/tmp/x5000_uma_leakcheck both 4    # expect SAME_TASK_REUSE_VISIBLE above 0
+/tmp/x5000_uma_leakcheck write 8
+/tmp/x5000_uma_leakcheck read 8    # expect READ 8 with_pattern=0
+```
+
+With the native pool buckets (machines below 16 GB), 64 MiB textures do not come from the pool, so pass `16` as a
+third argument to all three runs.
+
 `python3 tools/test_x5000_memory_policy.py` checks the placement policy, the residency state transitions and the
-budget calculation on the host.
+budget calculation and the pool bucket choice on the host.
 
 ## Results
 
@@ -297,14 +324,32 @@ between boots.
   animations run into the full carve-out.
 - With the flag, the defaults read `1 1 1` and all probes passed, including the 736-group pressure case. The
   cross-process check found the marker in 0 of 8 textures while the same-process control saw reuse in 4 of 4.
-  `pool_return_skips` and `pte_fallbacks` stayed at 0. Accelerator wired memory was 438 MB after 60 s idle and
-  449 MB after the probes.
+  `pool_return_skips` and `pte_fallbacks` stayed at 0. Accelerator wired memory (live resources, without idle pool
+  descriptors) was 438 MB after 60 s idle and 449 MB after the probes.
 
 The build without the switches (kext `4D2DE009`, commit `13942cd`) was checked in one more boot with the flag on:
 64 MiB create to release 7.94 ms, 16 MiB 2.23 ms, all probes passed including the pressure case, and the
 cross-process check found 0 of 8 markers with 4 of 4 in the control. In that boot 2727 backings were handed back
 and one was skipped: `returnPooledDescriptors` declined it (purgeable state, an extra reference or an attached
 resource), and the backing was freed the native way instead.
+
+The build that picks the buckets by RAM (kext `84A993E8`, commit `b620a28`) was checked in two more boots, both with
+the flag on. The external display had gone offline the evening before, after display sleep, and was not detected in
+these boots, so WindowServer ran on a virtual 1280x1024 display. The probes are valid; the animation runs recorded
+no display transactions and are not reported.
+
+| | `nred-uma-wired-mib=4095` (native buckets) | default (large buckets) |
+| --- | --- | --- |
+| Requests above 24 MiB served by the pool | 0 | 54 |
+| 64 MiB texture create, first use, release (median) | 21.2 ms (pageable path) | 7.95 ms |
+| 16 MiB texture create, first use, release (median) | 2.15 ms | 2.07 ms |
+| Backings handed back during churn and animation | 1375 | 1250 |
+| Cross-process check (control) | 0 of 8 at 16 MiB (4 of 4) | 0 of 8 at 64 MiB (4 of 4) |
+| Pool wired after the probes | about 75 MiB | about 200 MiB |
+
+All probes passed in both boots: readback with surfaces, cross-process IOSurface and layouts, purgeable states,
+Managed resources, OpenGL smoke, VBO and full cases, a 5 GiB reclaim run against the 4 GiB budget, and the 23 GiB
+pressure case with the default budget. `pool_return_skips` and `pte_fallbacks` stayed at 0.
 
 ### Pool, hand-back and PTE coalescing (2026-11-23)
 
@@ -372,7 +417,10 @@ Kext `F7C4DF32`, before the pool and mapping reuse:
 - Only `25G332` is supported. Every other build turns the feature off.
 - Other Renoir-family device IDs take the same code path but have not been tested. Raven, Raven2 and Picasso are
   excluded.
-- The pool keeps about 190 MiB wired when idle and does not shrink under memory pressure (see Footprint).
+- The pool does not shrink its wired part under memory pressure: about 190 MiB with the large buckets on the test
+  machine, about 32-75 MiB with the native buckets used below 16 GB (see Footprint). The 16 GB threshold is a
+  judgement call; machines below it were not tested.
+- The probes and the measurements come from one machine with a 512 MiB carve-out.
 - 4 KiB PTEs cost 17-22% in dependent-load latency compared with the carve-out.
 - Mission Control enter differs between boots (41-46% long frames in the 2026-11-23 afternoon boot, 9-13% in the
   boot of this branch) and does not depend on the pool or coalescing. Earlier traces placed it in GPU queueing.

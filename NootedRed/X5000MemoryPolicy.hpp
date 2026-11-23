@@ -98,6 +98,18 @@ namespace X5000Memory
         return singleAllocationBudget(UINT64_MAX, wired, pageSize * 2);
     }
 
+    // The large pool buckets keep up to about 200 MiB wired (the pool refills each bucket to 24 descriptors and keeps
+    // returned ones up to its capacity). They are used on 16 GB machines and larger, unless the residency budget was
+    // lowered below 4 GiB. The threshold sits at 12 GiB because firmware may report RAM minus the carve-out; an
+    // unknown RAM size keeps the native buckets.
+    constexpr uint64_t largeBucketMinimumRAM = 12ULL << 30;
+    constexpr uint32_t largeBucketMinimumBudgetMiB = 4096;
+    constexpr bool largePoolBuckets(const uint64_t physicalBytes, const uint32_t requestedBudgetMiB)
+    {
+        return physicalBytes >= largeBucketMinimumRAM
+               && (requestedBudgetMiB == 0 || requestedBudgetMiB >= largeBucketMinimumBudgetMiB);
+    }
+
     constexpr uint32_t glCommandBudgetKiB(const uint64_t wired, const uint64_t pageSize)
     {
         const auto kib = recommendedWorkingSet(wired, pageSize) / (2 * 1024);
