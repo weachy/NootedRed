@@ -249,6 +249,13 @@ void NRed::setProp32(const char* const key, const UInt32 value) const
     this->iGPU->setProperty(key, value, 32);
 }
 
+void NRed::setPropStr(const char* const key, const char* const value) const
+{
+    if (this->iGPU == nullptr || value == nullptr) { return; }
+
+    this->iGPU->setProperty(key, value);
+}
+
 UInt32 NRed::readReg32(const UInt32 reg) const
 {
     if (!this->isMmioReady()) { return 0xFFFFFFFFu; }
