@@ -226,8 +226,9 @@ and PTE coalescing are on by default with it. To roll back, remove the argument.
   the native behavior. There are no runtime switches.
 - The GPU's registry entry (`IGPU` in `ioreg`) shows the state. `NRedUnifiedMemory` reads `active`, or why the
   feature is off (`off: unsupported IOAcceleratorFamily2`, `off: unsupported AMDRadeonX5000`, `off: device not
-  supported`). `NRedCompatUnifiedMemory` is `1` when the device profile allows unified memory. While active, `NRedUnifiedMemoryPoolBuckets` is `large` or `native`, and
-  `NRedUnifiedMemoryHandBack` and `NRedUnifiedMemoryPTECoalescing` show whether those parts are on.
+  supported`). `NRedCompatUnifiedMemory` is `1` when the device profile allows unified memory. While active,
+  `NRedUnifiedMemoryPoolBuckets` is `large` or `native`, and `NRedUnifiedMemoryHandBack` and
+  `NRedUnifiedMemoryPTECoalescing` show whether those parts are on.
 - Once AMDRadeonX5000 is processed, NootedRed logs one line in the format of the other `Compat:` lines:
   `Compat: feature=UnifiedMemory profile="Renoir" level=experimental state="active" buckets=large handBack=1
   pteCoalescing=1`.
@@ -330,12 +331,53 @@ codesign -s - /tmp/x5000_uma_leakcheck
 With the native pool buckets (machines below 16 GB), 64 MiB textures do not come from the pool, so pass `16` as a
 third argument to all three runs.
 
+Three Metal workloads compare unified memory with the carve-out under load. Run each in a boot with and a boot
+without `-NRedUnifiedMemory`:
+
+```sh
+for t in workingset timeline export; do
+  xcrun swiftc -O tools/x5000_uma_$t.swift -o /tmp/x5000_uma_$t && codesign -s - /tmp/x5000_uma_$t
+done
+/tmp/x5000_uma_workingset 256 512 1024 2048 3072   # resident textures, GPU read rate per size
+/tmp/x5000_uma_timeline 8 12 120 medium             # 4K layers, blur + grade into a frame cache (1.3 GiB)
+/tmp/x5000_uma_export 10 60 /tmp/x5000_uma_export.mov large   # Core Image effects + hardware HEVC, then decode
+/tmp/x5000_uma_workingset --hold 1024 150           # keeps 1 GiB resident while another test runs
+```
+
 `python3 tools/test_x5000_memory_policy.py` checks the placement policy, the residency state transitions and the
 budget calculation and the pool bucket choice on the host.
 
 ## Results
 
 Test machine: Renoir `0x1636`, 64 GiB RAM, 4K 10-bit DisplayPort display, macOS 26.7.2 (`25G332`).
+
+### Flag off vs on (2026-11-24)
+
+Kext `B7DC1F8C` (this branch), two boots per round that differ only in `-NRedUnifiedMemory`. No GPU reset in any
+boot. The external display was offline: round 1 (the three workloads above and the churn tool) ran on the fallback
+virtual display, round 2 (Geekbench 7 and the desktop animation) on a 3840x2160 60 Hz virtual display.
+
+| Workload | Flag off | Flag on |
+| --- | --- | --- |
+| Metal recommended working set | 512 MiB | 16,896 MiB |
+| GPU read of resident textures, 256 MiB | 38.0 GB/s | 35.3 GB/s |
+| ... 512 MiB / 1 GiB / 2 GiB / 3 GiB | 8.6 / 6.9 / 6.0 / 5.9 GB/s | 35.8 / 36.1 / 38.0 / 38.1 GB/s |
+| 4K render, 0.5 / 1.3 / 2.3 GiB | 19.4 / 5.27 / 3.62 fps | 19.6 / 7.41 / 4.95 fps |
+| 4K export, 4 layers x 120 frames / 10 layers x 60 frames | 30.2 / 70.4 s | 11.3 / 28.4 s |
+| Hardware HEVC decode of the export | 98 / 115 fps | 98 / 115 fps |
+| Geekbench 7 GPU, Metal / OpenCL | 10,960 / 1,229 | 13,767 / 1,849 |
+| Animation, frames above 25 ms without scrolling: idle | 17.7% | 1.8% |
+| ... with 1 GiB / 2 GiB held by another process | 19.6% / 14.8% | 1.2% / 1.9% |
+| ... full-screen exit / enter, idle | 46.7% / 27.0% | 1.1% / 6.8% |
+| Holder pass over 1 GiB / 2 GiB | 171 / 356 ms | 29 / 56 ms |
+| 64 MiB / 16 MiB texture create, first use, release | 2.19 / 0.79 ms | 7.95 / 2.20 ms |
+
+With the flag off, the part above the carve-out goes through GART and the driver pages about 2 GB of surfaces and
+textures during round 1. Below the carve-out size, reads are about 7% slower with the flag on (4 KiB PTEs). On the
+virtual display a frame is a WindowServer command-buffer submission interval; scrolling scenes are left out because
+the virtual display produces too few submissions in them. The Geekbench results are
+[433454](https://browser.geekbench.com/v7/gpu/433454), [433470](https://browser.geekbench.com/v7/gpu/433470) (off)
+and [433577](https://browser.geekbench.com/v7/gpu/433577), [433588](https://browser.geekbench.com/v7/gpu/433588) (on).
 
 ### This branch (2026-11-23)
 
