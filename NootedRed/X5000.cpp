@@ -389,6 +389,16 @@ void X5000::processKext(KernelPatcher& patcher, const size_t id, const mach_vm_a
     }
     NRed::singleton().setProp32("NRedGFXOFFPatched", 1);
 
+    if (currentKernelVersion() >= MACOS_13) {
+        PenguinWizardry::PatternRouteRequest ptiReq{
+            "__ZN34AMDRadeonX5000_AMDAccelDisplayPipe27processTransactionInterruptEP8OSObjectPv",
+            wrapProcessTransactionInterrupt, this->orgProcessTransactionInterrupt};
+        if (!ptiReq.route(patcher, id, slide, size)) {
+            patcher.clearError();
+            SYSLOG("X5000", "Optional processTransactionInterrupt route unavailable; continuing");
+        }
+    }
+
     if (currentKernelVersion() >= MACOS_11) {
         PenguinWizardry::PatternSolveRequest solveRequest{"__ZN30AMDRadeonX5000_AMDGFX9Hardware15notifyGfxAccessEv",
                                                           this->notifyGfxAccess};
@@ -714,6 +724,21 @@ void X5000::wrapRTHardwareDidStart(void* const self)
         *reinterpret_cast<UInt8*>(reinterpret_cast<uintptr_t>(self) + singleton().gfxOffSupportedOffset) = 0;
         NRed::singleton().setProp32("NRedGFXOFFDisabled", 1);
         DBGLOG("X5000", "Disabled GFXOFF in RTHardware (offset 0x%x)", singleton().gfxOffSupportedOffset);
+    }
+}
+
+void X5000::wrapProcessTransactionInterrupt(void* const self, OSObject* const eventSource, void* const intInfo)
+{
+    FunctionCast(wrapProcessTransactionInterrupt, singleton().orgProcessTransactionInterrupt)(self, eventSource,
+                                                                                             intInfo);
+    // In VRR mode (vrrSharedStruct != nullptr and minNextFrame != maxNextFrame), Apple's
+    // AMDAccelDisplayPipe::processTransactionInterrupt clears the one-shot latch at +0x3A8 unconditionally
+    // after calling IOAccelDisplayPipe::process_transaction_interrupt.  If the pending flip had not yet
+    // completed on that interrupt (liveTransaction at +0x248 remains non-null), clearing +0x3A8 strands
+    // the transaction until the 1s DisplayPipe watchdog times out.  Preserve the latch while a live
+    // transaction is still pending across macOS 13-26.
+    if (self != nullptr && getMember<void*>(self, 0x248) != nullptr) {
+        getMember<UInt8>(self, 0x3A8) = 1;
     }
 }
 

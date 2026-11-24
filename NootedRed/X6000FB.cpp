@@ -33,6 +33,7 @@
 #include <Headers/kern_mach.hpp>
 #include <Headers/kern_patcher.hpp>
 #include <Headers/kern_util.hpp>
+#include <IOKit/IOLib.h>
 #include <IOKit/IOReturn.h>
 #include <IOKit/IOTypes.h>
 #include <IOKit/acpi/IOACPIPlatformExpert.h>
@@ -199,6 +200,33 @@ static const UInt8 kControllerPowerUpReplaceMask[]  = {0x00, 0x00, 0x00, 0x00, 0
 static const UInt8 kValidateDetailedTimingOriginal[] = {0x66, 0x0F, 0x2E, 0xC1, 0x76, 0x06, 0xF2, 0x0F, 0x5E, 0xC1};
 static const UInt8 kValidateDetailedTimingPatched[]  = {0x66, 0x0F, 0x2E, 0xC1, 0x66, 0x90, 0xF2, 0x0F, 0x5E, 0xC1};
 
+// Fix Navi10 (DCN 2.0) hardcoded OTG_V_TOTAL_MIN/MAX/CONTROL (0x1B88..0x1B8A) -> Raven/Renoir (0x1B48..0x1B4A)
+// inside dce110_timing_generator_set_drr across macOS 13-26 so hardware DRR/VRR updates reach the APU OTG.
+static const UInt8 kSetDrrRead1Orig[] = {0xBE, 0x88, 0x1B, 0x00, 0x00, 0x03, 0x77, 0x20};
+static const UInt8 kSetDrrRead1Pat[]  = {0xBE, 0x48, 0x1B, 0x00, 0x00, 0x03, 0x77, 0x20};
+
+static const UInt8 kSetDrrRead2Orig13[]  = {0xBE, 0x89, 0x1B, 0x00, 0x00, 0x41, 0x03, 0x76, 0x20};
+static const UInt8 kSetDrrRead2Pat13[]   = {0xBE, 0x49, 0x1B, 0x00, 0x00, 0x41, 0x03, 0x76, 0x20};
+static const UInt8 kSetDrrRead3Orig13[]  = {0xBE, 0x8A, 0x1B, 0x00, 0x00, 0x41, 0x03, 0x76, 0x20};
+static const UInt8 kSetDrrRead3Pat13[]   = {0xBE, 0x4A, 0x1B, 0x00, 0x00, 0x41, 0x03, 0x76, 0x20};
+static const UInt8 kSetDrrWrite1Orig13[] = {0xBB, 0x88, 0x1B, 0x00, 0x00, 0x41, 0x03, 0x5E, 0x20};
+static const UInt8 kSetDrrWrite1Pat13[]  = {0xBB, 0x48, 0x1B, 0x00, 0x00, 0x41, 0x03, 0x5E, 0x20};
+static const UInt8 kSetDrrWrite2Orig13[] = {0xBB, 0x89, 0x1B, 0x00, 0x00, 0x41, 0x03, 0x5E, 0x20};
+static const UInt8 kSetDrrWrite2Pat13[]  = {0xBB, 0x49, 0x1B, 0x00, 0x00, 0x41, 0x03, 0x5E, 0x20};
+static const UInt8 kSetDrrWrite3Orig13[] = {0xBB, 0x8A, 0x1B, 0x00, 0x00, 0x41, 0x03, 0x5E, 0x20};
+static const UInt8 kSetDrrWrite3Pat13[]  = {0xBB, 0x4A, 0x1B, 0x00, 0x00, 0x41, 0x03, 0x5E, 0x20};
+
+static const UInt8 kSetDrrRead2Orig15[]  = {0xBE, 0x89, 0x1B, 0x00, 0x00, 0x03, 0x73, 0x20};
+static const UInt8 kSetDrrRead2Pat15[]   = {0xBE, 0x49, 0x1B, 0x00, 0x00, 0x03, 0x73, 0x20};
+static const UInt8 kSetDrrRead3Orig15[]  = {0xBE, 0x8A, 0x1B, 0x00, 0x00, 0x03, 0x73, 0x20};
+static const UInt8 kSetDrrRead3Pat15[]   = {0xBE, 0x4A, 0x1B, 0x00, 0x00, 0x03, 0x73, 0x20};
+static const UInt8 kSetDrrWrite1Orig15[] = {0x41, 0xBD, 0x88, 0x1B, 0x00, 0x00, 0x44, 0x03, 0x6B, 0x20};
+static const UInt8 kSetDrrWrite1Pat15[]  = {0x41, 0xBD, 0x48, 0x1B, 0x00, 0x00, 0x44, 0x03, 0x6B, 0x20};
+static const UInt8 kSetDrrWrite2Orig15[] = {0x41, 0xBE, 0x89, 0x1B, 0x00, 0x00, 0x44, 0x03, 0x73, 0x20};
+static const UInt8 kSetDrrWrite2Pat15[]  = {0x41, 0xBE, 0x49, 0x1B, 0x00, 0x00, 0x44, 0x03, 0x73, 0x20};
+static const UInt8 kSetDrrWrite3Orig15[] = {0x41, 0xBE, 0x8A, 0x1B, 0x00, 0x00, 0x44, 0x03, 0x73, 0x20};
+static const UInt8 kSetDrrWrite3Pat15[]  = {0x41, 0xBE, 0x4A, 0x1B, 0x00, 0x00, 0x44, 0x03, 0x73, 0x20};
+
 static X6000FB moduleInstance;
 
 X6000FB& X6000FB::singleton() { return moduleInstance; }
@@ -267,6 +295,31 @@ void X6000FB::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t s
             }
         }
 
+        this->vrrEnabled = !checkKernelArgument("-NRedNoVRR");
+
+        KernelPatcher::RouteRequest displayPipeFixes[] = {
+            {"__ZN35AMDRadeonX6000_AmdRadeonFramebuffer12getAttributeEjPm", wrapFbGetAttribute,
+             this->orgFbGetAttribute},
+            {"__ZN29AMDRadeonX6000_AmdFbPresenter18handleTransactionsEP21_AMD_PIPE_TRANSACTION",
+             wrapPresenterHandleTransactions, this->orgPresenterHandleTransactions},
+            {"__ZN29AMDRadeonX6000_AmdFbPresenter26getOutstandingTransactionsEv",
+             wrapPresenterGetOutstandingTransactions, this->orgPresenterGetOutstandingTransactions},
+            {"__ZN38AMDRadeonX6000_AmdRadeonControllerNavi11isPoweredUpEv", wrapControllerIsPoweredUp,
+             this->orgControllerIsPoweredUp},
+            {"__ZN38AMDRadeonX6000_AmdRadeonControllerNavi12getDrrStatusEiP10_DrrStatus", wrapGetDrrStatus,
+             this->orgGetDrrStatus},
+            {"__ZN38AMDRadeonX6000_AmdRadeonControllerNavi24getVUpdateVBlankIntervalEiP22_VUpdateVBlankInterval",
+             wrapGetVUpdateVBlankInterval, this->orgGetVUpdateVBlankInterval},
+            {"__ZN38AMDRadeonX6000_AmdRadeonControllerNavi19setupBootWatermarksEv", wrapSetupBootWatermarks,
+             this->orgSetupBootWatermarks},
+        };
+        for (auto& req : displayPipeFixes) {
+            if (!patcher.routeMultiple(id, &req, 1, slide, size)) {
+                patcher.clearError();
+                SYSLOG("X6000FB", "Optional display/controller route %s unavailable; continuing", req.symbol);
+            }
+        }
+
         const PenguinWizardry::MaskedLookupPatch patches[] = {
             {&kextRadeonX6000Framebuffer, kControllerPowerUpOriginal, kControllerPowerUpOriginalMask,
              kControllerPowerUpReplace, kControllerPowerUpReplaceMask, 1},
@@ -274,6 +327,32 @@ void X6000FB::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t s
         };
         PANIC_COND(!PenguinWizardry::MaskedLookupPatch::applyAll(patcher, patches, slide, size), "X6000FB",
                    "Failed to apply logic revert patches");
+
+        if (this->vrrEnabled) {
+            const PenguinWizardry::MaskedLookupPatch drrPatches15[] = {
+                {&kextRadeonX6000Framebuffer, kSetDrrRead1Orig, kSetDrrRead1Pat, 1},
+                {&kextRadeonX6000Framebuffer, kSetDrrRead2Orig15, kSetDrrRead2Pat15, 1},
+                {&kextRadeonX6000Framebuffer, kSetDrrRead3Orig15, kSetDrrRead3Pat15, 1},
+                {&kextRadeonX6000Framebuffer, kSetDrrWrite1Orig15, kSetDrrWrite1Pat15, 1},
+                {&kextRadeonX6000Framebuffer, kSetDrrWrite2Orig15, kSetDrrWrite2Pat15, 1},
+                {&kextRadeonX6000Framebuffer, kSetDrrWrite3Orig15, kSetDrrWrite3Pat15, 1},
+            };
+            const PenguinWizardry::MaskedLookupPatch drrPatches13[] = {
+                {&kextRadeonX6000Framebuffer, kSetDrrRead1Orig, kSetDrrRead1Pat, 1},
+                {&kextRadeonX6000Framebuffer, kSetDrrRead2Orig13, kSetDrrRead2Pat13, 1},
+                {&kextRadeonX6000Framebuffer, kSetDrrRead3Orig13, kSetDrrRead3Pat13, 1},
+                {&kextRadeonX6000Framebuffer, kSetDrrWrite1Orig13, kSetDrrWrite1Pat13, 1},
+                {&kextRadeonX6000Framebuffer, kSetDrrWrite2Orig13, kSetDrrWrite2Pat13, 1},
+                {&kextRadeonX6000Framebuffer, kSetDrrWrite3Orig13, kSetDrrWrite3Pat13, 1},
+            };
+            const bool drrOk = currentKernelVersion() >= MACOS_14_4
+                                   ? PenguinWizardry::MaskedLookupPatch::applyAll(patcher, drrPatches15, slide, size)
+                                   : PenguinWizardry::MaskedLookupPatch::applyAll(patcher, drrPatches13, slide, size);
+            if (!drrOk) {
+                patcher.clearError();
+                SYSLOG("X6000FB", "Optional DCN OTG DRR register patch unavailable; continuing");
+            }
+        }
     }
 
     PenguinWizardry::PatternRouteRequest requests[] = {
@@ -281,7 +360,6 @@ void X6000FB::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t s
          kPopulateVramInfoPatternMask},
         {"__ZNK32AMDRadeonX6000_AmdAsicInfoNavi1027getEnumeratedRevisionNumberEv", getEnumeratedRevision},
         {"__ZN41AMDRadeonX6000_AmdDeviceMemoryManagerNavi21intializeReservedVramEv", initialiseReservedVRAM},
-        {"__ZN38AMDRadeonX6000_AmdRadeonControllerNavi19setupBootWatermarksEv", dummyIOReturnSuccess},
         {"__ZNK30AMDRadeonX6000_AmdAgdcServices13getVendorInfoEP16AGDCVendorInfo_tm", wrapGetVendorInfo,
          this->orgGetVendorInfo},
         {"__ZN34AMDRadeonX6000_AmdBiosParserHelper12readAtomBiosEv", readAtomBios},
@@ -667,6 +745,153 @@ UInt32 X6000FB::wrapDoPowerStateChange(void* const self, const UInt32 state)
     }
 
     return ret;
+}
+
+IOReturn X6000FB::wrapFbGetAttribute(void* const self, const UInt32 attribute, uintptr_t* const value)
+{
+    // 'vrrs' (0x76727273): Keep VRR shared timing struct enabled by default while providing -NRedNoVRR as
+    // an emergency opt-out boot argument.
+    static constexpr UInt32 kAttributeVRRS = 0x76727273U;
+    if (attribute == kAttributeVRRS && !singleton().vrrEnabled) {
+        if (value != nullptr) { *value = 0; }
+        return kIOReturnUnsupported;
+    }
+    return FunctionCast(wrapFbGetAttribute, singleton().orgFbGetAttribute)(self, attribute, value);
+}
+
+IOReturn X6000FB::wrapPresenterHandleTransactions(void* const self, void* const transaction)
+{
+    // AmdFbPresenter::handleTransactions uses a single-shot zero-retry OSCompareAndSwap(0, 1, &this->c8)
+    // spin-flag.  At 120Hz, when WindowServer's executeTransaction collides with the ~5-20us VBlank/VUpdate
+    // interrupt handler holding this->c8, handleTransactions logs "[FB:x] ??? Busy" and returns
+    // kIOReturnNotReady (0xE00002D8), causing IOAccelDisplayPipe transaction stamp 30 to time out.
+    // Pre-wait on this->c8 (and keep the kIOReturnNotReady fallback loop) in 5us increments (up to 2ms)
+    // until the concurrent interrupt releases this->c8, avoiding both timeout and "??? Busy" log spam.
+    if (self != nullptr) {
+        for (UInt32 wait = 0; __atomic_load_n(&getMember<UInt32>(self, 0xC8), __ATOMIC_ACQUIRE) != 0 && wait < 400;
+             ++wait)
+        {
+            IODelay(5);
+        }
+    }
+    auto ret = FunctionCast(wrapPresenterHandleTransactions, singleton().orgPresenterHandleTransactions)(
+        self, transaction);
+    for (UInt32 retry = 0; ret == kIOReturnNotReady && retry < 400; ++retry) {
+        IODelay(5);
+        ret = FunctionCast(wrapPresenterHandleTransactions, singleton().orgPresenterHandleTransactions)(
+            self, transaction);
+    }
+
+    if (ret == kIOReturnSuccess && self != nullptr && singleton().vrrEnabled) {
+        // Guard the shared 'vrrs' timing struct (presenter + 0x20..0x78) against two Apple bugs:
+        // 1) During mode/mirror switches before the first VUpdate interrupt, prepareVRR() zeros +0x20/+0x48/+0x58,
+        //    causing executeTransaction() to log "AMD ERROR! VRR FAILED TIMESTAMPS ... Next Frame: 0".
+        // 2) On fixed-refresh commits (requestedHostTime at +0x210 == 0) or when VRR is inactive (+0xBC == 0),
+        //    keep maxNextFrame (+0x30) == minNextFrame (+0x28) so executeTransaction() does not pre-fill a stale
+        //    actual_host_time and instead lets processTransactionInterrupt() record mach_absolute_time().
+        const UInt64 now               = mach_absolute_time();
+        const UInt64 requestedHostTime = transaction != nullptr ? getMember<UInt64>(transaction, 0x210) : 0ULL;
+        const bool   isVrrActive       = getMember<UInt8>(self, 0xBC) != 0;
+
+        auto& lastFrame   = getMember<UInt64>(self, 0x20);
+        auto& minNext     = getMember<UInt64>(self, 0x28);
+        auto& maxNext     = getMember<UInt64>(self, 0x30);
+        auto& nextFrame   = getMember<UInt64>(self, 0x48);
+        auto& txComplete  = getMember<UInt64>(self, 0x58);
+
+        if (lastFrame == 0) { lastFrame = now; }
+        if (nextFrame == 0) { nextFrame = now; }
+        if (txComplete == 0) {
+            const UInt64 vBlankTime = getMember<UInt64>(self, 0xF0);
+            UInt64       fallback   = vBlankTime;
+            if (fallback == 0) {
+                const UInt64 hLineTime = getMember<UInt64>(self, 0xD0);
+                const UInt32 vTotalMin = getMember<UInt32>(self, 0x16BC);
+                if (hLineTime != 0 && vTotalMin != 0) {
+                    fallback = hLineTime * vTotalMin;
+                }
+                else {
+                    nanoseconds_to_absolutetime(8333333ULL, &fallback);
+                }
+            }
+            txComplete = nextFrame + fallback;
+        }
+
+        if (!isVrrActive || requestedHostTime == 0) {
+            maxNext = minNext;
+        }
+        else if (txComplete < now) {
+            txComplete = now;
+        }
+    }
+
+    return ret;
+}
+
+UInt64 X6000FB::wrapPresenterGetOutstandingTransactions(void* const self)
+{
+    // AmdFbPresenter::getOutstandingTransactions loads 0xD8(%self) into %rbx before checking whether
+    // stuckCounter (0xC0(%self)) reached 121 and calling handleStuckQueue().  When handleStuckQueue()
+    // clears 0xD8(%self) to 0, the original function still returns the stale pre-clear %rbx value,
+    // forcing an unnecessary extra timeout cycle.  Re-read 0xD8(%self) after the original call.
+    const auto mask =
+        FunctionCast(wrapPresenterGetOutstandingTransactions, singleton().orgPresenterGetOutstandingTransactions)(
+            self);
+    if (mask != 0 && self != nullptr) {
+        return getMember<UInt64>(self, 0xD8);
+    }
+    return mask;
+}
+
+bool X6000FB::wrapControllerIsPoweredUp(void* const self)
+{
+    // Issue #451: AMDRadeonX6000_AmdRadeonControllerNavi::isPoweredUp() checks Navi10 dGPU BACOS
+    // register 0x53 bit 9 and spins up to 10ms (1000 x 10us) polling Navi10 MP1 0x16061.
+    // On Raven/Renoir APUs the GPU shares the SoC power domain; check m_flags bit 3 (0x8) and live MMIO.
+    if (self == nullptr) { return false; }
+    if ((getMember<UInt8>(self, 0x5F18) & 0x8U) == 0) { return false; }
+    return NRed::singleton().readReg32(0x0) != 0xFFFFFFFFU;
+}
+
+IOReturn X6000FB::wrapGetDrrStatus(void*, const SInt32 otgInst, UInt32* const outDrrStatus)
+{
+    // Issue #449 / #441: Reimplement AmdRadeonControllerNavi::getDrrStatus() for Raven (DCN 1.0) and
+    // Renoir (DCN 2.1): 4 OTG pipes, correct OTG_V_TOTAL_STATUS offset, and return kIOReturnSuccess (0)
+    // instead of Apple's buggy unconditional 0xE0000001 return.
+    if (otgInst < 0 || otgInst >= 4 || outDrrStatus == nullptr) { return kIOReturnError; }
+    const UInt32 vTotalStatusOff = NRed::singleton().getAttributes().isRenoir() ? 0x1B57U : 0x1B5AU;
+    const UInt32 regVal =
+        NRed::singleton().readReg32(DCN_BASE_2 + vTotalStatusOff + (0x80U * static_cast<UInt32>(otgInst)));
+    *outDrrStatus = (regVal >> 16) & 0x7FFFU;
+    return kIOReturnSuccess;
+}
+
+IOReturn X6000FB::wrapGetVUpdateVBlankInterval(void*, const SInt32 otgInst, UInt32* const outInterval)
+{
+    // Issue #449 / #441: Reimplement AmdRadeonControllerNavi::getVUpdateVBlankInterval() for Raven/Renoir:
+    // 4 OTG pipes and DCN 1.0/2.1 OTG_V_SYNC_A_CNTL offset (DCN_BASE_2 + 0x1B47) instead of Navi10's 0x5047.
+    if (otgInst < 0 || otgInst >= 4 || outInterval == nullptr) { return kIOReturnError; }
+    const UInt32 regVal =
+        NRed::singleton().readReg32(DCN_BASE_2 + 0x1B47U + (0x80U * static_cast<UInt32>(otgInst)));
+    *outInterval = regVal & 0x3FFU;
+    return kIOReturnSuccess;
+}
+
+IOReturn X6000FB::wrapSetupBootWatermarks(void*)
+{
+    // Issue #450: Reimplement AmdRadeonControllerNavi::setupBootWatermarks() for Raven (DCN 1.0) and
+    // Renoir (DCN 2.1) by propagating UEFI-initialized DCHUBBUB watermark Set A (0x39C9..0x39CD) to
+    // Sets B/C/D (+5/+10/+15), avoiding Navi10/14 hardcoded values and 5-pipe HUBP writes.
+    auto& nred = NRed::singleton();
+    for (UInt32 reg = 0x39C9U; reg <= 0x39CDU; ++reg) {
+        const UInt32 setA = nred.readReg32(reg);
+        if (setA != 0 && setA != 0xFFFFFFFFU) {
+            nred.writeReg32(reg + 5U, setA);
+            nred.writeReg32(reg + 10U, setA);
+            nred.writeReg32(reg + 15U, setA);
+        }
+    }
+    return kIOReturnSuccess;
 }
 
 IOReturn X6000FB::wrapReportCapabilitiesLinkInfo(void* const self)
