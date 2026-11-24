@@ -582,6 +582,35 @@ static bool matchSignature(const UInt8* const bytes, const UserPatches::Signatur
     return false;
 }
 
+void UserPatches::applyUnifiedMemorySites(const VnodeKind vnodeKind, const UInt64 pageOffset, const UInt8* const bytes)
+{
+    if (vnodeKind != kVnodeGLDriver && vnodeKind != kVnodeSharedCache) { return; }
+    size_t            count = 0;
+    const auto* const sites = X5000Memory::userBudgetSites(count);
+    for (size_t index = 0; index < count; ++index) {
+        const auto& site = sites[index];
+        if (site.sharedCache != (vnodeKind == kVnodeSharedCache) || site.patch.pageOffset != pageOffset) { continue; }
+        size_t matchOffset = 0, second = 0;
+        if (!matchSignature(bytes, site.patch, matchOffset)) { continue; }
+        if (matchSignature(bytes, site.patch, second, matchOffset + 1)) {
+            SYSLOG("UserPatch", "Unified memory budget site %zu is ambiguous on page 0x%llX", index, pageOffset);
+            continue;
+        }
+        if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
+            SYSLOG("UserPatch", "Resolver: failed to disable kernel write protection (unified memory budget)");
+            return;
+        }
+        memcpy(const_cast<UInt8*>(bytes) + matchOffset + site.patch.patchOffset, site.patch.replace,
+               site.patch.replaceSize);
+        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+        this->recordCachedSite(vnodeKind, pageOffset, matchOffset + site.patch.patchOffset, site.patch.context,
+                               site.patch.replace, site.patch.replaceSize);
+        X5000Memory::userBudgetSiteApplied(index);
+        SYSLOG("UserPatch", "Patched unified memory budget site %zu at page 0x%llX + 0x%zX", index, pageOffset,
+               matchOffset);
+    }
+}
+
 void UserPatches::recordCachedSite(const VnodeKind vnodeKind, const UInt64 pageOffset, const size_t inPageOffset,
                                    const UInt8* const find, const UInt8* const replace, const size_t size)
 {
@@ -882,11 +911,6 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     const bool isAppleGVA    = (strstr(vnodeName, "AppleGVA") != nullptr);
     const bool isSharedCache = (strstr(vnodeName, "dyld_shared_cache") != nullptr) ||
                                (strstr(vnodeName, "dyld") != nullptr);
-    if (isSharedCache && X5000Memory::requested()) {
-        X5000Memory::patchMetalBudgetPage(vnodeName, pageOffset, data);
-    } else if (isGLDriver && X5000Memory::requested()) {
-        X5000Memory::patchGLBudgetPage(pageOffset, data);
-    }
     vnode_putname(vnodeName);
 
     VnodeKind vnodeKind = kVnodeNone;
@@ -907,6 +931,9 @@ void UserPatches::patchSignaturePage(const void* const data, const UInt64 pageOf
     // O(1) fast path for previously discovered sites whose clean UBC pages were evicted under
     // memory pressure and re-faulted from disk. Must run before the `allApplied` early-outs.
     this->reapplyCachedSites(vnodeKind, pageOffset, bytes);
+
+    // Unified memory budget sites. Must run before the GL resource budget patch below, which targets the same leaf.
+    this->applyUnifiedMemorySites(vnodeKind, pageOffset, bytes);
 
     // VDA Dynamic Resolver path (AMDRadeonVADriver2: embedded in dyld_shared_cache or loose bundle)
     // Note: _cs_validate_page is invoked by XNU only once per physical page when the page enters the

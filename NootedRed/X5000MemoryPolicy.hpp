@@ -1,24 +1,31 @@
+// X5000 Unified Memory placement, residency and budget rules. Free of kernel headers so that
+// tools/test_x5000_memory_policy.py can check them on the host.
+
 #pragma once
 
 #include <stdint.h>
 
 namespace X5000Memory
 {
-    enum class ResourceKind : uint8_t {
-        DataBuffer = 0x0A,
-        Texture = 0x40,
+
+    enum class ResourceKind : uint8_t
+    {
+        DataBuffer   = 0x0A,
+        Texture      = 0x40,
         SurfaceAlias = 0x82,
-        Surface = 0xC0,
+        Surface      = 0xC0,
     };
 
-    enum class BackingKind : uint8_t {
+    enum class BackingKind : uint8_t
+    {
         Native,
         Buffer,
         Texture,
         Surface,
     };
 
-    enum class Residency : uint8_t {
+    enum class Residency : uint8_t
+    {
         Cold,
         Wired,
         Evicted,
@@ -27,16 +34,14 @@ namespace X5000Memory
     struct ResidencyChange
     {
         Residency state;
-        bool wired;
-        bool evicted;
-        bool rewired;
+        bool      wired;
+        bool      evicted;
+        bool      rewired;
     };
 
     constexpr ResidencyChange updateResidency(const Residency state, const bool wired)
     {
-        if (wired && state != Residency::Wired) {
-            return {Residency::Wired, true, false, state == Residency::Evicted};
-        }
+        if (wired && state != Residency::Wired) { return {Residency::Wired, true, false, state == Residency::Evicted}; }
         if (!wired && state == Residency::Wired) { return {Residency::Evicted, false, true, false}; }
         return {state, false, false, false};
     }
@@ -44,14 +49,14 @@ namespace X5000Memory
     struct Requirements
     {
         ResourceKind kind;
-        bool existingAllocation;
-        bool specialAddress;
-        bool auxiliaryStorage;
-        bool importsSurface;
-        bool directDisplay;
-        bool hasSurfaceCache;
-        bool hasLinearClientBuffer;
-        bool usesTaskVM;
+        bool         existingAllocation;
+        bool         specialAddress;
+        bool         auxiliaryStorage;
+        bool         importsSurface;
+        bool         directDisplay;
+        bool         hasSurfaceCache;
+        bool         hasLinearClientBuffer;
+        bool         usesTaskVM;
     };
 
     constexpr BackingKind choosePrimaryBacking(const Requirements& usage)
@@ -64,7 +69,7 @@ namespace X5000Memory
 
         switch (usage.kind) {
             case ResourceKind::DataBuffer: return BackingKind::Buffer;
-            case ResourceKind::Texture: return usage.importsSurface ? BackingKind::Native : BackingKind::Texture;
+            case ResourceKind::Texture   : return usage.importsSurface ? BackingKind::Native : BackingKind::Texture;
             case ResourceKind::Surface:
                 if (usage.hasSurfaceCache) { return BackingKind::Surface; }
                 if (usage.hasLinearClientBuffer && !usage.importsSurface) { return BackingKind::Buffer; }
@@ -102,9 +107,9 @@ namespace X5000Memory
     // returned ones up to its capacity). They are used on 16 GB machines and larger, unless the residency budget was
     // lowered below 4 GiB. The threshold sits at 12 GiB because firmware may report RAM minus the carve-out; an
     // unknown RAM size keeps the native buckets.
-    constexpr uint64_t largeBucketMinimumRAM = 12ULL << 30;
+    constexpr uint64_t largeBucketMinimumRAM       = 12ULL << 30;
     constexpr uint32_t largeBucketMinimumBudgetMiB = 4096;
-    constexpr bool largePoolBuckets(const uint64_t physicalBytes, const uint32_t requestedBudgetMiB)
+    constexpr bool     largePoolBuckets(const uint64_t physicalBytes, const uint32_t requestedBudgetMiB)
     {
         return physicalBytes >= largeBucketMinimumRAM
                && (requestedBudgetMiB == 0 || requestedBudgetMiB >= largeBucketMinimumBudgetMiB);
@@ -115,4 +120,5 @@ namespace X5000Memory
         const auto kib = recommendedWorkingSet(wired, pageSize) / (2 * 1024);
         return kib <= UINT32_MAX ? static_cast<uint32_t>(kib) : UINT32_MAX;
     }
-}
+
+}    // namespace X5000Memory

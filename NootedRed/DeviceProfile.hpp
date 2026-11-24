@@ -118,6 +118,13 @@ public:
         DecodeCaps decode{};
     };
 
+    struct MemoryPolicy
+    {
+        // Unified memory (`-NRedUnifiedMemory`) may install on this family.  Its routes still require the supported
+        // IOAcceleratorFamily2 and AMDRadeonX5000 builds; see docs/X5000-UnifiedMemory.md.
+        bool unifiedMemory{false};
+    };
+
     struct Profile
     {
         const char*                    name;
@@ -128,6 +135,7 @@ public:
         PenguinWizardry::KernelVersion maxVersion;
         GraphicsPolicy                 graphics;
         MediaPolicy                    media;
+        MemoryPolicy                   memory;
     };
 
     // Returns the profile for the running device and kernel version, or the generic fallback when the

@@ -48,6 +48,8 @@ along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowled
   APU families, patch-data generation, resolver rules, and testing checklist.
 - [Chromium/Electron fix usage](docs/Chromium-Fix-Usage.md) — end-user installation and rollback.
 - [Device profile / media capability layer](docs/Device-Profile.md) — graphics + future VDA capability model.
+- [X5000 unified memory](docs/X5000-UnifiedMemory.md) — opt-in `-NRedUnifiedMemory` for Renoir: textures, IOSurface
+  caches and buffers in pageable system memory instead of the carve-out; design, tests and measurements.
 - [Compatibility data collector](tools/README-collect-compat-data.md) — collect a target machine's drivers, patch sites, VDA data and capabilities for new macOS/APU support.
 - [iGPU HwInfo / UBM research](docs/IGPU-HwInfo-Research-Plan.md) — research record on where the user-space
   driver gets iGPU hardware info and what the GL fix still needs.

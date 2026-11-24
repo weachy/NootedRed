@@ -5,7 +5,8 @@ pageable system memory instead of the firmware carve-out (512 MiB on the test ma
 WindowServer keep using the normal system APIs. The code is in `NootedRed/X5000Memory.cpp`, `X5000Memory.hpp` and
 `X5000MemoryPolicy.hpp`. The probes and the policy test are in `tools/`.
 
-The feature is off by default. It installs only on Renoir-family devices, and only when the loaded
+The feature is off by default. It installs only on devices whose `DeviceProfile` allows it (the Renoir family:
+Renoir, Renoir/Green Sardine, Cezanne and Barcelo), and only when the loaded
 `IOAcceleratorFamily2` (UUID `6C4A16B1-66DC-3A8B-9F0B-D3E027B16EB1`) and `AMDRadeonX5000` match macOS 26.7.2
 (`25G332`). On any other build it logs `Unsupported ... ABI` and the native behavior stays in place.
 
@@ -63,6 +64,13 @@ segmentation threshold, so several command buffers and the system graphics clien
 its command resource list budget, half of the recommended working set, through the same device config interface.
 Both budgets are published only for the Renoir device with unified memory on. The physical carve-out size is
 reported separately. An OpenGL device that does not receive a budget keeps the existing compatibility policy.
+
+The drivers read these budgets through four patched sites: the recommended working set and the command segment limit
+in the Metal driver (dyld shared cache), and the share group and resource list setup in the OpenGL driver. Each site
+is a `SignaturePatch` that `UserPatches` applies with its signature matcher and records for re-application when the
+page is read again. A site is applied only when its whole original code matches once on its page, and the list stays
+empty until the kernel routes are installed. The resource list site replaces the same leaf as the low-VRAM GL budget
+fix and uses that fix's formula when no budget is published.
 
 ## Page tables
 
@@ -217,9 +225,12 @@ and PTE coalescing are on by default with it. To roll back, remove the argument.
 - Each part acts only after it has verified that its routes are in place. Otherwise it turns itself off and keeps
   the native behavior. There are no runtime switches.
 - The GPU's registry entry (`IGPU` in `ioreg`) shows the state. `NRedUnifiedMemory` reads `active`, or why the
-  feature is off (`off: unsupported IOAcceleratorFamily2`, `off: unsupported AMDRadeonX5000`, `off: not a
-  Renoir-family GPU`). While active, `NRedUnifiedMemoryPoolBuckets` is `large` or `native`, and
+  feature is off (`off: unsupported IOAcceleratorFamily2`, `off: unsupported AMDRadeonX5000`, `off: device not
+  supported`). `NRedCompatUnifiedMemory` is `1` when the device profile allows unified memory. While active, `NRedUnifiedMemoryPoolBuckets` is `large` or `native`, and
   `NRedUnifiedMemoryHandBack` and `NRedUnifiedMemoryPTECoalescing` show whether those parts are on.
+- Once AMDRadeonX5000 is processed, NootedRed logs one line in the format of the other `Compat:` lines:
+  `Compat: feature=UnifiedMemory profile="Renoir" level=experimental state="active" buckets=large handBack=1
+  pteCoalescing=1`.
 - The read-only `debug.nred_uma` sysctls report the state and the counters the probes use. `active` is `1` once the
   driver routes are installed. `pool_state` reads `none` until the first pooled allocation or hand-back samples the
   pool. `pool_large_requests`, `pool_returns` and `pte_batches` grow only while the large buckets, hand-back and PTE
@@ -383,6 +394,14 @@ packets were written, and the cross-process check found 0 of 8 markers (control 
 23 GiB pressure probes passed. The purgeable probe failed once while the external display came back online during
 the run, which made WindowServer release and re-create surfaces and kept the device-wide `bytes_live` growth at
 500 MiB; it passed three times when run again in the same boot.
+
+The final build (kext `B7DC1F8C`: the cleanup, the `DeviceProfile` gate and the budget sites applied through
+`UserPatches`) was checked in one boot with default boot arguments and the 4K display on. The registry showed
+`active`, `large`, hand-back and coalescing on, and `NRedCompatUnifiedMemory` = 1. Both Metal sites and both OpenGL
+sites were applied through `UserPatches` (`metal_budget_pages` 2, `gl_budget_sites` 3). 64 MiB create to release
+took 8.19 ms and 16 MiB 2.25 ms, the cross-process check found 0 of 8 markers (control 4 of 4), all probes passed,
+and `pool_return_skips` and `pte_fallbacks` stayed at 0. Frames above 25 ms: full-screen enter 11.3%, full-screen
+exit 3.8%, Mission Control enter 0% and exit 4.3%, all scenes without scrolling 4.3%.
 
 ### Pool, hand-back and PTE coalescing (2026-11-23)
 

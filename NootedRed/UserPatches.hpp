@@ -219,6 +219,7 @@ private:
                                const SignaturePatch* sigs, size_t sigCount, size_t* appliedCounts,
                                size_t maxCounts, const char* label);
     void applyRaven2EncoderDebugPage(const UInt8* bytes, UInt64 pageOffset);
+    void applyUnifiedMemorySites(VnodeKind vnodeKind, UInt64 pageOffset, const UInt8* bytes);
     void recordCachedSite(VnodeKind vnodeKind, UInt64 pageOffset, size_t inPageOffset, const UInt8* find,
                           const UInt8* replace, size_t size);
     void reapplyCachedSites(VnodeKind vnodeKind, UInt64 pageOffset, const UInt8* bytes);
