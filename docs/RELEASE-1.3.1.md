@@ -45,9 +45,10 @@ If you need to diagnose or toggle specific features, use the following boot argu
 
 ### Important Notes & Prerequisites
 
-1. **AMFI & SIP Status**:
+1. **AMFI & SIP Status (Important for VP9 Hardware Decoding)**:
    - **`AMFIPass.kext` is NOT REQUIRED.**
-   - **System Integrity Protection (SIP) DOES NOT NEED TO BE DISABLED.** NootedRed's page patches comply natively with Apple code signing validation during kernel page faulting.
+   - **For VP9 Hardware Decoding**: In v1.3.0, `VP9UserPatch` uses per-process Copy-On-Write (COW) shared-cache patching. **You must disable System Integrity Protection (SIP) to use VP9 hardware decoding**; with SIP enabled, Hardened Runtime / `VideoToolbox` apps (e.g., Hackintool, UURemote, etc.) may crash with `SIGKILL (Code Signature Invalid)`.
+   - **To Keep SIP Enabled**: Add **`-NRedNoVP9`** to your `boot-args` to disable VP9 hardware decoding. All other NootedRed v1.3.0+ features (AVC/HEVC Main10/8K hardware acceleration, Metal/OpenCL, GLFix, and HDMI/DP audio) comply natively with Apple code signing validation and work with SIP enabled.
 2. **Native Metal Compute Acceleration**:
    - Starting with v1.2.5+, native Metal Compute acceleration is fully functional on macOS 14 (Sonoma), macOS 15 (Sequoia), and macOS 26 (Tahoe).
    - If you previously applied the legacy `allowMetalTransferSession -bool NO` workaround in CoreMedia, you can safely delete it:
