@@ -41,12 +41,13 @@ struct Queue
     const Layout layout;
     std::deque<Frame> pending;
     Failure firstFailure{};
-    uint32_t completed{}, submitError{}, buildErrorAt{}, builds{}, attempts{};
+    uint32_t completed{}, submitError{}, buildErrorAt{}, builds{}, attempts{}, replays{};
     Path path{};
 
     explicit Queue(bool decode) : source(referenceFrame(decode)), layout(decode ? Decode : Encode) {}
     static uint32_t invalid() { return 1; }
     Failure failure() const { return firstFailure; }
+    uint32_t replay(const Submission& job) { ++replays; return job.stamp; }
     void record(const Submission&, Path selected, uint32_t) { path = selected; }
     uint32_t reject(const Submission& job, uint32_t status)
     {
@@ -108,7 +109,6 @@ void testQueue(bool decode, const std::string& name, const char* directory)
     job.stamp = UINT32_MAX - 1;
     assert(commit(job, decode, queue) == job.stamp && queue.path == Path::Primary);
     job.ib[0].dwords = 0;
-    job.flags = 2;
     ++job.stamp;
     assert(commit(job, decode, queue) == job.stamp && queue.path == Path::Fence);
     auto expected = queue.source;
@@ -131,8 +131,13 @@ void testQueue(bool decode, const std::string& name, const char* directory)
     job.count = MaxIBs;
     job.flags = 2;
     for (auto& ib : job.ib) { ib.gpuAddress = ibAddress; }
-    assert(commit(job, decode, queue) == 0 && queue.path == Path::Fence && queue.builds == 1);
-    queue.retire();
+    const auto enqueued = queue.attempts;
+    assert(commit(job, decode, queue) == 0 && queue.path == Path::Replay && queue.replays == 1);
+    assert(queue.builds == 1 && queue.attempts == enqueued && queue.pending.empty());
+    queue.firstFailure = {3, 123};
+    assert(commit(job, decode, queue) == 0 && queue.replays == 2 && queue.firstFailure.precedingStamp == 123);
+    assert(queue.attempts == enqueued && queue.pending.empty());
+    queue.firstFailure = {};
 
     job.flags = 0;
     job.vmid = 8;
@@ -205,7 +210,7 @@ void testQueue(bool decode, const std::string& name, const char* directory)
     queue.retire();
     assert(queue.completed == 1 && queue.source == referenceFrame(decode));
     job.flags = 2;
-    assert(selectPath(job) == Path::Rejected);
+    assert(selectPath(job) == Path::Replay);
     job.flags = 0;
     job.count = MaxIBs + 1;
     assert(selectPath(job) == Path::Rejected);
@@ -216,12 +221,128 @@ void testQueue(bool decode, const std::string& name, const char* directory)
     assert(selectPath(job) == Path::Rejected);
     job.ib[1].gpuAddress = UINT64_MAX - 3;
     assert(selectPath(job) == Path::Rejected);
+    job = {};
+    job.count = 1;
+    job.vmid = decode ? 11 : 8;
+    job.stamp = decode ? 0x79 : 0x156;
+    job.ib[0].gpuAddress = decode ? 0x400010000 : 0x400010280;
+    job.ib[0].dwords = decode ? 176 : 13;
+    assert(commit(job, decode, queue) == job.stamp && queue.path == Path::Primary);
+    if (directory) {
+        assert(queue.pending.front() == readFrame(std::string(directory) + "/" + name + "-handoff.bin", layout.words));
+    }
+    queue.retire();
+    assert(queue.completed == job.stamp);
     std::printf("%s queue checks passed\n", name.c_str());
+}
+
+void testFirstReset()
+{
+    Timeline live{};
+    FirstReset first{};
+    first.capture({1, 12, 0x79, 0x79, 0x79}, live);
+    assert(!first.captured);
+    SubmitEvent decode{}, encode{};
+    decode.stamp = 0x79;
+    decode.vmid = 11;
+    encode.stamp = encode.softwareStamp = 0x156;
+    encode.vmid = 8;
+    live.submissions[0].append(decode);
+    live.submissions[2].append(encode);
+    live.unmaps.append({2, 3, 0x400000000, 0x10000, 0, 11});
+    live.releases.append({4, 5, 6175, 0});
+    first.capture({6, 14, 0x156, 0x155, 0x155}, live);
+    assert(first.captured);
+    for (uint32_t replay = 0; replay < 32; ++replay) {
+        ++encode.stamp;
+        encode.path = Path::Fence;
+        encode.vmid = 0;
+        live.submissions[2].append(encode);
+        live.unmaps.append({7, 8, 0, 0x1000, 0, 8});
+        live.releases.append({9, 10, 0, 8});
+        first.capture({11, 14, encode.stamp, encode.stamp - 1, encode.stamp - 1}, live);
+    }
+    assert(first.stamps.time == 6 && first.stamps.channel == 14 && first.stamps.submitted == 0x156);
+    assert(first.stamps.lastRead == 0x155 && first.stamps.writeback == 0x155);
+    assert(first.timeline.submissions[0].next == 1 && first.timeline.submissions[2].next == 1);
+    SubmitEvent event{};
+    assert(first.timeline.submissions[2].read(0, event));
+    assert(event.stamp == 0x156 && event.vmid == 8 && event.path == Path::Primary);
+    assert(first.timeline.unmaps.next == 1 && first.timeline.releases.next == 1);
+    UnmapRange range{};
+    MappingRelease release{};
+    assert(first.timeline.unmaps.read(0, range) && range.bytes == 0x10000 && range.mmVmid == 11);
+    assert(first.timeline.releases.read(0, release) && release.pid == 6175);
+    assert(!live.submissions[2].read(24, event));
+    assert(live.submissions[2].read(25, event) && event.stamp == 0x16F);
+    assert(live.submissions[2].read(32, event) && event.stamp == 0x176);
+    assert(!live.submissions[2].read(33, event));
+    live = {};
+    first.capture({12, 12, 1, 0, 0}, live);
+    assert(first.stamps.time == 6 && first.timeline.submissions[2].next == 1);
+    FirstReset wrapped{};
+    wrapped.capture({13, 12, 0, UINT32_MAX, UINT32_MAX}, live);
+    assert(wrapped.captured && wrapped.stamps.channel == 12 && wrapped.stamps.submitted == 0);
+    std::puts("First reset survives replay, history wrap and engine reinitialization");
+}
+
+void testUnmapTrace()
+{
+    int decoderThread{}, encoderThread{}, decoderTask{}, encoderTask{};
+    TaskReleaseScope outer{&decoderThread, &decoderTask, 4}, overlapping{&encoderThread, &decoderTask, 5},
+        otherTask{&decoderThread, &encoderTask, 6}, inner{&decoderThread, &decoderTask, 7};
+    ActiveTaskReleases releases{};
+    const auto check = [&](const void* thread, const void* task, uint64_t expected) {
+        for (auto vmid : {0U, 11U}) {
+            UnmapRange range{0, 0, 0x4000, 0x1000, UINT64_MAX, vmid};
+            assert(releases.associate(range, thread, task) == (vmid || expected));
+            assert(range.taskRelease == expected);
+        }
+    };
+    releases.enter(outer);
+    releases.enter(overlapping);
+    releases.enter(otherTask);
+    releases.enter(inner);
+    check(&decoderThread, &decoderTask, 7);
+    check(&decoderThread, &encoderTask, 6);
+    check(&encoderThread, &decoderTask, 5);
+    check(&encoderThread, &encoderTask, 0);
+    check(&decoderThread, nullptr, 0);
+    releases.leave(overlapping);
+    releases.leave(inner);
+    check(&decoderThread, &decoderTask, 4);
+    check(&encoderThread, &decoderTask, 0);
+    releases.leave(outer);
+    check(&decoderThread, &decoderTask, 0);
+    check(&decoderThread, &encoderTask, 6);
+    releases.leave(otherTask);
+    check(&decoderThread, &encoderTask, 0);
+    const auto vmids = 1U << 11;
+    assert(eligibleUnmapRange(vmids, 11, 0x4000, 0x1000, 0x4000, 0x5000));
+    assert(eligibleUnmapRange(vmids, 0, 0x4000, 0x1000, 0x4000, 0x5000));
+    assert(!eligibleUnmapRange(0, 0, 0x4000, 0x1000, 0x4000, 0x5000));
+    assert(!eligibleUnmapRange(vmids, 8, 0x4000, 0x1000, 0x4000, 0x5000));
+    assert(!eligibleUnmapRange(UINT32_MAX, 32, 0x4000, 0x1000, 0x4000, 0x5000));
+    assert(!eligibleUnmapRange(vmids, 11, 0x4000, 0, 0x4000, 0x5000));
+    assert(!eligibleUnmapRange(vmids, 11, 0x3FFF, 1, 0x4000, 0x5000));
+    assert(!eligibleUnmapRange(vmids, 11, 0x5000, 1, 0x4000, 0x5000));
+    assert(!eligibleUnmapRange(vmids, 11, UINT64_MAX - 1, 3, 0x4000, UINT64_MAX));
+    std::puts("MM-hub unmap ranges and thread/task ownership checked");
 }
 
 int main(int argc, char** argv)
 {
     assert(argc <= 2);
+    Writebacks writebacks{};
+    writebacks.observe(1, 1);
+    assert(!writebacks.updates);
+    writebacks.observe(UINT32_MAX, 0);
+    writebacks.observe(UINT32_MAX, 0);
+    writebacks.observe(0, 0);
+    writebacks.observe(0, 3);
+    assert(writebacks.updates == 2 && writebacks.lastStamp == 3);
+    testFirstReset();
+    testUnmapTrace();
     testQueue(true, "Dec", argv[1]);
     testQueue(false, "Enc", argv[1]);
     testQueue(false, "EncLLQ", argv[1]);

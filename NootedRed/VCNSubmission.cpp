@@ -8,6 +8,7 @@
 #include <VCNBridge.hpp>
 #include <VCNSubmission.hpp>
 #include <kern/clock.h>
+#include <kern/thread.h>
 #include <libkern/c++/OSNumber.h>
 #include <sys/sysctl.h>
 
@@ -15,84 +16,48 @@ namespace VCNSubmission
 {
     namespace
     {
-        constexpr size_t queueCount = 3;
-        constexpr size_t historySize = 8;
         IOSimpleLock* historyLock{};
         bool hardwareLibraryMatched{};
         bool routesReady{};
+        bool unmapTraceReady{};
+        bool writebackTraceReady{};
         void* activeEngine{};
+        void* activeHardware{};
+        uint64_t engineStart{};
+        uint32_t videoVmids{};
         uintptr_t hardwareTable{};
-        uintptr_t channelTables[queueCount]{};
-        mach_vm_address_t orgEncode{}, orgDecode{}, orgReset{}, orgReport{}, orgFreeMappings{};
-        mach_vm_address_t orgEngineInit{}, orgEngineFree{};
-
-        struct SubmitEvent
-        {
-            uint64_t time;
-            uint32_t stamp, softwareStamp, softwareChannel, flags, vmid, count, error;
-            Path path;
-            uint32_t words[MaxIBs];
-            uint64_t addresses[MaxIBs];
-        };
-
-        struct MappingRelease
-        {
-            uint64_t begin, end;
-            int32_t pid;
-            uint32_t mmVmid;
-        };
-
-        template<typename Entry>
-        struct History
-        {
-            Entry entries[historySize]{};
-            uint64_t next{};
-
-            void append(const Entry& entry)
-            {
-                const auto irq = IOSimpleLockLockDisableInterrupt(historyLock);
-                entries[next++ % historySize] = entry;
-                IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
-            }
-
-            template<typename Print>
-            void print(Print emit) const
-            {
-                auto irq = IOSimpleLockLockDisableInterrupt(historyLock);
-                const uint64_t end = next;
-                IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
-                for (auto serial = end > historySize ? end - historySize : 0; serial < end; ++serial) {
-                    Entry entry;
-                    irq = IOSimpleLockLockDisableInterrupt(historyLock);
-                    const bool available = serial < next && next - serial <= historySize;
-                    if (available) { entry = entries[serial % historySize]; }
-                    IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
-                    if (available) { emit(entry); }
-                }
-            }
-        };
+        uintptr_t channelTables[QueueCount]{};
+        mach_vm_address_t orgEncode{}, orgDecode{}, orgReset{}, orgReport{}, orgFreeMappings{}, orgTimestampUpdated{};
+        mach_vm_address_t orgEngineInit{}, orgEngineFree{}, orgUnmapVA{};
+        Timeline live{};
+        FirstReset firstReset{};
+        ActiveTaskReleases activeReleases{};
 
         struct QueueState
         {
-            History<SubmitEvent> history;
             Failure failure{};
             uint64_t failures{};
+            Writebacks writebacks{};
         };
-        QueueState queues[queueCount]{};
-        History<MappingRelease> releases{};
+        QueueState queues[QueueCount]{};
 
         int readSubmissions(struct sysctl_oid* oid, void*, int, struct sysctl_req* request)
         {
-            uint64_t records[queueCount], failures[queueCount];
+            uint64_t records[QueueCount], failures[QueueCount], writebacks[QueueCount];
             const auto irq = IOSimpleLockLockDisableInterrupt(historyLock);
-            for (size_t index = 0; index < queueCount; ++index) {
-                records[index] = queues[index].history.next;
+            for (size_t index = 0; index < QueueCount; ++index) {
+                records[index] = live.submissions[index].next;
                 failures[index] = __atomic_load_n(&queues[index].failures, __ATOMIC_RELAXED);
+                writebacks[index] = queues[index].writebacks.updates;
             }
+            const bool captured = firstReset.captured;
             IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
-            char text[192];
-            snprintf(text, sizeof(text), "VCN0Dec=%llu/%llu VCN0Enc=%llu/%llu VCN0EncLLQ=%llu/%llu",
-                     records[0], failures[0], records[1], failures[1], records[2], failures[2]);
+            char text[320];
+            snprintf(text, sizeof(text), "VCN0Dec=%llu/%llu VCN0Enc=%llu/%llu VCN0EncLLQ=%llu/%llu "
+                     "writebacks=%llu/%llu/%llu writebackTrace=%u firstReset=%u unmapVA=%u",
+                     records[0], failures[0], records[1], failures[1], records[2], failures[2],
+                     writebacks[0], writebacks[1], writebacks[2], writebackTraceReady ? 1U : 0U, captured ? 1U : 0U,
+                     unmapTraceReady ? 1U : 0U);
             return sysctl_handle_string(oid, text, sizeof(text), request);
         }
         SYSCTL_PROC(_debug, OID_AUTO, nred_vcn_submissions, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
@@ -105,7 +70,7 @@ namespace VCNSubmission
                 return -1;
             }
             const auto table = getMember<uintptr_t>(channel, 0);
-            for (size_t index = 0; index < queueCount; ++index) {
+            for (size_t index = 0; index < QueueCount; ++index) {
                 if (table == channelTables[index]) { return static_cast<int>(index); }
             }
             return -1;
@@ -125,8 +90,10 @@ namespace VCNSubmission
         {
             void* channel;
             uint32_t queue;
+            Commit original;
 
             static uint32_t invalid() { return static_cast<uint32_t>(kIOReturnBadArgument); }
+            uint32_t replay(const Submission& job) const { return original(channel, &job); }
             Failure failure() const
             {
                 Failure value;
@@ -150,7 +117,14 @@ namespace VCNSubmission
                     event.words[index] = job.ib[index].dwords;
                     event.addresses[index] = job.ib[index].gpuAddress;
                 }
-                queues[queue].history.append(event);
+                const auto irq = IOSimpleLockLockDisableInterrupt(historyLock);
+                live.submissions[queue].append(event);
+                if ((path == Path::Primary || path == Path::Auxiliary) && job.vmid && job.vmid < 32) {
+                    const auto known = __atomic_load_n(&videoVmids, __ATOMIC_RELAXED);
+                    const auto mask = 1U << job.vmid;
+                    if (!(known & mask)) { __atomic_store_n(&videoVmids, known | mask, __ATOMIC_RELAXED); }
+                }
+                IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
             }
 
             uint32_t reject(const Submission& job, uint32_t status) const
@@ -205,13 +179,36 @@ namespace VCNSubmission
             auto original = reinterpret_cast<Commit>(DecodeChannel ? orgDecode : orgEncode);
             const auto index = queueIndex(channel);
             if (!job || index < 0 || (index == 0) != DecodeChannel) { return original(channel, job); }
-            Port port{channel, static_cast<uint32_t>(index)};
+            Port port{channel, static_cast<uint32_t>(index), original};
             return commit(*job, DecodeChannel, port);
+        }
+
+        void timestampUpdated(void* channel)
+        {
+            const auto index = queueIndex(channel);
+            if (index >= 0) {
+                const auto irq = IOSimpleLockLockDisableInterrupt(historyLock);
+                const auto* writeback = getMember<const volatile uint32_t*>(channel, 0xC0);
+                const auto& cached = getMember<volatile uint32_t>(channel, 0x84);
+                if (writeback && writeback != &cached) { queues[index].writebacks.observe(cached, *writeback); }
+                IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
+            }
+            FunctionCast(timestampUpdated, orgTimestampUpdated)(channel);
         }
 
         void resetChannel(void* channel)
         {
             const auto index = queueIndex(channel);
+            if (index >= 0) {
+                const auto irq = IOSimpleLockLockDisableInterrupt(historyLock);
+                const auto* writeback = getMember<const volatile uint32_t*>(channel, 0xC0);
+                if (!firstReset.captured && writeback && writeback != &getMember<uint32_t>(channel, 0x84)) {
+                    firstReset.capture({mach_absolute_time(), getMember<uint32_t>(channel, 0xC),
+                                        getMember<uint32_t>(channel, 0x80), getMember<uint32_t>(channel, 0x84),
+                                        *writeback}, live);
+                }
+                IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
+            }
             FunctionCast(resetChannel, orgReset)(channel);
             if (index >= 0) {
                 Failure cleared{};
@@ -229,12 +226,42 @@ namespace VCNSubmission
             if (!accelerator || accelerator->getProvider() != NRed::singleton().getIGPU()) { return original(task); }
             auto* context = getMember<void*>(task, 0x260);
             MappingRelease release{};
-            release.pid = getMember<int32_t>(task, 0xAD0);
             release.mmVmid = context ? getMember<uint32_t>(context, 0x11C) : 0;
             release.begin = mach_absolute_time();
+            TaskReleaseScope scope{current_thread(), task, release.begin};
+            auto irq = IOSimpleLockLockDisableInterrupt(historyLock);
+            activeReleases.enter(scope);
+            IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
             original(task);
             release.end = mach_absolute_time();
-            releases.append(release);
+            release.pid = getMember<int32_t>(task, 0xAD0);
+            irq = IOSimpleLockLockDisableInterrupt(historyLock);
+            activeReleases.leave(scope);
+            if (release.begin >= engineStart) { live.releases.append(release); }
+            IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
+        }
+
+        void unmapVA(void* context, uint64_t address, uint64_t bytes)
+        {
+            const auto original = FunctionCast(unmapVA, orgUnmapVA);
+            const auto hardware = __atomic_load_n(&activeHardware, __ATOMIC_ACQUIRE);
+            if (!hardware || hardware != getMember<void*>(context, 0x10)) { return original(context, address, bytes); }
+            const auto vmids = __atomic_load_n(&videoVmids, __ATOMIC_RELAXED);
+            if (!vmids) { return original(context, address, bytes); }
+            const auto vmid = getMember<uint32_t>(context, 0x11C);
+            if (!eligibleUnmapRange(vmids, vmid, address, bytes, getMember<uint64_t>(context, 0x80),
+                                    getMember<uint64_t>(context, 0x88))) {
+                return original(context, address, bytes);
+            }
+            const auto* task = getMember<void*>(context, 0x28);
+            UnmapRange range{mach_absolute_time(), 0, address, bytes, 0, vmid};
+            original(context, address, bytes);
+            range.end = mach_absolute_time();
+            const auto irq = IOSimpleLockLockDisableInterrupt(historyLock);
+            if (range.begin >= engineStart && activeReleases.associate(range, current_thread(), task)) {
+                live.unmaps.append(range);
+            }
+            IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
         }
 
         __attribute__((format(printf, 3, 4)))
@@ -251,35 +278,78 @@ namespace VCNSubmission
             remaining -= used;
         }
 
+        template<typename Entry, size_t Capacity, typename Print>
+        void printHistory(const History<Entry, Capacity>& history, uint64_t end, uint64_t liveStart, Print emit)
+        {
+            for (auto serial = end > Capacity ? end - Capacity : 0; serial < end; ++serial) {
+                Entry entry;
+                const auto irq = IOSimpleLockLockDisableInterrupt(historyLock);
+                const bool available = (!liveStart || engineStart == liveStart) && history.read(serial, entry);
+                IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
+                if (available) { emit(entry); }
+            }
+        }
+
         void reportChannel(void* channel, char*& cursor, uint32_t& remaining)
         {
             FunctionCast(reportChannel, orgReport)(channel, cursor, remaining);
             const auto index = queueIndex(channel);
             if (index < 0) { return; }
-            constexpr const char* paths[]{"primary", "fence", "auxiliary", "rejected"};
-            queues[index].history.print([&](const SubmitEvent& event) {
-                appendReport(cursor, remaining, "  NRedVCN t=%llu hw=%u stamp=%x sw=%u/%x flags=%x vmid=%u "
-                             "path=%s error=%x count=%u", event.time, getMember<uint32_t>(channel, 0xC),
+            const auto irq = IOSimpleLockLockDisableInterrupt(historyLock);
+            const bool captured = firstReset.captured;
+            const auto stamps = firstReset.stamps;
+            const auto& timeline = captured ? firstReset.timeline : live;
+            const auto liveStart = captured ? 0 : engineStart;
+            const auto submissions = timeline.submissions[index].next;
+            const auto releases = timeline.releases.next;
+            const auto unmaps = timeline.unmaps.next;
+            const auto& current = live.submissions[index];
+            SubmitEvent latest{};
+            const bool hasLatest = captured && current.next && (engineStart > stamps.time || current.next != submissions)
+                && current.read(current.next - 1, latest);
+            IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
+            if (captured) {
+                appendReport(cursor, remaining, "  NRedVCN first-reset t=%llu hw=%u submitted=%x cached=%x writeback=%x\n",
+                             stamps.time, stamps.channel, stamps.submitted, stamps.lastRead, stamps.writeback);
+            }
+            auto printSubmission = [&](const SubmitEvent& event, const char* prefix) {
+                constexpr const char* paths[]{"primary", "fence", "auxiliary", "rejected", "replay"};
+                appendReport(cursor, remaining, "  NRedVCN %st=%llu hw=%u stamp=%x sw=%u/%x flags=%x vmid=%u "
+                             "path=%s error=%x count=%u", prefix, event.time, getMember<uint32_t>(channel, 0xC),
                              event.stamp, event.softwareChannel, event.softwareStamp, event.flags, event.vmid,
                              paths[static_cast<size_t>(event.path)], event.error, event.count);
                 for (size_t slot = 0; slot < event.count && slot < MaxIBs; ++slot) {
                     appendReport(cursor, remaining, " ib%zu=%llx/%u", slot, event.addresses[slot], event.words[slot]);
                 }
                 appendReport(cursor, remaining, "\n");
-            });
+            };
+            printHistory(timeline.submissions[index], submissions, liveStart,
+                         [&](const SubmitEvent& event) { printSubmission(event, ""); });
+            if (hasLatest) { printSubmission(latest, "latest "); }
             if (index == 0) {
-                releases.print([&](const MappingRelease& release) {
+                printHistory(timeline.releases, releases, liveStart, [&](const MappingRelease& release) {
                     appendReport(cursor, remaining, "  NRedVCN freeMappings t=%llu..%llu pid=%d mmVMID=%u\n",
                                  release.begin, release.end, release.pid, release.mmVmid);
+                });
+                appendReport(cursor, remaining, "  NRedVCN unmapVA enabled=%u records=%llu\n",
+                             unmapTraceReady ? 1U : 0U, unmaps);
+                printHistory(timeline.unmaps, unmaps, liveStart, [&](const UnmapRange& range) {
+                    appendReport(cursor, remaining, "  NRedVCN unmapVA t=%llu..%llu mmVMID=%u va=%llx bytes=%llx release=%llu\n",
+                                 range.begin, range.end, range.mmVmid, range.address, range.bytes, range.taskRelease);
                 });
             }
         }
 
         void detachEngine(void* engine)
         {
-            if (__atomic_compare_exchange_n(&activeEngine, &engine, nullptr, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-                NRed::singleton().setProp32("NRedVCNOrderedFence", 0);
+            const auto irq = IOSimpleLockLockDisableInterrupt(historyLock);
+            const bool active = engine == __atomic_load_n(&activeEngine, __ATOMIC_RELAXED);
+            if (active) {
+                __atomic_store_n(&activeHardware, nullptr, __ATOMIC_RELEASE);
+                __atomic_store_n(&activeEngine, nullptr, __ATOMIC_RELEASE);
             }
+            IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
+            if (active) { NRed::singleton().setProp32("NRedVCNOrderedFence", 0); }
         }
 
         bool initEngine(void* engine, void* hardware, uint32_t type)
@@ -295,9 +365,13 @@ namespace VCNSubmission
             for (auto& queue : queues) {
                 __atomic_store(&queue.failure, &cleared, __ATOMIC_RELEASE);
                 __atomic_store_n(&queue.failures, uint64_t{0}, __ATOMIC_RELAXED);
-                queue.history.next = 0;
+                queue.writebacks = {};
             }
-            releases.next = 0;
+            for (auto& history : live.submissions) { history.next = 0; }
+            live.releases.next = live.unmaps.next = 0;
+            engineStart = mach_absolute_time();
+            __atomic_store_n(&videoVmids, 0U, __ATOMIC_RELAXED);
+            __atomic_store_n(&activeHardware, hardware, __ATOMIC_RELEASE);
             __atomic_store_n(&activeEngine, engine, __ATOMIC_RELEASE);
             IOSimpleLockUnlockEnableInterrupt(historyLock, irq);
             const auto result = original(engine, hardware, type);
@@ -331,14 +405,23 @@ namespace VCNSubmission
             }
             historyLock = IOSimpleLockAlloc();
             if (!historyLock) { return false; }
-            KernelPatcher::RouteRequest route{"__ZN27AMDRadeonX5000_AMDAccelTask18freeAllGPUMappingsEv",
-                                              freeMappings, orgFreeMappings};
-            if (!patcher.routeMultiple(id, &route, 1, slide, size)) {
+            KernelPatcher::RouteRequest release{"__ZN27AMDRadeonX5000_AMDAccelTask18freeAllGPUMappingsEv",
+                                                freeMappings, orgFreeMappings};
+            if (!patcher.routeMultiple(id, &release, 1, slide, size)) {
                 patcher.clearError();
                 IOSimpleLockFree(historyLock);
                 historyLock = nullptr;
                 return false;
             }
+            constexpr uint8_t unmapHead[]{0x48, 0x3B, 0xB7, 0x80, 0, 0, 0};
+            constexpr char unmapSymbol[] = "__ZN29AMDRadeonX5000_AMDHWVMContext7unmapVAEyy";
+            const auto address = patcher.solveSymbol(id, unmapSymbol, slide, size);
+            if (address >= slide && size >= sizeof(unmapHead) && address - slide <= size - sizeof(unmapHead)
+                && memcmp(reinterpret_cast<const void*>(address), unmapHead, sizeof(unmapHead)) == 0) {
+                KernelPatcher::RouteRequest range{unmapSymbol, unmapVA, orgUnmapVA};
+                unmapTraceReady = patcher.routeMultipleShort(id, &range, 1, slide, size);
+            }
+            if (!unmapTraceReady) { patcher.clearError(); }
             hardwareTable = table + 2 * sizeof(void*);
             return true;
         }
@@ -348,8 +431,8 @@ namespace VCNSubmission
             constexpr const char* tables[]{"__ZTV32AMDRadeonX6000_AMDVCN2DecChannel",
                                            "__ZTV32AMDRadeonX6000_AMDVCN2EncChannel",
                                            "__ZTV35AMDRadeonX6000_AMDVCN2EncLLQChannel"};
-            static_assert(arrsize(tables) == queueCount);
-            for (size_t index = 0; index < queueCount; ++index) {
+            static_assert(arrsize(tables) == QueueCount);
+            for (size_t index = 0; index < QueueCount; ++index) {
                 const auto address = patcher.solveSymbol(id, tables[index], slide, size);
                 if (!address) {
                     patcher.clearError();
@@ -372,6 +455,10 @@ namespace VCNSubmission
                 patcher.clearError();
                 return false;
             }
+            KernelPatcher::RouteRequest timestamp{"__ZN27AMDRadeonX6000_AMDHWChannel16timestampUpdatedEv",
+                                                  timestampUpdated, orgTimestampUpdated};
+            writebackTraceReady = patcher.routeMultiple(id, &timestamp, 1, slide, size);
+            if (!writebackTraceReady) { patcher.clearError(); }
             sysctl_register_oid(&sysctl__debug_nred_vcn_submissions);
             __atomic_store_n(&routesReady, true, __ATOMIC_RELEASE);
             return true;

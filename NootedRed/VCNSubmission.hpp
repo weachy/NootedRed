@@ -37,11 +37,141 @@ namespace VCNSubmission
     static_assert(offsetof(Submission, ib) + offsetof(IndirectBuffer, dwords) == 0x4C);
     static_assert(offsetof(Submission, ib) + offsetof(IndirectBuffer, gpuAddress) == 0x58);
 
-    enum class Path : uint8_t { Primary, Fence, Auxiliary, Rejected };
+    enum class Path : uint8_t { Primary, Fence, Auxiliary, Rejected, Replay };
 
     struct alignas(8) Failure
     {
         uint32_t status, precedingStamp;
+    };
+
+    template<typename Entry, size_t Capacity>
+    struct History
+    {
+        Entry entries[Capacity]{};
+        uint64_t next{};
+
+        void append(const Entry& entry) { entries[next++ % Capacity] = entry; }
+
+        bool read(uint64_t serial, Entry& entry) const
+        {
+            if (serial >= next || next - serial > Capacity) { return false; }
+            entry = entries[serial % Capacity];
+            return true;
+        }
+    };
+
+    struct SubmitEvent
+    {
+        uint64_t time;
+        uint32_t stamp, softwareStamp, softwareChannel, flags, vmid, count, error;
+        Path path;
+        uint32_t words[MaxIBs];
+        uint64_t addresses[MaxIBs];
+    };
+
+    struct MappingRelease
+    {
+        uint64_t begin, end;
+        int32_t pid;
+        uint32_t mmVmid;
+    };
+
+    struct UnmapRange
+    {
+        uint64_t begin, end, address, bytes, taskRelease;
+        uint32_t mmVmid;
+    };
+
+    struct TaskReleaseScope
+    {
+        const void* thread;
+        const void* task;
+        uint64_t begin;
+        TaskReleaseScope* next{};
+    };
+
+    struct ActiveTaskReleases
+    {
+        TaskReleaseScope* head{};
+
+        void enter(TaskReleaseScope& scope)
+        {
+            scope.next = head;
+            head = &scope;
+        }
+
+        void leave(TaskReleaseScope& scope)
+        {
+            for (auto** link = &head; *link; link = &(*link)->next) {
+                if (*link == &scope) {
+                    *link = scope.next;
+                    return;
+                }
+            }
+        }
+
+        bool associate(UnmapRange& range, const void* thread, const void* task) const
+        {
+            for (auto* scope = head; scope; scope = scope->next) {
+                if (scope->thread == thread && scope->task == task) {
+                    range.taskRelease = scope->begin;
+                    return true;
+                }
+            }
+            range.taskRelease = 0;
+            return range.mmVmid != 0;
+        }
+    };
+
+    inline bool eligibleUnmapRange(uint32_t vmids, uint32_t vmid, uint64_t address, uint64_t bytes, uint64_t base,
+                                   uint64_t end)
+    {
+        if (!vmids || vmid >= 32 || !bytes || address < base || address >= end || bytes > end - address) { return false; }
+        return vmid == 0 || (vmids & (1U << vmid)) != 0;
+    }
+
+    constexpr size_t QueueCount = 3;
+
+    struct Writebacks
+    {
+        uint64_t updates{};
+        uint32_t lastStamp{};
+
+        void observe(uint32_t cached, uint32_t stamp)
+        {
+            if (stamp != cached && (!updates || stamp != lastStamp)) {
+                ++updates;
+                lastStamp = stamp;
+            }
+        }
+    };
+
+    struct Timeline
+    {
+        History<SubmitEvent, 8> submissions[QueueCount];
+        History<MappingRelease, 8> releases;
+        History<UnmapRange, 16> unmaps;
+    };
+
+    struct ResetStamps
+    {
+        uint64_t time;
+        uint32_t channel, submitted, lastRead, writeback;
+    };
+
+    struct FirstReset
+    {
+        bool captured{};
+        ResetStamps stamps{};
+        Timeline timeline{};
+
+        void capture(const ResetStamps& sample, const Timeline& live)
+        {
+            if (captured || (sample.submitted == sample.lastRead && sample.submitted == sample.writeback)) { return; }
+            stamps = sample;
+            timeline = live;
+            captured = true;
+        }
     };
 
     inline bool validIB(const IndirectBuffer& ib)
@@ -52,16 +182,16 @@ namespace VCNSubmission
 
     inline Path selectPath(const Submission& job)
     {
+        if (job.flags & 2U) { return Path::Replay; }
         if (job.count > MaxIBs) { return Path::Rejected; }
-        const bool discard = (job.flags & 2U) != 0;
-        if (!discard && job.count && job.ib[0].dwords) {
+        if (job.count && job.ib[0].dwords) {
             return validIB(job.ib[0]) ? Path::Primary : Path::Rejected;
         }
         auto path = Path::Fence;
-        for (size_t index = 0; index < job.count; ++index) {
+        for (size_t index = 1; index < job.count; ++index) {
             const auto& ib = job.ib[index];
             if (!ib.dwords) { continue; }
-            if (discard || !validIB(ib)) { return Path::Rejected; }
+            if (!validIB(ib)) { return Path::Rejected; }
             path = Path::Auxiliary;
         }
         return path;
@@ -133,12 +263,16 @@ namespace VCNSubmission
     template<typename Port>
     uint32_t commit(const Submission& job, bool decode, Port& port)
     {
+        const auto path = selectPath(job);
+        if (path == Path::Replay) {
+            port.record(job, path, 0);
+            return port.replay(job);
+        }
         const auto failure = port.failure();
         if (failure.status) {
             port.record(job, Path::Rejected, failure.status);
             return failure.precedingStamp;
         }
-        const auto path = selectPath(job);
         port.record(job, path, 0);
         const auto status = path == Path::Rejected ? port.invalid() : port.queueFrame(job, path, decode);
         return status ? port.reject(job, status) : job.stamp;

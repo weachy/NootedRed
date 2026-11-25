@@ -16,10 +16,12 @@
 #include <NRed.hpp>
 #include <RenoirDriverBuild.hpp>
 #include <UserPatches.hpp>
+#include <VCNBridge.hpp>
 #include <X5000Memory.hpp>
 #include <X5000MemoryPolicy.hpp>
 #include <kern/clock.h>
 #include <kern/task.h>
+#include <libkern/c++/OSIterator.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSString.h>
 #include <sys/sysctl.h>
@@ -105,6 +107,7 @@ namespace
     constexpr char taskSymbol[]       = "__ZNK16IOAccelResource210getGPUTaskEv";
     constexpr char storageSymbol[]    = "__ZN16IOAccelResource218getStorageResourceEv";
     constexpr char sharedInitSymbol[] = "__ZN14IOAccelShared24initEP22IOGraphicsAccelerator2P4task";
+    constexpr char connectClientSymbol[] = "__ZN15IOAccelContext213connectClientEP12IOUserClient";
     constexpr char allocationParametersSymbol[] = "__ZN31AMDRadeonX5000_AMDAccelResource23getMemoryAllocParameterEv";
     constexpr char sysInitSymbol[] = "__ZN32AMDRadeonX5000_AMDAccelSysMemory4initEP22IOGraphicsAccelerator2";
     constexpr char mapInitSymbol[] =
@@ -122,6 +125,7 @@ namespace
     constexpr size_t resourceType              = 0x14;
     constexpr size_t resourceAccelerator       = 0x18;
     constexpr size_t resourceClientMap         = 0x60;
+    constexpr size_t videoContextShared        = 0x5A0;
     constexpr UInt32 bothCopiesPurgeable       = (1U << 14) | (1U << 15);
     constexpr size_t backingMemory             = 0x80;
     constexpr size_t primaryMemory             = 0x88;
@@ -323,6 +327,7 @@ namespace
     constexpr UInt8 taskHead[]         = {0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x47, 0x68, 0x48, 0x85, 0xC0};
     constexpr UInt8 surfaceOwnerLoad[] = {0x48, 0x8B, 0x9B, 0xE0, 0, 0, 0};
     constexpr UInt8 sharedTaskStore[]  = {0x48, 0x89, 0x83, 0x88, 0, 0, 0, 0x48, 0x85, 0xC0};
+    constexpr UInt8 connectedSharedStore[] = {0x48, 0x89, 0xBB, 0xA0, 0x05, 0, 0};
     constexpr UInt8 clientBufferFlagStore[] = {0x80, 0x4B, 0x0C, 0x40};
     constexpr UInt8 configAcceleratorLoad[] = {0x4C, 0x8B, 0xA7, 0x08, 0x01, 0, 0};
     constexpr UInt8 configBitsStore[]       = {0x0F, 0xB7, 0xC8, 0xC1, 0xE8, 0x09, 0x25, 0x00,
@@ -569,6 +574,7 @@ namespace
     UInt64 allocationFailures{0};
     UInt64 bufferAllocations{0};
     UInt64 textureAllocations{0};
+    UInt64 nativeVideoTextureDecisions{0};
     UInt64 surfaceAllocations{0};
     UInt64 liveBytes{0};
     UInt64 unwireCount{0};
@@ -721,11 +727,31 @@ namespace
         return false;
     }
 
+    bool usesVideoShare(IOService* const accelerator, void* const shared)
+    {
+        if (!VCNBridge::singleton().engineEnabled()) { return false; }
+        auto* const clients = accelerator->getChildIterator(gIOServicePlane);
+        if (!clients) { return true; }
+        bool found = false;
+        while (auto* const client = clients->getNextObject()) {
+            if (client->metaCast("AMDRadeonX6000_AMDNavi10VideoContext")
+                && __atomic_load_n(&getMember<void*>(client, videoContextShared), __ATOMIC_ACQUIRE) == shared)
+            {
+                found = true;
+                break;
+            }
+        }
+        const bool native = found || !clients->isValid();
+        clients->release();
+        if (found) { increment(nativeVideoTextureDecisions); }
+        return native;
+    }
+
     BackingKind primaryBackingForResource(void* const resource, void* const shared)
     {
-        if (resource == nullptr || !ownsAccelerator(getMember<IOService*>(resource, resourceAccelerator))) {
-            return BackingKind::Native;
-        }
+        if (!resource) { return BackingKind::Native; }
+        auto* const accelerator = getMember<IOService*>(resource, resourceAccelerator);
+        if (!ownsAccelerator(accelerator)) { return BackingKind::Native; }
 
         X5000Memory::Requirements usage{};
         usage.kind               = static_cast<ResourceKind>(getMember<UInt8>(resource, resourceType));
@@ -753,7 +779,12 @@ namespace
                            == copyKindLinear;
             }
         }
-        return X5000Memory::choosePrimaryBacking(usage);
+        const auto kind = X5000Memory::choosePrimaryBacking(usage);
+        if (kind == BackingKind::Texture) {
+            return X5000Memory::placeLinearTexture(getMember<UInt32>(resource, resourceCopyFlags),
+                getMember<void*>(resource, surfaceLayout) != nullptr, [&] { return usesVideoShare(accelerator, shared); });
+        }
+        return kind;
     }
 
     struct EntryHead
@@ -2612,6 +2643,7 @@ namespace
     UMA_COUNTER(allocation_failures, allocationFailures, "Failed pageable backing allocations");
     UMA_COUNTER(data_buffers, bufferAllocations, "Data buffers allocated with pageable backing");
     UMA_COUNTER(textures, textureAllocations, "Textures allocated with pageable primary backing");
+    UMA_COUNTER(native_vcn_textures, nativeVideoTextureDecisions, "Native placement decisions for VCN linear textures");
     UMA_COUNTER(surfaces, surfaceAllocations, "Surfaces allocated with pageable primary backing");
     UMA_COUNTER(bytes_live, liveBytes, "Logical size of managed backing objects");
     UMA_COUNTER(bytes_managed_wired, managedWiredBytes, "Wired managed backing bytes including cached textures");
@@ -2697,6 +2729,7 @@ namespace
             &sysctl__debug_nred_uma_allocation_failures,
             &sysctl__debug_nred_uma_data_buffers,
             &sysctl__debug_nred_uma_textures,
+            &sysctl__debug_nred_uma_native_vcn_textures,
             &sysctl__debug_nred_uma_surfaces,
             &sysctl__debug_nred_uma_bytes_live,
             &sysctl__debug_nred_uma_bytes_managed_wired,
@@ -2953,6 +2986,7 @@ namespace
             || !image.matches(limit, wiredLimitBody) || !image.matches(singleLimit, singleLimitHead)
             || !image.matches(task, taskHead) || !image.matches(storage + 0x86, surfaceOwnerLoad)
             || !image.matches(sharedInit + 0x37, sharedTaskStore)
+            || !image.matches(image.resolve(connectClientSymbol) + 0x1A4, connectedSharedStore)
             || !image.matches(config + 0x11, configAcceleratorLoad) || !image.matches(config + 0x6B, configBitsStore)
             || !image.matches(config + 0x91, configTextureStore) || !image.matches(config + 0xAE, configWiredStore))
         {

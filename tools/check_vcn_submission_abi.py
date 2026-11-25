@@ -40,6 +40,30 @@ def check_engine_ownership(producer, consumer, bias):
     print("X5000 PCI owner, X6000 channel owner and VCN2 engine lifetime verified")
 
 
+def check_diagnostic_fields(producer, consumer):
+    reset = consumer.symbols["__ZN27AMDRadeonX6000_AMDHWChannel5resetEv"]
+    assert consumer.read(reset + 0xA, 17) == bytes.fromhex("488b87c0000000 488d8f84000000 4839c8")
+    assert consumer.read(reset + 0x2F, 14) == bytes.fromhex("8b8b80000000 8908 898b84000000")
+    timestamp = consumer.symbols["__ZN27AMDRadeonX6000_AMDHWChannel16timestampUpdatedEv"]
+    assert consumer.read(timestamp + 0x20, 21) == bytes.fromhex("488b93c0000000 488bb3e0000000 4881c384000000")
+    assert consumer.read(timestamp + 0x46, 15) == bytes.fromhex("488b83c0000000 8b10 899384000000")
+    task_release = producer.symbols["__ZN27AMDRadeonX5000_AMDAccelTask18freeAllGPUMappingsEv"]
+    assert producer.read(task_release + 0xDE, 11) == bytes.fromhex("8b83d00a0000 83f8ff 751a")
+    assert producer.read(task_release + 0xFD, 6) == bytes.fromhex("8983d00a0000")
+    context = "__ZN29AMDRadeonX5000_AMDHWVMContext"
+    init = producer.symbols[context + "4initEP30AMDRadeonX5000_IAMDHWInterfaceP24AMDRadeonX5000_IAMDHWVMM"
+                            "P27AMDRadeonX5000_AMDAccelTask"]
+    assert producer.read(init + 0xE, 12) == bytes.fromhex("4989cc 4989d7 4989f5 4889fb")
+    assert producer.read(init + 0x5E, 12) == bytes.fromhex("4c896b10 4c897b18 4c896328")
+    getter = producer.symbols["__ZNK29AMDRadeonX5000_AMDHWVMContext15getAssignedVMIDE16eAMD_VM_HUB_TYPEb"]
+    assert producer.read(getter + 4, 9) == bytes.fromhex("89f0 8b848718010000")
+    unmap = producer.symbols[context + "7unmapVAEyy"]
+    assert producer.read(unmap, 7) == bytes.fromhex("483bb780000000")
+    assert producer.read(unmap + 0x1A, 20) == bytes.fromhex("4989d6 4989f7 4889fb 488d0432 483b8788000000")
+    assert producer.read(unmap + 0x85, 7) == bytes.fromhex("488d9318010000")
+    print("Native writeback and reset, VM context task, task PID fill, MM VMID and unmap bounds verified")
+
+
 def check(kc_path, output):
     collection = kcdata.KernelCollection(kc_path)
     producer = collection.kexts[kcdata.X5000_ID]
@@ -75,6 +99,7 @@ def check(kc_path, output):
     native_stamps = []
     bias = kcdata.derive_prelink_bias(collection)
     check_engine_ownership(producer, consumer, bias)
+    check_diagnostic_fields(producer, consumer)
     read = machine.reg_read
     write = machine.reg_write
 
@@ -132,6 +157,7 @@ def check(kc_path, output):
     for index, name in enumerate(("Dec", "Enc", "EncLLQ")):
         channel_type = f"AMDRadeonX6000_AMDVCN2{name}Channel"
         table = consumer.symbols[f"__ZTV{len(channel_type)}{channel_type}"] + 16
+        assert run(consumer.read_u64(table + 0x138) - bias, channel) == 1, "expected the MM hub"
         for slot in range(0x338, 0x370, 8):
             pointer(vtable + slot, consumer.read_u64(table + slot) - bias)
         initializer = consumer.read_u64(table + 0x368) - bias
@@ -182,6 +208,18 @@ def check(kc_path, output):
         assert run(libs.read_u64(ttl_dispatch + 0xA0) - bias, ttl, index, 0, frame) != 0
         assert run(commit, channel, job) == stamp and not native_stamps
         pointer(ttl + 0x6B8, libs.symbols["_queue_submit_frame"])
+        vmid, address, words, serial = (8, 0x400010280, 13, 0x156) if index else (11, 0x400010000, 176, 0x79)
+        word(job + 4, vmid)
+        word(job + 0x14, 1)
+        word(job + 0x18, serial)
+        word(job + 0x4C, words)
+        pointer(job + 0x58, address)
+        assert run(commit, channel, job) == serial and len(native_stamps) == 1
+        packet = struct.unpack(f"<{size // 4}I", native_stamps[0])
+        assert packet[1 if index else 5] == vmid and packet[8 if index else 19] == serial
+        assert packet[4 if index else 17] == words
+        assert packet[2 if index else 9] | (packet[3 if index else 7] << 32) == address
+        (output / f"{name}-handoff.bin").write_bytes(native_stamps[0])
         print(f"{name}: native {size}-byte template, primary selection, empty, discard and failed submit verified")
 
 

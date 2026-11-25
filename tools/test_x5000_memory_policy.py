@@ -31,6 +31,13 @@ void testPlacement() {
     assert(choosePrimaryBacking(buffer) == BackingKind::Buffer);
     auto texture = usable(ResourceKind::Texture);
     assert(choosePrimaryBacking(texture) == BackingKind::Texture);
+    unsigned lookups = 0;
+    auto video = [&] { ++lookups; return true; };
+    assert(placeLinearTexture(0x10002000, false, video) == BackingKind::Native);
+    assert(placeLinearTexture(0x10002000, true, video) == BackingKind::Texture);
+    assert(placeLinearTexture(0x10082000, false, video) == BackingKind::Texture);
+    assert(lookups == 1);
+    assert(placeLinearTexture(0x10002000, false, [] { return false; }) == BackingKind::Texture);
     texture.importsSurface = true;
     assert(choosePrimaryBacking(texture) == BackingKind::Native);
 

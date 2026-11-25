@@ -26,6 +26,9 @@ These allocations stay on the native carve-out path:
 - allocations for which the kernel creates separate auxiliary descriptors, such as OpenGL MSAA and depth/stencil;
 - fixed-address resources.
 
+The native allocator also handles linear working textures on a connected VCN video context's share. This includes
+its session buffer. Ordinary textures allocated through another share in the same process remain eligible for UMA.
+
 DCC metadata that the Metal driver places inside a normal texture allocation, and reaches through the same GPU VA,
 pages together with the texture.
 
@@ -559,6 +562,12 @@ the 256 MiB and 1 GiB reads measured 30.55 and 33.01 GiB/s, respectively, up fro
 the reference run. Median dependent-load latency at 4 KiB and 64 KiB strides measured 334.2 and 169.0 ns,
 against 334.5 and 169.4 ns. Each build contributed one benchmark run.
 
+On `A09487DF` all seven UMA workloads passed. In three additional Managed runs, both the 16 MiB buffer
+and the 16 MiB texture became `Volatile`. Each reduced the task's graphics footprint by 16 MiB. After
+discard, refill and GPU readback succeeded at the original buffer VA. The 256 MiB and 1 GiB working sets
+measured 30.83 and 32.20 GiB/s in one run. The median 4 KiB and 64 KiB stride latencies were 335.0 and
+168.5 ns per load.
+
 ### SwiftRDP and VCN completion
 
 The VCN submission repair targets Renoir `0x1636` with the `25G332` X5000, X5000HWLibs and X6000 driver UUIDs.
@@ -569,11 +578,15 @@ During the November 25 incident, the WindowServer watchdog sample placed an I/O 
 The native reset also copies the submitted stamp into timestamp memory. A hardware timestamp observed after
 reset cannot establish whether the original job executed.
 
-X5000 marks an empty submission or a discarded replay with bit 1. X6000's VCN2 commit returned the requested
-stamp immediately in that case. With a zero primary IB and the bit clear, it submitted the initial template with
-its original fence value. For an ordinary primary IB, native commit also returned the requested stamp after a
-TTL enqueue error. The bridge now queues a frame containing the channel's fence address, requested
-timestamp, trap and end command. It replaces the IB with native NOPs and preserves the decoder start packet.
+X5000 sets flag `0x2` when it discards a replay. Native X6000 commit returns the requested stamp without
+submitting a frame for this flag. In NootedRed 1.3.4 the upstream `submitCommandBuffer` hook retires the
+skipped job after the native call returns. The PR forwards flagged jobs to native commit, including during
+recovery from a queue error. This leaves one writer responsible for retiring a discarded job.
+
+For an ordinary zero-length primary IB with the flag clear, native commit submitted the initial template with
+its original fence value. For a populated primary IB it also returned the requested stamp after a TTL enqueue
+error. For empty jobs the PR queues a frame containing the channel's fence address, requested timestamp, trap
+and end command. It replaces the IB with native NOPs and preserves the decoder start packet.
 If a zero primary IB has live auxiliary IBs, the native TTL builder encodes them in order in one frame with a
 single final fence. An active primary keeps native video packet selection even if side buffers are present.
 All three paths check the TTL operation results. After the first failure, later submissions on that queue return
@@ -581,12 +594,25 @@ the same preceding stamp until native reset. Healthy queues can continue indepen
 GPU receives the original packet sequence. The CPU runs one IB query and build, writes the stamp into the copied
 fence packet and records a short history entry. The original commit also queried and built the fence packet.
 
-`NRedVCNOrderedFence = 1` on the iGPU records activation. GPU restart reports include the last eight commits per
-video queue with hardware and software timestamps, actual VMID, flags, IB addresses and dword lengths. The
-decoder section also reports eight recent task mapping releases with PID, MM-hub VMID and begin/end times.
-Both histories use Mach absolute time. `sysctl -n debug.nred_vcn_submissions` reads each queue's history-record
-and failure counts. The failure count survives a channel reset. The cause of the initial MM-hub fault still
-needs hardware evidence. The old reports lack the live IBs and the encoder VMID at the instant of submission.
+`NRedVCNOrderedFence = 1` on the iGPU records activation. The diagnostic build saves the first VCN reset with
+outstanding timestamps before native reset rewrites the writeback. The snapshot includes the submitted, cached
+and writeback stamps and eight commits per queue with their actual VMID, flags, IB addresses and lengths.
+Later reports retain that snapshot across replay and engine reinitialization. They also show the latest live
+submission when available.
+
+The decoder section records eight completed task releases and sixteen recent `unmapVA` calls. Entries use
+Mach absolute time. For a known video VMID, compare the fault page with the unmap address and byte count.
+The driver reads the VM context's task before calling native `unmapVA`. A release start time links an
+unmap to an enclosing `freeMappings` on the same thread for the same GPU task. Known nonzero video VMIDs
+also produce records outside a task release. VMID zero requires a matching release and the former VMID
+still needs independent evidence. An unmap end time records the native function's return. The GPU may
+execute the page-table update later.
+
+`debug.nred_vcn_submissions` also reports observed writeback updates in decode, encode and low-latency
+encode order. The timestamp callback compares the separate hardware writeback word with the driver's
+cached value and counts a changed stamp once. Several jobs can complete between callbacks. The runner
+checks the upstream reset and skipped-replay counts because recovery can also write the timestamp word.
+A diagnostic run requires `firstReset=0`, `unmapVA=1` and `writebackTrace=1`.
 
 On the host, the original X6000 initializers and commits ran against the native HWLibs TTL methods with an
 in-memory ring sink. An injected enqueue error reproduced the returned success stamp on all three native channels.
@@ -603,11 +629,19 @@ xcrun clang++ -std=c++20 -O1 -g -fsanitize=address,undefined -INootedRed \
 ```
 
 `tools/test_swiftrdp_vcn.py` takes the candidate kext, the SwiftRDP XCTest bundle and `--output DIRECTORY`.
-On a boot with the matching kext it runs the original full-HD encode/decode/close test five times in separate
-processes, then the continuous H.264 encoding test. It saves XCTest output, per-case durations, driver and
-hardware counters, and new diagnostic report names. Each full-HD case must advance the bridge and hardware
-counts for both encode and decode. At least one full-HD case must exercise the original `VCN0EncLLQ` queue.
-The counters cover the whole device, so run the suite with other video workloads idle.
+For a copied bundle, also pass `--swift-package PATH` to the SwiftRDP checkout with the matching Release
+executable. On a boot with the candidate loaded, it checks SwiftRDP's serial 1080p/4K AVC420 pipeline for
+both encoder and decoder writeback activity, then runs the full Release suite with SwiftPM's original
+`--parallel --num-workers 1` process isolation. It checks the scheduled XCTest cases against xUnit and the
+1080p test's terminal result against the verbose XCTest log. SwiftPM on this host omitted `XCTSkip` from xUnit.
+The runner then measures five isolated 1080p encode/decode/close runs and one continuous encoding run.
+Ordinary assertion failures remain in the final result while allowing the remaining measurements to run.
+A reset, skipped replay, new diagnostic report, submission failure or timeout stops the run. The runner cleans up its
+test session, including XCTest workers in separate process groups, and reports any worker still blocked.
+When a test stalls, it samples its XCTest worker before cleanup. On an aborted workload it saves available
+AMD and IOAccelerator kernel messages for that workload's time interval and boot UUID in `*.kernel.log`.
+Acceptance requires passing tests, advancing encode and decode counters on each handoff, and activity on
+`VCN0EncLLQ` in at least one handoff. The counters cover the whole device, so other video workloads should be idle.
 
 On `9704C1C3` the first full-HD XCTest stopped the runner on an H.264 color assertion. Five further runs of the
 same test each finished encode, decode and close. All six gray levels passed in each run. Each of the five runs
@@ -621,6 +655,208 @@ VideoToolbox client encoded and decoded 41 full-HD frames with keyframes at indi
 2 for sRGB and produced 1 when asked for BT.709. SwiftRDP's original continuous test requests a 64×64
 hardware session. Its creation returned `kVTInvalidSessionErr` before the VCN submission counts changed.
 These failures and the zero completion-counter deltas leave the original validation criteria unmet.
+
+At 19:38:31.759 Shanghai time on November 25, 2026, the full Release run on `9704C1C3` reset channel 14
+again. The 1080p gray-level XCTest was in `VTCompressionSessionInvalidate`. The pre-reset log showed both
+software and hardware at `0x155`, waiting for `0x156`. The latter was a primary submission from the encoder
+on VMID 8 with a 13-dword IB at `0x400010280`. The VMID-zero fence submissions for software stamp `0x156`
+appeared after recovery began. The decoder had completed `0x79` on VMID 11. The MM hub reported a read fault
+on VMID 11 at `0x40000c000`, client 29. The Renoir table `mmhub_client_ids_renoir` in Linux
+`drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c` identifies read client 29 as `VCNU`.
+
+The native event log placed PID 6175 (`VTDecoderXPCService`) inside the last recorded task release.
+Its return preceded encode submission `0x156` by 2.46 ms. The release record contained no address range.
+Whether it unmapped the fault page remains open. Offline replay of the recorded decode and encode IB descriptors
+produced byte-identical native queue frames. The diagnostic Release build `A09487DF` includes the local
+`dec0a87` Managed/Volatile change. Its kext and dSYM UUIDs match. The ABI and sanitizer checks passed.
+A CPU-only SwiftPM fixture exercised normal completion, ordinary failures, skipped tests, partial reports
+and termination after simulated resets or timeouts. `python3 tools/test_swiftrdp_vcn_runner.py` runs the
+portable fixture checks on a Mac with Xcode.
+
+At 20:52:07 Shanghai time on November 25, 2026, the full SwiftRDP Release run on `A09487DF` stopped during
+the 1080p test. The XCTest stack showed `VTCompressionSessionInvalidate`. The encoder service was in
+`VAUveEncoder::destroySession`, waiting in `IOAccelResourceFinishEvent`. Channel 14 had submitted `0xc3`
+on VMID 7. The first reset captured both its cached and hardware completion values at `0xc2`.
+The MM hub recorded a read fault at `0x40000c000` on VMID 8. An 8 KiB `unmapVA` at the same address and
+VMID returned 3.986 ms before submission `0xc3`. The fault register gives no timestamp for the read.
+On this build, only VMID-zero unmaps record an enclosing task release. The owner of the nonzero-VMID
+unmap and the operation that issued the read remain unresolved.
+
+The runner stopped before the isolated rounds. Two WindowServer watchdog reports belong to the validation
+boot. The subsequent panic reported 120 seconds without a WindowServer check-in. An earlier panic written
+at 20:46:58 reported a watchdog timeout during shutdown of the preceding boot. The hardware video
+validation failed. Both this run and the preceding full run also produced the same three Swift array-bounds
+traps in the GFX pipeline tests before reaching the 1080p case.
+
+The native report for the 20:52 incident places the last decoder hardware timestamp update at
+338.959838 seconds since boot, with `0x2a` submitted and completed. The 8 KiB unmap began about
+0.39 ms later. The encoder submitted `0xc3` another 3.986 ms after the unmap returned. The writeback
+records completion of the decoder submission. The report does not identify which command accessed
+the fault page or when the MM hub latched the fault.
+
+After the 20:54:43 restart, separate 720p H.264 hardware controls on the same driver completed.
+In a single-frame decode, the final command referenced `0x40000c000` as its message buffer.
+The decoder service released those 8 KiB with `0x14` submitted and completed. In a two-frame decode,
+the same address was unmapped with `0x11` submitted and `0x10` completed. That session's final
+command referenced a *different* message buffer, `0x400466000`, which was unmapped with `0x11`
+completed. In both controls the releasing VM context was created by `VTDecoderXPCService` and its
+task's cached PID was still `-1` at unmap. A two-frame encode also completed. Its 13-dword create
+and close commands had different operation codes. Address, outstanding queue depth and IB length
+alone therefore cannot identify an early release in the failed run. The available historical boot
+logs also truncate the boot arguments, including on a confirmed UMA-enabled boot. They leave the
+UMA-off comparison for this failure open.
+
+SwiftRDP's serial native AVC420 test on that boot completed 1080p and 4K in 9.604 s using the same
+Release XCTest binary as the failed run. All 28 low-latency encode submissions and all six decode
+submissions in the trace had a subsequent matching hardware writeback on their own queue. No new
+diagnostic report appeared. There was other video activity on this boot outside the measured interval.
+
+| Session | Final decode writeback to message unmap entry | Message unmap entry to encoder close submission |
+| --- | --- | --- |
+| SwiftRDP 1080p | 0.440 ms | 4.419 ms |
+| SwiftRDP 4K | 0.207 ms | 6.665 ms |
+
+In both passing sessions the final decode command referenced its 8 KiB message at `0x40000c000`.
+In the separate 720p single-frame control, that message had native resource type `0`, flags `0x103`,
+and no `setFlags(2)` call from allocation through release. The encoder and decoder had distinct
+128 KiB session buffers at `0x400040000` in their respective address spaces. Both used pooled UMA
+resource type `0x40`, flags `0x3103`, and received `setFlags(2)`. The 13-dword encode commands had
+opcodes `0x01000001` (create) and `0x01000002` (close) after relocation. These controls distinguish
+the message from the session storage. The failed run still lacks a relocated command identifying
+the reader of the faulting page.
+
+On the November 25 22:23:15 Shanghai boot, kext `180FFCDE` (1.3.4, based on `3190816`)
+passed all seven UMA workloads. The Managed buffer and texture each released 16 MiB of graphics
+footprint while volatile. GPU refill and readback passed after discard. The isolated SwiftRDP
+1080p/4K control completed in 10.703 s with 28 low-latency encode submissions and writeback
+updates, and six decode submissions and updates. The full Release run finished 856 XCTest cases
+with 71 failures and 66 passing Swift Testing tests. The 1080p XCTest finished in 0.641 s with
+the existing SPS transfer-characteristic assertion. Three GFX pipeline XCTest processes trapped.
+
+The first subsequent isolated 1080p round hung in `VTCompressionSessionInvalidate`. At
+22:31:22.497 the kernel reported channel 14 waiting for stamp `0xfa`. The encoder service was
+in `VAUveEncoder::destroySession` waiting in `IOAccelResourceFinishEvent`. Direct hardware
+samples showed `0xf9` in the channel writeback word with `0xfa` submitted. The decoder had
+completed `0x33`. The kernel reported an MM-hub read protection fault at `0x40000c000` on
+VMID 11. The low-latency encoder used VMID 10.
+
+The relocated command trace identifies the final decoder message at `0x40000c000` in the
+VM context belonging to `VTDecoderXPCService` PID 6086. It was a native type `0` resource
+with flags `0x103` and size 8 KiB. Native `unmapVA` began about 0.124 ms after the last
+decoder timestamp update and returned 4.091 ms before the encoder close submission.
+The driver's same-thread, same-task release marker was zero for this unmap. The relocated
+encoder close referenced its own session at `0x400040000`. These observations identify
+the resource and its owner. The fault register still gives no time for the read. At abort,
+the counters showed 51 decoder submissions and 51 writeback updates, 250 low-latency encoder
+submissions and 249 updates, one upstream reset and zero skipped replays. The remaining
+four handoff rounds and the continuous case did not run. The kernel logged
+`GPURestartEnd` for channel 14 at 22:31:33.507. The same WindowServer process was still
+running twelve minutes later. This build fails video acceptance.
+
+The same boot's trace covers both executions of the gray-level XCTest. In both,
+the decoder used VMID 11 and the final command referenced the same 8 KiB message
+address. At 22:29:03 the message unmap returned 8.928 ms before relocation of the
+encoder close command and the test finished. At 22:31:17 that interval was
+4.081 ms and the close stalled. In both runs the decoder VM context entered
+`free` before encoder close relocation, by 2.105 and 2.317 ms respectively.
+These intervals measure CPU-side events. The time of the GPU fault is unknown.
+
+The next boot ran the same `180FFCDE` kext and Release XCTest binary with
+`-NRedUnifiedMemory` removed. It repeated the UMA workloads, the native 1080p/4K
+control, the full suite and then the isolated cases in the original order. The
+1080p/4K control passed in 9.772 s. Both full runs completed 856 XCTest cases and
+66 passing Swift Testing tests. All 70 cases that failed with UMA off also failed
+with it on. The one additional failure with UMA on was
+`MobileDesktopGeometryTests.testColorChangesDoNotReconfigureTheCaptureTarget`.
+
+| Check on `180FFCDE` | UMA off | UMA restored at 22:54:02 Shanghai time |
+| --- | --- | --- |
+| Five isolated 1080p gray-level sessions after the full suite | All five closed in 0.508–0.525 s. Each had three decoder and three low-latency encoder writeback updates. Each failed only the SPS transfer-characteristic assertion (2, expected 13). | Not repeated |
+| Original 64×64 explicit-IDR test | Session creation returned `-12903` with zero submissions or writeback updates on all three queues. | Not repeated |
+| Additional 1080p encode/decode/close control | 41 frames decoded in a 0.996 s test, with keyframes at 0 and 40. | Same 41 frames and keyframes in a 1.335 s test. |
+| VCN reset / skipped replay counters at the end of testing | 0 / 0 | 0 / 0 |
+
+For the additional control, both boots recorded 43 submissions and 43 hardware
+writeback updates on each of the decoder and low-latency encoder queues. The
+restored boot ran only that workload. A repeat at 06:43 Shanghai time on
+November 26 decoded all 41 frames in a 1.184 s test, with the same queue deltas,
+keyframes, zero resets and zero skipped replays. The five completed closes with UMA off and
+the stall with UMA on warrant checking how UMA places video-session storage.
+The 8 KiB decoder message uses native placement in the recorded failure.
+In the earlier 720p control, the two 128 KiB session allocations each belonged
+to the same `IOAccelShared2` object as their respective video context. The
+encoder process also allocated textures through a different `IOAccelShared2`
+object. Process identity alone cannot distinguish those allocations. The cause
+of the stalled close and the effect on throughput remain open.
+
+On November 26 a 41-frame 1080p control on `180FFCDE` identified one 131,072-byte
+allocation per video context. Each used copy flags `0x10002000`, had a backing
+copy, and had no surface layout. Each context's share was connected before the
+allocation. The encoder's 16 other 32 KiB video textures and the decoder's two
+larger video textures used the same copy flags. Both 128 KiB mappings resolved to
+`AMDAccelSysMemory` with flags `0x3103` on all 43 command observations per queue.
+
+On November 26, the `1E1A4D05` boot placed the 128 KiB sessions in native
+`AMDAccelVidMemory` with flags `0x5906` in all 274 encoder and 42 decoder command
+observations. The seven UMA workloads and the 9.799 s 1080p/4K control passed.
+The full suite finished 856 XCTest cases. Its 70 failing cases matched the
+UMA-off run exactly, and all 66 Swift Testing cases passed. The 1080p gray-level
+case finished in 0.514 s inside the full suite with the existing SPS assertion.
+In the native control, median frame preparation plus encoding took 60.98 ms
+at 1080p and 146.65 ms at 4K. The same test on `180FFCDE` with UMA off measured
+60.51 ms and 146.39 ms. Each figure comes from one run per boot.
+
+At 07:29:06 Shanghai time, the first subsequent gray-level session stalled in
+`VTCompressionSessionInvalidate`. Channel 14 had submitted 250 and completed
+249 on encoder VMID 8. The decoder had submitted and completed 51 on VMID 10.
+Its 8 KiB message unmap returned 3.157 ms before the encoder close submission.
+The unmap began about 0.523 ms after the last decoder timestamp update. The
+MM hub reported a read fault at that message address on decoder VMID 10.
+The report gives no timestamp for the hardware read. The runner stopped at this
+reset before completing any of the five handoffs or the final 41-frame control.
+At 07:30:01 the decoder also timed out during recovery. Its report preserved
+the first reset's encoder writeback of 249. Moving only the 128 KiB sessions
+therefore left the shutdown fault reproducible.
+
+#### Native video working textures on November 26, 2026
+
+Release `E635F13C` also sends the video context's linear working textures to the
+native allocator. It checks copy flags `0x10002000`, absence of a surface layout
+and the connected `IOAccelShared2` of an attached `AMDNavi10VideoContext` on the
+owning accelerator. `debug.nred_uma.native_vcn_textures` counts matching placement
+decisions. `tools/test_swiftrdp_vcn.py --verify-video-placement` checks that the
+counter advances during each hardware workload. Allocation and command traces
+independently showed `AMDAccelVidMemory` in all 754 encoder and 39 decoder backing
+observations and all 751 encoder and 239 decoder command observations. These
+included the 32 KiB encoder textures, both 128 KiB sessions and working textures
+as large as 37,326,848 bytes.
+
+On the 07:46:46 Shanghai boot, all seven UMA workloads passed. After the full
+SwiftRDP Release suite, five consecutive 1080p gray-level sessions closed in
+0.551–0.633 s. Each added three submissions and three hardware writeback updates
+on both the decoder and low-latency encoder. Each reported only the existing
+SPS transfer-characteristic assertion (2, expected 13). A separate 1080p control
+decoded all 41 frames, with keyframes at 0 and 40, and added 43 submissions and
+43 writeback updates on each queue. The boot ended validation with 106/106
+decoder and 305/305 low-latency encoder submissions/writebacks, zero resets,
+zero skipped replays and no new GPU diagnostic report. The close that stalled
+on `1E1A4D05` completed in all five rounds on this boot. The trace cannot identify
+the individual texture or the precise hardware access that caused the prior fault.
+
+The full suite ran 856 XCTest cases. Its 71 failing cases matched the earlier
+UMA-enabled `180FFCDE` run exactly. The UMA-off run and `1E1A4D05` each skipped
+the physical-capture color-change case because the test found no physical source,
+and had 70 failing cases. All 66 Swift Testing cases passed on each boot. The
+original 64×64 IDR control still returned `-12903` before submitting any work.
+
+| Median frame preparation plus native AVC420 encoding | `180FFCDE`, UMA off | `1E1A4D05`, UMA on | `E635F13C`, UMA on |
+| --- | ---: | ---: | ---: |
+| 1920×1080 | 60.51 ms | 60.98 ms | 62.95 ms |
+| 3840×2160 | 146.39 ms | 146.65 ms | 146.28 ms |
+
+Each column represents one run of the same Release test binary. These timings
+cover server-side preparation and encoding. Client display latency and sustained
+throughput still need separate measurements.
 
 ### Flag off vs on (2026-11-24)
 

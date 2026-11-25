@@ -100,6 +100,14 @@ namespace X5000Memory
 
     constexpr uint64_t MiB = 1ULL << 20;
 
+    template<typename VideoShare>
+    constexpr BackingKind placeLinearTexture(const uint32_t copyFlags, const bool hasSurfaceLayout,
+                                             const VideoShare& usesVideoShare)
+    {
+        return copyFlags == 0x10002000 && !hasSurfaceLayout && usesVideoShare() ? BackingKind::Native :
+                                                                                 BackingKind::Texture;
+    }
+
     constexpr bool validAlignment(const uint64_t alignment, const uint64_t pageSize)
     {
         return alignment >= pageSize && alignment <= UINT32_MAX && (alignment & (alignment - 1)) == 0;
