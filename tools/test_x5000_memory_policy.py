@@ -93,6 +93,20 @@ void testBudgets() {
     assert(glCommandBudgetKiB(UINT64_MAX, page) == UINT32_MAX);
 }
 
+void testPurgeableWires() {
+    std::array<PurgeableMapping, 2> mappings{{{true, true}, {true, false}}};
+    const auto lookup = [&](int16_t index) { return mappings.at(index); };
+    assert(exclusiveMappingWires(0, 1, 0, lookup));
+    assert(exclusiveMappingWires(2, 3, 1, lookup));
+    assert(!exclusiveMappingWires(2, 4, 1, lookup));
+    assert(!exclusiveMappingWires(2, 3, 2, lookup));
+    assert(!exclusiveMappingWires(2, 3, 0, lookup));
+    assert(!exclusiveMappingWires(0, 1, 1, lookup));
+    assert(!exclusiveMappingWires(-1, 0, 0, lookup));
+    mappings[1].owned = false;
+    assert(!exclusiveMappingWires(2, 3, 1, lookup));
+}
+
 void testPoolBuckets() {
     assert(!largePoolBuckets(0, 0));
     assert(!largePoolBuckets(8 * GiB, 0));
@@ -326,6 +340,7 @@ void testFragmentSegments() {
 int main() {
     testPlacement();
     testResidency();
+    testPurgeableWires();
     testBudgets();
     testPoolBuckets();
     testPressureAndCache();

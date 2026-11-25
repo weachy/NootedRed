@@ -46,6 +46,25 @@ namespace X5000Memory
         return {state, false, false, false};
     }
 
+    struct PurgeableMapping
+    {
+        bool owned;
+        bool committed;
+    };
+
+    template<typename Lookup>
+    constexpr bool exclusiveMappingWires(const int16_t mappings, const int references, int32_t wires,
+                                         const Lookup& lookup)
+    {
+        if (mappings < 0 || references != mappings + 1 || wires < 0 || wires > mappings) { return false; }
+        for (int16_t index = 0; index < mappings; ++index) {
+            const auto mapping = lookup(index);
+            if (!mapping.owned) { return false; }
+            if (mapping.committed) { --wires; }
+        }
+        return wires == 0;
+    }
+
     struct Requirements
     {
         ResourceKind kind;

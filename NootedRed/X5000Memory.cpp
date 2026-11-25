@@ -95,6 +95,7 @@ namespace
     constexpr char memoryPurgeableSymbol[]   = "__ZN16IOAccelSysMemory12setPurgeableEjPj";
     constexpr char prepareCountSymbol[]      = "__ZNK13IOAccelMemory15getPrepareCountEv";
     constexpr char testEventsSymbol[]        = "__ZN13IOAccelMemory12testAllEventEv";
+    constexpr char resourceEventsSymbol[]    = "__ZN16IOAccelResource213testAllEventsEv";
     constexpr char unwireSymbol[]            = "__ZN16IOAccelSysMemory6unwireEv";
     constexpr char setFlagsSymbol[]          = "__ZN13IOAccelMemory8setFlagsEj";
     constexpr char mapReleaseSymbol[]        = "__ZNK16IOAccelMemoryMap7releaseEv";
@@ -120,6 +121,8 @@ namespace
     constexpr size_t resourceFlags             = 0x0C;
     constexpr size_t resourceType              = 0x14;
     constexpr size_t resourceAccelerator       = 0x18;
+    constexpr size_t resourceClientMap         = 0x60;
+    constexpr UInt32 bothCopiesPurgeable       = (1U << 14) | (1U << 15);
     constexpr size_t backingMemory             = 0x80;
     constexpr size_t primaryMemory             = 0x88;
     constexpr size_t resourceSurface           = 0xE0;
@@ -138,6 +141,11 @@ namespace
     constexpr UInt32 copyKindLinear            = 4U << 26;
     constexpr UInt32 copyFormatMask            = 0xFF;
     constexpr size_t memoryFlags               = 0x0C;
+    constexpr size_t memoryWireCount           = 0x14;
+    constexpr size_t memoryDescriptor          = 0xD0;
+    constexpr size_t userLockedMapping         = 0xE8;
+    constexpr size_t kernelLockedMapping       = 0x188;
+    constexpr size_t poolReuseEvent            = 0x108;
     constexpr UInt8  clientBufferMemory        = 0x40;
     constexpr UInt32 wiredMemory               = 1U << 1;
     constexpr UInt32 pooledMemory              = 1U << 13;
@@ -306,6 +314,8 @@ namespace
     constexpr UInt8 prepareCountHead[] = {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x8B, 0x5F, 0x10};
     constexpr UInt8 testEventsHead[]   = {0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0x48,
                                           0x89, 0xFB, 0x66, 0x83, 0x7F, 0x5A, 0};
+    constexpr UInt8 resourceEventLoads[] = {0x49, 0x8B, 0x46, 0x18, 0x48, 0x8B, 0xB8, 0x80, 0x03, 0, 0,
+                                            0x49, 0x8B, 0x76, 0x38};
     constexpr UInt8 unwireClearsWired[] = {0x80, 0x63, 0x0C, 0xFD, 0x48, 0x8B, 0x7B, 0x28};
     constexpr UInt8 wiredLimitBody[]   = {0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x87, 0x48, 0x03, 0, 0, 0x5D, 0xC3, 0x90};
     constexpr UInt8 singleLimitHead[]  = {0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x87, 0x48,
@@ -428,6 +438,7 @@ namespace
     const void*        (*getAllocationParameters)(void*){nullptr};
     UInt32             (*getPrepareCount)(const OSObject*){nullptr};
     bool               (*allEventsComplete)(OSObject*){nullptr};
+    bool               (*resourceEventsComplete)(void*){nullptr};
     void               (*unwireMemory)(OSObject*){nullptr};
     void               (*setMemoryFlags)(OSObject*, UInt32){nullptr};
     void               (*pruneOrphanedMappings)(OSObject*){nullptr};
@@ -517,6 +528,7 @@ namespace
     mach_vm_address_t originalWired{0};
     mach_vm_address_t originalUnwired{0};
     mach_vm_address_t originalSetResourcePurgeable{0};
+    mach_vm_address_t originalSetMemoryPurgeable{0};
     mach_vm_address_t originalFree{0};
     mach_vm_address_t originalOrphan{0};
     mach_vm_address_t originalMapAt{0};
@@ -1393,30 +1405,85 @@ namespace
         __atomic_store_n(&totalResidentBytes, getMember<UInt64>(accelerator, acceleratorWiredBytes), __ATOMIC_RELAXED);
     }
 
-    bool requestsImmediatePurge(const UInt32 state)
+    template<typename Function>
+    Function virtualSlot(const void* const object, const size_t slot)
     {
-        // Volatile only permits discard under memory pressure; the native LRU can
-        // still unwire it later. Unwiring immediately makes transient WindowServer
-        // transitions rewire the same backing at 6-14 ms per surface.
-        return state == kIOMemoryPurgeableEmpty;
+        return reinterpret_cast<Function>((*static_cast<void* const* const*>(object))[slot / sizeof(void*)]);
     }
 
-    void releasePurgeableBacking(OSObject* const memory, const UInt32 state)
+    bool idlePurgeableBacking(OSObject* const memory, const UInt32 state)
     {
-        if (!requestsImmediatePurge(state) || memory == nullptr || memory->metaCast(sysMemoryClass) == nullptr) {
-            return;
-        }
+        if (!memory || !memory->metaCast(sysMemoryClass)) { return false; }
         constexpr UInt32 requiredOptions = kIOMemoryPageable | kIOMemoryPurgeable;
         const auto       flags           = getMember<UInt32>(memory, memoryFlags);
-        if ((flags & (wiredMemory | clientBufferMemory)) != wiredMemory
-            || ((flags >> purgeableShift) & purgeableMask) != state
-            || (getMember<UInt32>(memory, memoryOptionsOffset) & requiredOptions) != requiredOptions
-            || getPrepareCount(memory) != 0 || !allEventsComplete(memory))
-        {
-            return;
+        return !(flags & clientBufferMemory) && ((flags >> purgeableShift) & purgeableMask) == state
+               && (getMember<UInt32>(memory, memoryOptionsOffset) & requiredOptions) == requiredOptions
+               && getPrepareCount(memory) == 0 && allEventsComplete(memory);
+    }
+
+    bool exclusiveIdleBacking(OSObject* const memory, void* const task)
+    {
+        if (!idlePurgeableBacking(memory, kIOMemoryPurgeableVolatile)
+            || getMember<void*>(memory, userLockedMapping) || getMember<void*>(memory, kernelLockedMapping)) {
+            return false;
         }
+        const auto count = getMember<SInt16>(memory, memoryMappingCount);
+        auto* const maps = getMember<void**>(memory, memoryMappings);
+        const auto mappingAt = [&](const SInt16 index) -> X5000Memory::PurgeableMapping {
+            auto* const map = maps ? maps[index] : nullptr;
+            return {map && getMember<void*>(map, mappingMemory) == memory && getMember<void*>(map, mappingTask) == task,
+                    map && (getMember<UInt32>(map, mappingFlags) & 4)};
+        };
+        if (!X5000Memory::exclusiveMappingWires(count, memory->getRetainCount(), getMember<SInt32>(memory, memoryWireCount),
+                                               mappingAt)) { return false; }
+        if (!(getMember<UInt32>(memory, memoryFlags) & pooledMemory)) { return true; }
+        auto* const machine = getEventMachine ? getEventMachine(memory) : nullptr;
+        return machine && virtualSlot<bool (*)(void*, void*)>(machine, eventTestSlot)(
+                              machine, reinterpret_cast<UInt8*>(memory) + poolReuseEvent);
+    }
+
+    bool hasManagedCopies(void* const resource, OSObject* const backing, OSObject* const primary)
+    {
+        if (!backing || backing == primary || !backing->metaCast(sysMemoryClass)
+            || getMember<void*>(primary, memoryResource) != resource
+            || getMember<void*>(backing, memoryAccelerator) != getMember<void*>(resource, resourceAccelerator)
+            || (getMember<UInt32>(backing, memoryOptionsOffset) & kIOMemorySharingTypeMask) != kIOMemoryKernelUserShared)
+        {
+            return false;
+        }
+        auto* const shared = getMember<void*>(primary, memoryShared);
+        auto* const map = OSDynamicCast(IOMemoryMap, getMember<OSObject*>(resource, resourceClientMap));
+        return shared && shared == getMember<void*>(backing, memoryShared) && map
+               && map->getAddressTask() == getMember<task_t>(shared, sharedPoolTask)
+               && map->getMemoryDescriptor() == getMember<IOMemoryDescriptor*>(backing, memoryDescriptor);
+    }
+
+    void releasePurgeableBacking(OSObject* const memory)
+    {
+        if (!(getMember<UInt32>(memory, memoryFlags) & wiredMemory)) { return; }
         unwireMemory(memory);
         increment(purgeUnwires);
+    }
+
+    struct PurgeObservation
+    {
+        OSObject* backing;
+        OSObject* primary;
+        bool      lost;
+    };
+
+    thread_t purgeObserver{};
+    PurgeObservation* purgeObservation{};
+
+    IOReturn setMemoryPurgeable(OSObject* const memory, const UInt32 state, UInt32* const previous)
+    {
+        const auto result = FunctionCast(setMemoryPurgeable, originalSetMemoryPurgeable)(memory, state, previous);
+        if (result == kIOReturnSuccess && previous && *previous == kIOMemoryPurgeableEmpty
+            && __atomic_load_n(&purgeObserver, __ATOMIC_ACQUIRE) == current_thread()
+            && (memory == purgeObservation->backing || memory == purgeObservation->primary)) {
+            purgeObservation->lost = true;
+        }
+        return result;
     }
 
     [[gnu::noinline]]
@@ -1424,21 +1491,45 @@ namespace
                               UInt32* const previous)
     {
         const auto caller = reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0));
-        FunctionCast(setResourcePurgeable, originalSetResourcePurgeable)(resource, backingState, primaryState,
-                                                                         previous);
-        if (caller != purgeRequestReturn || !ready() || !requestsImmediatePurge(primaryState)) { return; }
-
-        const auto kind = static_cast<ResourceKind>(getMember<UInt8>(resource, resourceType));
-        if ((kind != ResourceKind::Texture && kind != ResourceKind::DataBuffer)
-            || (kind == ResourceKind::Texture && getMember<void*>(resource, resourceSurface) != nullptr))
-        {
-            return;
+        const auto original = FunctionCast(setResourcePurgeable, originalSetResourcePurgeable);
+        if (caller != purgeRequestReturn || !ready() || backingState != primaryState) {
+            return original(resource, backingState, primaryState, previous);
         }
+        const bool wasPurgeable = (getMember<UInt32>(resource, resourceFlags) & bothCopiesPurgeable) == bothCopiesPurgeable;
+        if (!wasPurgeable && primaryState != kIOMemoryPurgeableVolatile && primaryState != kIOMemoryPurgeableEmpty) {
+            return original(resource, backingState, primaryState, previous);
+        }
+        const auto kind = static_cast<ResourceKind>(getMember<UInt8>(resource, resourceType));
         auto* const primary = getMember<OSObject*>(resource, primaryMemory);
-        if (!isManaged(primary)) { return; }
+        if ((kind != ResourceKind::Texture && kind != ResourceKind::DataBuffer)
+            || (kind == ResourceKind::Texture && getMember<void*>(resource, resourceSurface)) || !isManaged(primary)) {
+            return original(resource, backingState, primaryState, previous);
+        }
         auto* const backing = getMember<OSObject*>(resource, backingMemory);
-        releasePurgeableBacking(primary, primaryState);
-        if (backing != primary) { releasePurgeableBacking(backing, backingState); }
+        const bool paired = hasManagedCopies(resource, backing, primary);
+        PurgeObservation observation{backing, primary, false};
+        const bool observe = paired && previous && wasPurgeable;
+        if (observe) {
+            purgeObservation = &observation;
+            __atomic_store_n(&purgeObserver, current_thread(), __ATOMIC_RELEASE);
+        }
+        original(resource, backingState, primaryState, previous);
+        if (observe) {
+            __atomic_store_n(&purgeObserver, nullptr, __ATOMIC_RELEASE);
+            purgeObservation = nullptr;
+            if (observation.lost) { *previous = kIOMemoryPurgeableEmpty; }
+        }
+        if (primaryState == kIOMemoryPurgeableEmpty) {
+            if (idlePurgeableBacking(primary, primaryState)) { releasePurgeableBacking(primary); }
+            if (backing != primary && idlePurgeableBacking(backing, backingState)) { releasePurgeableBacking(backing); }
+        } else if (paired && primaryState == kIOMemoryPurgeableVolatile) {
+            auto* const task = getGPUTask(resource);
+            if (hasPerTaskPageTable(task) && resourceEventsComplete(resource)
+                && exclusiveIdleBacking(primary, task) && exclusiveIdleBacking(backing, task)) {
+                releasePurgeableBacking(primary);
+                releasePurgeableBacking(backing);
+            }
+        }
     }
 
     void freeBacking(void* const memory)
@@ -1466,12 +1557,6 @@ namespace
             }
         }
         FunctionCast(freeBacking, originalFree)(memory);
-    }
-
-    template<typename Function>
-    Function virtualSlot(const void* const object, const size_t slot)
-    {
-        return reinterpret_cast<Function>((*static_cast<void* const* const*>(object))[slot / sizeof(void*)]);
     }
 
     // Caller holds the accelerator lock.
@@ -2835,6 +2920,7 @@ namespace
         const auto memoryPurgeable   = image.resolve(memoryPurgeableSymbol);
         const auto prepareCount      = image.resolve(prepareCountSymbol);
         const auto testEvents        = image.resolve(testEventsSymbol);
+        const auto resourceEvents    = image.resolve(resourceEventsSymbol);
         const auto unwire            = image.resolve(unwireSymbol);
         const auto mapAt             = image.resolve(mapAtSymbol);
         const auto reserveVA         = image.resolve(reserveVASymbol);
@@ -2856,7 +2942,8 @@ namespace
             || !image.matches(resourcePurgeable + 0x92, purgeablePrimaryLoad)
             || !image.matches(memoryPurgeable + 0x1C, purgeableFlagsLoad)
             || !image.matches(factory + 0x33B, memoryOptionsStore) || !image.matches(prepareCount, prepareCountHead)
-            || !image.matches(testEvents, testEventsHead) || !image.matches(unwire + 0x189, unwireClearsWired)
+            || !image.matches(testEvents, testEventsHead) || !image.matches(resourceEvents + 0x12, resourceEventLoads)
+            || !image.matches(unwire + 0x189, unwireClearsWired)
             || !image.matches(clientBuffer + 0x19D, clientBufferFlagStore)
             || !image.matches(mapAt + 0x44, mappingLookup) || !image.matches(reserveVA + 0x10, fixedStores)
             || !image.calls(factory + poolFactoryCall, pool)
@@ -2877,6 +2964,7 @@ namespace
         getGPUTask              = FunctionCast(getGPUTask, task);
         getPrepareCount         = FunctionCast(getPrepareCount, prepareCount);
         allEventsComplete       = FunctionCast(allEventsComplete, testEvents);
+        resourceEventsComplete  = FunctionCast(resourceEventsComplete, resourceEvents);
         unwireMemory            = FunctionCast(unwireMemory, unwire);
         setMemoryFlags          = FunctionCast(setMemoryFlags, setFlags);
         pruneOrphanedMappings   = FunctionCast(pruneOrphanedMappings, prune);
@@ -2910,6 +2998,7 @@ namespace
             {wiredSymbol, didWire, originalWired},
             {unwiredSymbol, didUnwire, originalUnwired},
             {resourcePurgeableSymbol, setResourcePurgeable, originalSetResourcePurgeable},
+            {memoryPurgeableSymbol, setMemoryPurgeable, originalSetMemoryPurgeable},
             {freeSymbol, freeBacking, originalFree},
             {orphanSymbol, orphanBacking, originalOrphan},
             {mapAtSymbol, mapAtAddress, originalMapAt},

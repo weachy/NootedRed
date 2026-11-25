@@ -9,6 +9,8 @@
 #include <limits.h>
 #include <mach/mach.h>
 #include <mach/mach_param.h>
+#include <mach/mach_vm.h>
+#include <mach/vm_purgable.h>
 #include <spawn.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
@@ -198,12 +200,52 @@ static void readResources(id<MTLCommandQueue> queue, id<MTLBuffer> buffer, id<MT
     id<MTLCommandBuffer> command = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
     if (blit == nil) { errx(1, "Could not create a readback encoder"); }
-    [blit copyFromBuffer:buffer sourceOffset:0 toBuffer:readback destinationOffset:0 size:payload];
-    encodeTextureCopy(blit, texture, readback, payload);
+    if (buffer) { [blit copyFromBuffer:buffer sourceOffset:0 toBuffer:readback destinationOffset:0 size:payload]; }
+    if (texture) { encodeTextureCopy(blit, texture, readback, payload); }
     [blit endEncoding];
     finish(command);
-    verify(readback, 0, payload, sample, "buffer", index);
-    verify(readback, payload, payload, sample, "render target", index);
+    if (buffer) { verify(readback, 0, payload, sample, "buffer", index); }
+    if (texture) { verify(readback, payload, payload, sample, "render target", index); }
+}
+
+static void verifyManagedContents(id<MTLBuffer> buffer, id<MTLTexture> texture, id<MTLBuffer> readback,
+                                  const uint8_t sample, const NSUInteger index)
+{
+    if (buffer) { verifyBytes(buffer.contents, payload, sample, "managed CPU buffer", index); }
+    if (texture) {
+        [texture getBytes:readback.contents bytesPerRow:edge * 4 fromRegion:MTLRegionMake2D(0, 0, edge, edge) mipmapLevel:0];
+        verify(readback, 0, payload, sample, "managed CPU texture", index);
+    }
+}
+
+static void verifyManagedReadback(id<MTLCommandQueue> queue, id<MTLBuffer> buffer, id<MTLTexture> texture,
+                                  id<MTLBuffer> readback, const uint8_t sample, const NSUInteger index)
+{
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+    if (blit == nil) { errx(1, "Could not create a managed-resource synchronization encoder"); }
+    [blit synchronizeResource:buffer];
+    [blit synchronizeResource:texture];
+    [blit endEncoding];
+    finish(command);
+    verifyManagedContents(buffer, texture, readback, sample, index);
+}
+
+static int vmPurgeableState(const mach_vm_address_t address)
+{
+    int state = 0;
+    const kern_return_t result = mach_vm_purgable_control(mach_task_self(), address, VM_PURGABLE_GET_STATE, &state);
+    if (result != KERN_SUCCESS) { errx(1, "Could not query the managed buffer's VM object: %s", mach_error_string(result)); }
+    return state & VM_PURGABLE_STATE_MASK;
+}
+
+static int64_t graphicsFootprint(void)
+{
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS
+        || count < TASK_VM_INFO_REV3_COUNT) { errx(1, "Could not read the task's graphics footprint"); }
+    return info.ledger_tag_graphics_footprint;
 }
 
 static void verifyPurgeableResources(id<MTLCommandQueue> queue, id<MTLBuffer> buffer, id<MTLTexture> texture,
@@ -211,29 +253,51 @@ static void verifyPurgeableResources(id<MTLCommandQueue> queue, id<MTLBuffer> bu
                                      const BOOL baseline)
 {
     const uint64_t address = buffer.gpuAddress;
-    const uint64_t purgeUnwires = baseline ? 0 : counter("debug.nred_uma.purge_unwires");
+    if (managed) { verifyManagedReadback(queue, buffer, texture, readback, sample, 0); }
+    const mach_vm_address_t cpuAddress = managed && !baseline ? (mach_vm_address_t)buffer.contents : 0;
     NSArray<id<MTLResource>> *resources = @[buffer, texture];
     BOOL statesValid = YES;
-    BOOL preserved = YES;
+    id<MTLBuffer> retainedBuffer = buffer;
+    id<MTLTexture> retainedTexture = texture;
     for (NSUInteger index = 0; index < resources.count; ++index) {
         id<MTLResource> resource = resources[index];
+        const int64_t initialFootprint = managed ? graphicsFootprint() : 0;
         const MTLPurgeableState before = [resource setPurgeableState:MTLPurgeableStateVolatile];
         const MTLPurgeableState current = [resource setPurgeableState:MTLPurgeableStateKeepCurrent];
+        if (cpuAddress && index == 0) {
+            const int state = vmPurgeableState(cpuAddress);
+            printf("Managed CPU buffer VM state while volatile: %d\n", state);
+            statesValid &= state == VM_PURGABLE_VOLATILE || state == VM_PURGABLE_EMPTY;
+        }
+        if (managed) {
+            printf("%s graphics footprint delta while volatile: %lld bytes\n", index == 0 ? "Buffer" : "Texture",
+                   (long long)(graphicsFootprint() - initialFootprint));
+        }
         const MTLPurgeableState restored = [resource setPurgeableState:MTLPurgeableStateNonVolatile];
+        statesValid &= [resource setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile;
+        if (cpuAddress && index == 0) { statesValid &= vmPurgeableState(cpuAddress) == VM_PURGABLE_NONVOLATILE; }
         printf("%s volatility: previous=%lu current=%lu restored=%lu\n", index == 0 ? "Buffer" : "Texture",
                (unsigned long)before, (unsigned long)current, (unsigned long)restored);
         const BOOL volatileState = (current == MTLPurgeableStateVolatile || current == MTLPurgeableStateEmpty)
-                                && (restored == MTLPurgeableStateVolatile || restored == MTLPurgeableStateEmpty);
+                                && (restored == current || restored == MTLPurgeableStateEmpty);
         const BOOL retainedRenderTarget = !managed && index == 1 && current == MTLPurgeableStateNonVolatile
                                        && restored == MTLPurgeableStateNonVolatile;
         statesValid &= before == MTLPurgeableStateNonVolatile && (volatileState || retainedRenderTarget);
-        preserved &= restored != MTLPurgeableStateEmpty;
+        if (restored == MTLPurgeableStateEmpty) {
+            if (index == 0) { retainedBuffer = nil; } else { retainedTexture = nil; }
+        }
     }
-    if (preserved) {
-        readResources(queue, buffer, texture, readback, sample, 0);
+    if (retainedBuffer || retainedTexture) {
+        if (managed) { verifyManagedContents(retainedBuffer, retainedTexture, readback, sample, 0); }
+        readResources(queue, retainedBuffer, retainedTexture, readback, sample, 0);
     }
-    if (buffer.gpuAddress != address) { errx(1, "Volatile buffer changed GPU virtual address"); }
+    if (!retainedBuffer || !retainedTexture) {
+        writeResources(queue, buffer, texture, sample);
+        if (managed) { verifyManagedReadback(queue, buffer, texture, readback, sample, 0); }
+    }
+    if (!address || buffer.gpuAddress != address) { errx(1, "Volatile buffer lost its GPU virtual address"); }
 
+    const uint64_t purgeUnwires = baseline ? 0 : counter("debug.nred_uma.purge_unwires");
     for (NSUInteger index = 0; index < resources.count; ++index) {
         id<MTLResource> resource = resources[index];
         const MTLPurgeableState before = [resource setPurgeableState:MTLPurgeableStateEmpty];
@@ -247,6 +311,7 @@ static void verifyPurgeableResources(id<MTLCommandQueue> queue, id<MTLBuffer> bu
     const uint8_t replacement = sample ^ 0xA7;
     writeResources(queue, buffer, texture, replacement);
     readResources(queue, buffer, texture, readback, replacement, 0);
+    if (managed) { verifyManagedReadback(queue, buffer, texture, readback, replacement, 0); }
     if (buffer.gpuAddress != address) { errx(1, "Purgeable buffer changed GPU virtual address"); }
     puts("GPU refill and readback passed at the original GPU virtual address");
     if (!statesValid) { errx(1, "Metal did not report the requested purgeable states"); }
@@ -263,22 +328,6 @@ static void uploadManagedResources(id<MTLBuffer> buffer, id<MTLTexture> texture,
     memset(upload.contents, sample, payload);
     [texture replaceRegion:MTLRegionMake2D(0, 0, edge, edge) mipmapLevel:0 withBytes:upload.contents
                bytesPerRow:edge * 4];
-}
-
-static void verifyManagedReadback(id<MTLCommandQueue> queue, id<MTLBuffer> buffer, id<MTLTexture> texture,
-                                   id<MTLBuffer> readback, const uint8_t sample, const NSUInteger index)
-{
-    id<MTLCommandBuffer> command = [queue commandBuffer];
-    id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
-    if (blit == nil) { errx(1, "Could not create a managed-resource synchronization encoder"); }
-    [blit synchronizeResource:buffer];
-    [blit synchronizeResource:texture];
-    [blit endEncoding];
-    finish(command);
-
-    verifyBytes(buffer.contents, payload, sample, "managed CPU buffer", index);
-    [texture getBytes:readback.contents bytesPerRow:edge * 4 fromRegion:MTLRegionMake2D(0, 0, edge, edge) mipmapLevel:0];
-    verify(readback, 0, payload, sample, "managed CPU texture", index);
 }
 
 static void verifySingleDispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,

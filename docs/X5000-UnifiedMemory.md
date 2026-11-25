@@ -50,9 +50,17 @@ For purgeable requests the native resource methods first handle the retained sta
 - `Empty` asks for an immediate discard. When the backing has no prepare reference and all GPU events have
   completed, unified memory calls the native `unwire`, which removes the PTEs and releases the pages
   (`purge_unwires`).
-- `Volatile` only allows a discard under memory pressure. The backing stays wired and the native LRU reclaims it
-  when the residency budget requires it. WindowServer marks surfaces `Volatile` during window and full-screen
-  transitions and often uses them again right away, so unwiring them at once would cause a rewire.
+- For a Metal `Managed` buffer or texture, an explicit `Volatile` request can release the wires on both the
+  CPU copy and the GPU primary. The CPU map must belong to the allocating task and map the backing descriptor.
+  Both copies must be idle, including any inherited pool event. Each copy must have just the resource and its own
+  task mappings as references, with a wire count matching its committed mappings. The checks run for both copies
+  before the first `unwire`. The native method then applies the recorded state to the descriptors. The VM can
+  reclaim their pages and the GPU keeps its address reservation.
+- The native resource method maintains the validity of each copy. During a query or a transition out of a
+  purgeable state, the hook also observes the two native memory results on the calling thread. If either copy
+  reports `Empty`, Metal reports `Empty` for the pair so the application can recreate its contents.
+- Other `Volatile` requests follow native LRU reclamation. This includes WindowServer surfaces, which are often
+  used again immediately during window and full-screen transitions.
 
 In `25G332` the hook sits between `lock_busy` and `unlock_busy` in `set_resource_purgeable`. The native non-blocking
 LRU path also checks the prepare count and the GPU events before `unwire`.
@@ -343,6 +351,9 @@ sysctl debug.nred_uma
 - `--purgeable` checks Metal purgeable states and their recovery, requires a rewrite and readback at the same buffer
   GPU VA after `Empty`, and requires `purge_unwires` to grow. AMD Metal turns a `Volatile` request on a private
   render target into `NonVolatile`; the probe then checks that the contents were kept.
+- `--managed --purgeable` synchronizes both resources before the request. On a UMA boot the probe also queries the
+  VM object at the buffer's CPU address while volatile and after restoration. It records the calling task's
+  graphics footprint during each request and checks each retained resource on both the CPU and GPU.
 - `--seed` sets the first check byte, so parallel processes can use different data to check task isolation at the
   same GPU VA.
 - `--hotplug 300` keeps the resources while the main external display goes offline and comes back at its original
@@ -534,7 +545,19 @@ the Renoir GPU and no attached display. Its results are recorded in `build/uma-p
 Two-queue churn verified 48 readbacks at each size. Private purgeable resources, cross-process IOSurface, Metal
 layouts, Managed readback and OpenGL smoke passed. The combined Managed and purgeable check again observed
 `NonVolatile` after a `Volatile` request on both resources. Discard, rewrite and readback passed at the original
-buffer VA. A native UMA-off run and measurements on the combined candidate are still needed.
+buffer VA.
+
+The combined candidate `9704C1C3` booted at 19:08:24 Shanghai time with UMA active. Six of the seven UMA
+checks passed. The Managed buffer and texture again reported `NonVolatile` after a `Volatile` request.
+Both reported `Empty` after discard, and the refill and readback passed at the original buffer VA. Three repeats
+with the updated probe on `9704C1C3` found that the Managed buffer's CPU VM object stayed nonvolatile and
+the task's graphics footprint changed by zero bytes for each 16 MiB resource during `Volatile`.
+A run with UMA disabled on this machine would establish how the native driver handles the `Volatile` request.
+
+With the same working-set probe binary, OS build, boot arguments and display configuration as `CB2FC334`,
+the 256 MiB and 1 GiB reads measured 30.55 and 33.01 GiB/s, respectively, up from 29.69 and 32.61 GiB/s in
+the reference run. Median dependent-load latency at 4 KiB and 64 KiB strides measured 334.2 and 169.0 ns,
+against 334.5 and 169.4 ns. Each build contributed one benchmark run.
 
 ### SwiftRDP and VCN completion
 
@@ -584,9 +607,20 @@ On a boot with the matching kext it runs the original full-HD encode/decode/clos
 processes, then the continuous H.264 encoding test. It saves XCTest output, per-case durations, driver and
 hardware counters, and new diagnostic report names. Each full-HD case must advance the bridge and hardware
 counts for both encode and decode. At least one full-HD case must exercise the original `VCN0EncLLQ` queue.
-The counters cover the whole device, so run the suite with other video workloads idle. The recorded boot uses
-`CB2FC334`. End-to-end recovery, steady-state frame rate and session close latency on the combined candidate
-await a hardware run.
+The counters cover the whole device, so run the suite with other video workloads idle.
+
+On `9704C1C3` the first full-HD XCTest stopped the runner on an H.264 color assertion. Five further runs of the
+same test each finished encode, decode and close. All six gray levels passed in each run. Each of the five runs
+added three `VCN0EncLLQ` and three `VCN0Dec` bridge records with zero submission failures. The IORegistry
+`Commands Completed` counters showed zero delta. SwiftRDP's separate serial AVC420 pipeline test passed at
+1920×1080 and 3840×2160. No GPU restart, panic or watchdog timeout report appeared during these runs.
+
+The hardware encoder rejected the sRGB transfer-function property with `kVTParameterErr`. SwiftRDP's SPS
+contained transfer characteristic 2 (unspecified), while the full-HD XCTest expects 13 (sRGB). An independent
+VideoToolbox client encoded and decoded 41 full-HD frames with keyframes at indices 0 and 40. It also produced
+2 for sRGB and produced 1 when asked for BT.709. SwiftRDP's original continuous test requests a 64×64
+hardware session. Its creation returned `kVTInvalidSessionErr` before the VCN submission counts changed.
+These failures and the zero completion-counter deltas leave the original validation criteria unmet.
 
 ### Flag off vs on (2026-11-24)
 
