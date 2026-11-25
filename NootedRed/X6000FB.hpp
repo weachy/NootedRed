@@ -61,6 +61,14 @@ class X6000FB
     IOLock*                fbPowerLock{nullptr};
     FbPowerStateEntry      fbPowerStates[kMaxFbPowerStates]{};
     bool                   oledEnabled{false};
+    bool                   vrrEnabled{false};
+    mach_vm_address_t      orgFbGetAttribute{0};
+    mach_vm_address_t      orgPresenterHandleTransactions{0};
+    mach_vm_address_t      orgPresenterGetOutstandingTransactions{0};
+    mach_vm_address_t      orgControllerIsPoweredUp{0};
+    mach_vm_address_t      orgGetDrrStatus{0};
+    mach_vm_address_t      orgGetVUpdateVBlankInterval{0};
+    mach_vm_address_t      orgSetupBootWatermarks{0};
     mach_vm_address_t      orgCreateObjectInfo{0};
     mach_vm_address_t      orgCreateVramInfo{0};
     mach_vm_address_t      orgGetVendorInfo{0};
@@ -91,6 +99,13 @@ private:
     static void                             wrapDpReceiverPowerCtrl(void* link, bool powerOn);
     static UInt32                           wrapControllerPowerUp(void* self);
     static UInt32                           wrapDoPowerStateChange(void* self, UInt32 state);
+    static IOReturn                         wrapFbGetAttribute(void* self, UInt32 attribute, uintptr_t* value);
+    static IOReturn                         wrapPresenterHandleTransactions(void* self, void* transaction);
+    static UInt64                           wrapPresenterGetOutstandingTransactions(void* self);
+    static bool                             wrapControllerIsPoweredUp(void* self);
+    static IOReturn                         wrapGetDrrStatus(void* self, SInt32 otgInst, UInt32* outDrrStatus);
+    static IOReturn                         wrapGetVUpdateVBlankInterval(void* self, SInt32 otgInst, UInt32* outInterval);
+    static IOReturn                         wrapSetupBootWatermarks(void* self);
     static IOReturn                         wrapReportCapabilitiesLinkInfo(void* self);
     static void*                            wrapCreateObjectInfo(void* helper, UInt32 tableOffset);
     static AmdAtomVramInfo*                 wrapCreateVramInfo(AmdAtomFwHelper* biosHelper, UInt32 tableOffset);

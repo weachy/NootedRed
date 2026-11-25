@@ -72,6 +72,18 @@ class VCNBridge
     mach_vm_address_t orgInitVCNContext{0};
     mach_vm_address_t orgSafeMetaCast{0};
     mach_vm_address_t orgFetchResource{0};
+    mach_vm_address_t orgVideoContextStart{0};
+    mach_vm_address_t orgVideoContextStop{0};
+    mach_vm_address_t orgVideoContextDestroy{0};
+    mach_vm_address_t orgEngineReset{0};
+    mach_vm_address_t orgWaitForHwStamp{0};
+    mach_vm_address_t orgAccelWaitForStamp{0};
+    mach_vm_address_t orgVcnSubmitCommandBuffer{0};
+    mach_vm_address_t vcnReleaseHardware{0};
+    mach_vm_address_t vcnIsIdle{0};
+    mach_vm_address_t vcnGetHWChannel{0};
+    mach_vm_address_t vcnChannelIsEmpty{0};
+    mach_vm_address_t vcnChannelReset{0};
     volatile UInt32   resourceFailures{0};
 
     mach_vm_address_t newVideo6000{0};
@@ -85,6 +97,21 @@ class VCNBridge
     OSMetaClass* sharedMC{nullptr};
     OSMetaClass* clientMC{nullptr};
     void*        hardwareHandle{nullptr};
+    void*        vcnEngine{nullptr};
+
+    static constexpr size_t kMaxTrackedVideoContexts = 16;
+    void*                   activeContextSlots[kMaxTrackedVideoContexts]{};
+    int                     activeContextPids[kMaxTrackedVideoContexts]{};
+    char                    activeContextNames[kMaxTrackedVideoContexts][16]{};
+    volatile SInt32         activeVideoContexts{0};
+    SInt32                  maxVideoContexts{6};
+    volatile UInt32         quotaFallbacks{0};
+    volatile UInt32         vcnResetCount{0};
+    volatile UInt32         consecutiveResets{0};
+    volatile UInt64         cooldownUntilNs{0};
+    volatile UInt32         vcnSkippedReplayRetired{0};
+    volatile UInt32         vcnWaitTimeoutPending{0};
+
     static constexpr size_t kClassPairCount = 6;
     ClassPair              classPairs[kClassPairCount];
 
@@ -130,5 +157,18 @@ private:
     static bool          initHardware(void* self, UInt32 channel);
     static bool          fetchResource(void* self, void* parameters, void* resourceInfo);
     static bool          initVCNContext(void* self, void* accelerator, void* context, void* createInfo);
+    static bool          videoContextStart(void* self);
+    static void          videoContextStop(void* self);
+    static void          videoContextDestroy(void* self);
+    static bool          engineReset(void* self, UInt32 ringType, UInt32* resetMaskOut);
+    static UInt64        vcnSubmitCommandBuffer(void* self, void* submitInfo);
+    static bool          channelWaitForHwStamp(void* self, UInt32 stamp);
+    static IOReturn      accelWaitForStamp(void* self, int stampIdx, UInt32 stamp, UInt32* statusOut);
     static OSMetaClassBase* safeMetaCast(const OSMetaClassBase* object, const OSMetaClass* target);
+
+    void drainVCN(const char* reason);
+    void triggerSelfHealingCooldown(const char* reason);
+    bool trackContextStart(void* context);
+    bool trackContextStop(void* context);
+    void clearTrackedContexts();
 };

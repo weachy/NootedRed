@@ -27,6 +27,7 @@
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLib.h>
 #include <IOKit/pci/IOPCIDevice.h>
+#include <sys/proc.h>
 #include <Kexts.hpp>
 #include <NRed.hpp>
 #include <UserPatches.hpp>
@@ -42,6 +43,7 @@
 #include <VideoCommandPatch.hpp>
 #include <X5000.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
+#include <kern/clock.h>
 #include <libkern/OSAtomic.h>
 #include <libkern/OSKextLib.h>
 #include <libkern/c++/OSMetaClass.h>
@@ -55,7 +57,8 @@ static VCNBridge moduleInstance;
 namespace
 {
 
-    const char* const kBootArgNoVDA = "-NRedNoVDA";
+    const char* const kBootArgNoVDA  = "-NRedNoVDA";
+    constexpr UInt32  kVCNDecChannel = 8;
 
 
     // VCN bridge supports macOS 13 through 26 (Darwin 22 - 25).
@@ -267,7 +270,17 @@ void VCNBridge::init()
     // X5000 accelerator start, i.e. after both drivers' load hooks are in place.
     lilu.onKextLoadForce(&kextRadeonX6000);
 
-    DBGLOG("VCN", "VCN bridge requested; waiting for device and driver load");
+    SInt32 maxCtx = 6;
+    if (PE_parse_boot_argn("vcnmaxctx", &maxCtx, sizeof(maxCtx))) {
+        if (maxCtx < 1) { maxCtx = 1; }
+        else if (maxCtx > static_cast<SInt32>(kMaxTrackedVideoContexts)) {
+            maxCtx = static_cast<SInt32>(kMaxTrackedVideoContexts);
+        }
+    }
+    this->maxVideoContexts = maxCtx;
+
+    DBGLOG("VCN", "VCN bridge requested (maxVideoContexts=%d); waiting for device and driver load",
+           this->maxVideoContexts);
 }
 
 bool VCNBridge::loadReady() const
@@ -338,11 +351,18 @@ void* VCNBridge::allocateEngine(void* const hardware)
 
     this->hardwareHandle  = hardware;
     auto* const engine    = this->engineMC->alloc();
+    this->vcnEngine       = engine;
     this->engineAllocated = engine != nullptr;
+    this->clearTrackedContexts();
 
     NRed::singleton().setProp32("NRedVCNEngineAllocated", static_cast<UInt32>(this->engineAllocated));
     NRed::singleton().setProp32("NRedVDAMediaEnabled", static_cast<UInt32>(this->engineAllocated));
     NRed::singleton().setProp32("NRedVCNUserPatchesAllowed", this->userPatchesAllowed() ? 1 : 0);
+    NRed::singleton().setProp32("NRedVCNMaxContexts", static_cast<UInt32>(this->maxVideoContexts));
+    NRed::singleton().setProp32("NRedVCNQuotaFallbacks", 0);
+    NRed::singleton().setProp32("NRedVCNResetCount", 0);
+    NRed::singleton().setProp32("NRedVCNSkipReplayRetired", 0);
+    NRed::singleton().setPropStr("NRedVCNActiveOwners", "none");
     if (!this->engineAllocated) {
         this->failMedia(7);
         SYSLOG("VCN", "Failed to allocate AMDVCN2HWEngine");
@@ -406,6 +426,8 @@ bool VCNBridge::acceleratorStart(void* const self, IOService* const provider)
     if (!result) {
         bridge.loadCompleted   = false;
         bridge.engineAllocated = false;
+        bridge.vcnEngine       = nullptr;
+        bridge.clearTrackedContexts();
         NRed::singleton().setProp32("NRedVCNEngineAllocated", 0);
         NRed::singleton().setProp32("NRedVDAMediaEnabled", 0);
         if (bridge.hardwareHandle != nullptr) {
@@ -429,7 +451,9 @@ void VCNBridge::acceleratorStop(void* const self, IOService* const provider)
     // object.  The prepared X5000/X6000 symbols stay valid for a possible restart, and a new start will
     // allocate a fresh engine.
     bridge.engineAllocated = false;
+    bridge.vcnEngine       = nullptr;
     bridge.hardwareHandle  = nullptr;
+    bridge.clearTrackedContexts();
     bridge.setAccelerator(nullptr);
 
     NRed::singleton().setProp32("NRedVCNEngineAllocated", 0);
@@ -510,7 +534,7 @@ void VCNBridge::signalWork(void* const hardware)
 
 bool VCNBridge::initHardware(void* const self, const UInt32 channel)
 {
-    auto& bridge = singleton();
+    auto&      bridge = singleton();
     const auto result = FunctionCast(initHardware, bridge.orgInitHardware)(self, channel);
     NRed::singleton().setProp32("NRedVCNLastHardwareInit", static_cast<UInt32>(result));
 
@@ -527,7 +551,9 @@ bool VCNBridge::initHardware(void* const self, const UInt32 channel)
     // best that can be done without a reboot.
     SYSLOG("VCN", "VCN2 initHardware channel=%u failed; disabling the VCN bridge", channel);
     bridge.engineAllocated = false;
+    bridge.vcnEngine       = nullptr;
     bridge.loadCompleted   = false;
+    bridge.clearTrackedContexts();
     NRed::singleton().setProp32("NRedVCNEngineAllocated", 0);
     NRed::singleton().setProp32("NRedVDAMediaEnabled", 0);
     if (bridge.hardwareHandle != nullptr) {
@@ -575,6 +601,383 @@ bool VCNBridge::initVCNContext(void* const self, void* const accelerator, void* 
     }
 
     return FunctionCast(initVCNContext, bridge.orgInitVCNContext)(self, accelerator, context, createInfo);
+}
+
+static void publishActiveOwners(void* const (&slots)[16], const int (&pids)[16], const char (&names)[16][16])
+{
+    char   buf[256];
+    size_t pos   = 0;
+    bool   first = true;
+    for (size_t i = 0; i < 16; ++i) {
+        if (__atomic_load_n(&slots[i], __ATOMIC_ACQUIRE) == nullptr) { continue; }
+        const int n = snprintf(buf + pos, sizeof(buf) - pos, "%s%d:%s", first ? "" : ",", pids[i], names[i]);
+        if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf) - pos) { break; }
+        pos  += static_cast<size_t>(n);
+        first = false;
+    }
+    NRed::singleton().setPropStr("NRedVCNActiveOwners", first ? "none" : buf);
+}
+
+bool VCNBridge::trackContextStart(void* const context)
+{
+    if (context == nullptr) { return false; }
+    for (size_t i = 0; i < kMaxTrackedVideoContexts; ++i) {
+        if (__atomic_load_n(&this->activeContextSlots[i], __ATOMIC_ACQUIRE) == context) {
+            return true;
+        }
+    }
+    for (size_t i = 0; i < kMaxTrackedVideoContexts; ++i) {
+        void* expected = nullptr;
+        if (__atomic_compare_exchange_n(&this->activeContextSlots[i], &expected, context, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        {
+            this->activeContextPids[i] = proc_selfpid();
+            proc_selfname(this->activeContextNames[i], sizeof(this->activeContextNames[i]));
+            this->activeContextNames[i][sizeof(this->activeContextNames[i]) - 1] = '\0';
+            const SInt32 count = OSIncrementAtomic(&this->activeVideoContexts) + 1;
+            NRed::singleton().setProp32("NRedVCNActiveContexts", static_cast<UInt32>(count > 0 ? count : 0));
+            publishActiveOwners(this->activeContextSlots, this->activeContextPids, this->activeContextNames);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool VCNBridge::trackContextStop(void* const context)
+{
+    if (context == nullptr) { return false; }
+    for (size_t i = 0; i < kMaxTrackedVideoContexts; ++i) {
+        void* expected = context;
+        if (__atomic_compare_exchange_n(&this->activeContextSlots[i], &expected, nullptr, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        {
+            this->activeContextPids[i]    = 0;
+            this->activeContextNames[i][0] = '\0';
+            SInt32 current = __atomic_load_n(&this->activeVideoContexts, __ATOMIC_ACQUIRE);
+            while (current > 0) {
+                if (__atomic_compare_exchange_n(&this->activeVideoContexts, &current, current - 1, false,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                {
+                    current -= 1;
+                    break;
+                }
+            }
+            NRed::singleton().setProp32("NRedVCNActiveContexts", static_cast<UInt32>(current > 0 ? current : 0));
+            publishActiveOwners(this->activeContextSlots, this->activeContextPids, this->activeContextNames);
+            return true;
+        }
+    }
+    return false;
+}
+
+void VCNBridge::clearTrackedContexts()
+{
+    for (size_t i = 0; i < kMaxTrackedVideoContexts; ++i) {
+        __atomic_store_n(&this->activeContextSlots[i], nullptr, __ATOMIC_RELEASE);
+        this->activeContextPids[i]     = 0;
+        this->activeContextNames[i][0] = '\0';
+    }
+    __atomic_store_n(&this->activeVideoContexts, 0, __ATOMIC_RELEASE);
+    NRed::singleton().setProp32("NRedVCNActiveContexts", 0);
+    NRed::singleton().setPropStr("NRedVCNActiveOwners", "none");
+}
+
+void VCNBridge::drainVCN(const char* const reason)
+{
+    if (!this->engineEnabled()) { return; }
+    void* const engine = this->vcnEngine;
+    if (engine == nullptr || this->vcnIsIdle == 0) { return; }
+
+    auto isQuiet = [&]() -> bool {
+        if (!reinterpret_cast<bool (*)(void*)>(this->vcnIsIdle)(engine)) {
+            return false;
+        }
+        if (this->vcnGetHWChannel != 0 && this->vcnChannelIsEmpty != 0) {
+            for (UInt32 ringType = 0; ringType < 3; ++ringType) {
+                void* const ch = reinterpret_cast<void* (*)(void*, UInt32)>(this->vcnGetHWChannel)(engine, ringType);
+                if (ch != nullptr && !reinterpret_cast<bool (*)(void*)>(this->vcnChannelIsEmpty)(ch)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    if (isQuiet()) { return; }
+
+    // Bounded micro-drain (<= 1ms spin in 50us steps, then <= 3ms yield in 1ms steps) before the video
+    // context tears down its VMID GPU page tables in MMHUB.
+    for (UInt32 i = 0; i < 20; ++i) {
+        IODelay(50);
+        if (isQuiet()) { return; }
+    }
+    for (UInt32 i = 0; i < 3; ++i) {
+        IOSleep(1);
+        if (isQuiet()) { return; }
+    }
+    DBGLOG("VCN", "drainVCN(%s): VCN still busy after 4ms bounded wait; proceeding with context stop",
+           reason != nullptr ? reason : "?");
+}
+
+void VCNBridge::triggerSelfHealingCooldown(const char* const reason)
+{
+    const auto totalResets = static_cast<UInt32>(OSIncrementAtomic(&this->vcnResetCount) + 1);
+    const auto streak      = static_cast<UInt32>(OSIncrementAtomic(&this->consecutiveResets) + 1);
+    NRed::singleton().setProp32("NRedVCNResetCount", totalResets);
+
+    // Stage 1: Enter a 15-second cooldown window so new VideoToolbox sessions temporarily fall back to CPU
+    // software decode while PowerPlay power-gates VCN (PowerDownVcn / PowerUpVcn) to clear any MMHUB/VCN wedge,
+    // and ensure the window outlives IOAccelEventMachine2::restart_channel() (~5s).
+    static constexpr UInt64 kCooldownDurationNs = 15000000000ULL;
+    UInt64                  nowNs               = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+    __atomic_store_n(&this->cooldownUntilNs, nowNs + kCooldownDurationNs, __ATOMIC_RELEASE);
+
+    SYSLOG("VCN", "VCN reset triggered (%s): total=%u consecutive=%u; entering 15s self-healing cooldown",
+           reason != nullptr ? reason : "?", totalResets, streak);
+
+    // Stage 2: Only trip the permanent circuit breaker if VCN fails 3 consecutive times without a clean
+    // video context completion in between.
+    if (streak >= 3) {
+        SYSLOG("VCN", "VCN consecutive resets reached %u; escalating to permanent software decode fallback", streak);
+        this->failMedia(19);
+    }
+}
+
+bool VCNBridge::videoContextStart(void* const self)
+{
+    auto& bridge = singleton();
+    if (!bridge.userPatchesAllowed()) { return false; }
+
+    const UInt64 cooldownEnd = __atomic_load_n(&bridge.cooldownUntilNs, __ATOMIC_ACQUIRE);
+    if (cooldownEnd != 0) {
+        UInt64 nowNs = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+        if (nowNs < cooldownEnd) {
+            SYSLOG("VCN", "videoContextStart: VCN in 15s self-healing cooldown; routing session to software decode");
+            return false;
+        }
+    }
+
+    // Check if this context is already tracked (idempotent re-start); otherwise enforce concurrency quota.
+    bool alreadyTracked = false;
+    if (self != nullptr) {
+        for (size_t i = 0; i < kMaxTrackedVideoContexts; ++i) {
+            if (__atomic_load_n(&bridge.activeContextSlots[i], __ATOMIC_ACQUIRE) == self) {
+                alreadyTracked = true;
+                break;
+            }
+        }
+    }
+    if (!alreadyTracked) {
+        const SInt32 active = __atomic_load_n(&bridge.activeVideoContexts, __ATOMIC_ACQUIRE);
+        if (active >= bridge.maxVideoContexts) {
+            const auto fallbacks = static_cast<UInt32>(OSIncrementAtomic(&bridge.quotaFallbacks) + 1);
+            NRed::singleton().setProp32("NRedVCNQuotaFallbacks", fallbacks);
+            DBGLOG("VCN",
+                   "videoContextStart: active=%d >= quota=%d; routing excess stream to software decode (fallbacks=%u)",
+                   active, bridge.maxVideoContexts, fallbacks);
+            return false;
+        }
+    }
+
+    const bool ok = FunctionCast(videoContextStart, bridge.orgVideoContextStart)(self);
+    if (ok && !alreadyTracked) {
+        bridge.trackContextStart(self);
+    }
+    return ok;
+}
+
+void VCNBridge::videoContextStop(void* const self)
+{
+    auto&      bridge     = singleton();
+    const bool wasTracked = bridge.trackContextStop(self);
+    if (wasTracked) {
+        bridge.drainVCN("videoContextStop");
+    }
+
+    FunctionCast(videoContextStop, bridge.orgVideoContextStop)(self);
+
+    if (wasTracked) {
+        const UInt64 cooldownEnd = __atomic_load_n(&bridge.cooldownUntilNs, __ATOMIC_ACQUIRE);
+        UInt64       nowNs       = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+        if (cooldownEnd == 0 || nowNs >= cooldownEnd) {
+            __atomic_store_n(&bridge.consecutiveResets, 0, __ATOMIC_RELEASE);
+        }
+    }
+}
+
+void VCNBridge::videoContextDestroy(void* const self)
+{
+    auto& bridge = singleton();
+    if (bridge.trackContextStop(self)) {
+        bridge.drainVCN("videoContextDestroy");
+    }
+    FunctionCast(videoContextDestroy, bridge.orgVideoContextDestroy)(self);
+}
+
+bool VCNBridge::engineReset(void* const self, const UInt32 ringType, UInt32* const resetMaskOut)
+{
+    auto& bridge = singleton();
+    if (self == nullptr || (bridge.vcnEngine != nullptr && self != bridge.vcnEngine)) {
+        return FunctionCast(engineReset, bridge.orgEngineReset)(self, ringType, resetMaskOut);
+    }
+
+    if (resetMaskOut != nullptr) { *resetMaskOut = 0; }
+
+    // AMDRadeonX6000_AMDHWEngine::reset returns early with *resetMaskOut == 0 because ring reset types at
+    // +0x1A0 are 0xE (uninitialized) on VCN2, and its fallback path calls unpatched X6000 hardware vtable
+    // slots 0x2C0/0x2C8 on the X5000 AMDVega10Hardware instance.
+    // Power-cycle the VCN2 hardware block before re-initializing the ring, and only advertise the reset
+    // mask (allowing IOAcceleratorFamily2 to reset the channel) when hardware re-initialization succeeds.
+    if (ringType < 3) {
+        void* hwChannel = nullptr;
+        if (bridge.vcnGetHWChannel != 0) {
+            hwChannel = reinterpret_cast<void* (*)(void*, UInt32)>(bridge.vcnGetHWChannel)(self, ringType);
+        }
+
+        // Perform a real VCN2 hardware power-cycle reset (releaseHardware + initHardware) before touching
+        // the ring, because initializing the ring while VCN2 is powered down corrupts ring/PSP state.
+        const UInt32 vcnChannel = kVCNDecChannel + ringType;
+        if (bridge.vcnReleaseHardware != 0) {
+            reinterpret_cast<bool (*)(void*, UInt32)>(bridge.vcnReleaseHardware)(self, vcnChannel);
+        }
+
+        bool reinitOk = true;
+        if (bridge.orgInitHardware != 0) {
+            reinitOk = FunctionCast(initHardware, bridge.orgInitHardware)(self, vcnChannel);
+        }
+        if (!reinitOk) {
+            SYSLOG("VCN", "VCN2 hardware re-init failed during engineReset(channel=%u); failing media", vcnChannel);
+            if (hwChannel != nullptr && bridge.vcnChannelReset != 0) {
+                reinterpret_cast<void (*)(void*)>(bridge.vcnChannelReset)(hwChannel);
+            }
+            bridge.triggerSelfHealingCooldown("AMDHWEngine::reset");
+            bridge.failMedia(19);
+            return false;
+        }
+
+        void* const hwRing = getMember<void*>(self, 0x50 + ringType * sizeof(void*));
+        if (hwRing != nullptr) {
+            void* const vtable = *reinterpret_cast<void**>(hwRing);
+            if (vtable != nullptr) {
+                auto* const ringInitHw = getMember<void (*)(void*)>(vtable, 0x130);
+                if (ringInitHw != nullptr) {
+                    ringInitHw(hwRing);
+                }
+            }
+        }
+
+        if (hwChannel != nullptr) {
+            const UInt32 channelIndex = getMember<UInt32>(hwChannel, 0x0C);
+            if (resetMaskOut != nullptr && channelIndex < 32) {
+                *resetMaskOut = (1U << channelIndex);
+            }
+            else if (bridge.vcnChannelReset != 0) {
+                reinterpret_cast<void (*)(void*)>(bridge.vcnChannelReset)(hwChannel);
+            }
+        }
+    }
+
+    bridge.triggerSelfHealingCooldown("AMDHWEngine::reset");
+    return true;
+}
+
+UInt64 VCNBridge::vcnSubmitCommandBuffer(void* const self, void* const submitInfo)
+{
+    auto&      bridge       = singleton();
+    const UInt32 flags      = submitInfo != nullptr ? getMember<UInt32>(submitInfo, 0) : 0;
+    const bool skipGuiltyCb = (flags & 0x2U) != 0;
+
+    const UInt64 result = FunctionCast(vcnSubmitCommandBuffer, bridge.orgVcnSubmitCommandBuffer)(self, submitInfo);
+    if (skipGuiltyCb && self != nullptr) {
+        // Apple's AMDVCN2DecChannel::commitIndirectCommandBuffer returns early on flags & 0x02 without
+        // emitting a fence packet or ringing the doorbell, leaving the skipped CB's HW timestamp unretired.
+        // Do NOT call AMDHWChannel::reset() here because AMDSWScheduler::advance() already holds the
+        // SWScheduler mutex and reset() would call resetHwChannel() and self-deadlock on the same lock.
+        // Instead, retire the skipped CB's HW timestamp lock-free via AMDHWChannel's verified offsets
+        // (+0x80 submitted, +0x84 completed, +0xC0 HW timestamp pointer).
+        const UInt32 submitted    = getMember<UInt32>(self, 0x80);
+        auto* const  completedPtr = reinterpret_cast<volatile UInt32*>(static_cast<UInt8*>(self) + 0x84);
+        auto* const  tsPtr        = getMember<volatile UInt32*>(self, 0xC0);
+        if (tsPtr != nullptr && tsPtr != completedPtr) {
+            __atomic_store_n(tsPtr, submitted, __ATOMIC_RELEASE);
+        }
+        __atomic_store_n(completedPtr, submitted, __ATOMIC_RELEASE);
+
+        const auto retired = static_cast<UInt32>(OSIncrementAtomic(&bridge.vcnSkippedReplayRetired) + 1);
+        NRed::singleton().setProp32("NRedVCNSkipReplayRetired", retired);
+
+        static constexpr UInt64 kCooldownDurationNs = 15000000000ULL;
+        UInt64                  nowNs               = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+        __atomic_store_n(&bridge.cooldownUntilNs, nowNs + kCooldownDurationNs, __ATOMIC_RELEASE);
+
+        SYSLOG("VCN", "vcnSubmitCommandBuffer: retired skipped replay CB lock-free (flags=0x%x, ts=0x%x, count=%u)",
+               flags, submitted, retired);
+    }
+    return result;
+}
+
+IOReturn VCNBridge::accelWaitForStamp(void* const self, const int stampIdx, const UInt32 stamp, UInt32* const statusOut)
+{
+    auto& bridge = singleton();
+    // Guard only VCN channels (12: VCN0Dec, 13: VCN0Enc, 14: VCN0EncLLQ).
+    if (stampIdx >= 12 && stampIdx <= 14) {
+        const UInt64 cooldownEnd = __atomic_load_n(&bridge.cooldownUntilNs, __ATOMIC_ACQUIRE);
+        bool         inCooldown  = bridge.hasMediaFailed();
+        if (!inCooldown && cooldownEnd != 0) {
+            UInt64 nowNs = 0;
+            absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+            inCooldown = nowNs < cooldownEnd;
+        }
+        const bool priorTimeout = __atomic_exchange_n(&bridge.vcnWaitTimeoutPending, 0, __ATOMIC_ACQ_REL) != 0;
+        if (inCooldown || priorTimeout) {
+            if (statusOut != nullptr) { *statusOut = stamp; }
+            SYSLOG("VCN",
+                   "accelWaitForStamp(ch=%d, stamp=0x%x): VCN post-reset/cooldown (cd=%u prior=%u); retiring wait cleanly",
+                   stampIdx, stamp, inCooldown ? 1U : 0U, priorTimeout ? 1U : 0U);
+            return kIOReturnSuccess;
+        }
+    }
+
+    const IOReturn ret = FunctionCast(accelWaitForStamp, bridge.orgAccelWaitForStamp)(self, stampIdx, stamp, statusOut);
+    if (stampIdx >= 12 && stampIdx <= 14 && ret != kIOReturnSuccess) {
+        __atomic_store_n(&bridge.vcnWaitTimeoutPending, 1, __ATOMIC_RELEASE);
+    }
+    return ret;
+}
+
+bool VCNBridge::channelWaitForHwStamp(void* const self, const UInt32 stamp)
+{
+    auto& bridge = singleton();
+
+    // If VCN is currently in the post-reset cooldown window or permanently failed, retire any pending
+    // channel wait immediately so teardown/replay never stalls holding the IOAcceleratorFamily2 lock.
+    const UInt64 cooldownEnd = __atomic_load_n(&bridge.cooldownUntilNs, __ATOMIC_ACQUIRE);
+    if (bridge.hasMediaFailed() || cooldownEnd != 0) {
+        UInt64 nowNs = 0;
+        if (!bridge.hasMediaFailed()) {
+            absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+        }
+        if (bridge.hasMediaFailed() || nowNs < cooldownEnd) {
+            if (self != nullptr && bridge.vcnChannelReset != 0) {
+                reinterpret_cast<void (*)(void*)>(bridge.vcnChannelReset)(self);
+            }
+            return true;
+        }
+    }
+
+    const bool ok = FunctionCast(channelWaitForHwStamp, bridge.orgWaitForHwStamp)(self, stamp);
+    if (!ok && self != nullptr) {
+        if (bridge.vcnChannelReset != 0) {
+            reinterpret_cast<void (*)(void*)>(bridge.vcnChannelReset)(self);
+        }
+        bridge.triggerSelfHealingCooldown("AMDHWChannel::waitForHwStamp timeout");
+        return true;
+    }
+    return ok;
 }
 
 OSMetaClassBase* VCNBridge::safeMetaCast(const OSMetaClassBase* const object, const OSMetaClass* const target)
@@ -680,6 +1083,14 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
             SYSLOG("VCN", "Failed to route X5000 VCN entry points");
             this->x5000Prepared = false;
             return;
+        }
+
+        KernelPatcher::RouteRequest waitForStampRoute{
+            "__ZN35AMDRadeonX5000_AMDAccelEventMachine12waitForStampEijPj", accelWaitForStamp,
+            this->orgAccelWaitForStamp};
+        if (!patcher.routeMultiple(id, &waitForStampRoute, 1, slide, size)) {
+            patcher.clearError();
+            SYSLOG("VCN", "Optional X5000 waitForStamp route unavailable; continuing");
         }
 
         KernelPatcher::RouteRequest castRoute{"__ZN15OSMetaClassBase12safeMetaCastEPKS_PK11OSMetaClass", safeMetaCast,
@@ -847,6 +1258,33 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
         if (!patcher.routeMultiple(id, &fetchRoute, 1, slide, size)) {
             patcher.clearError();
             SYSLOG("VCN", "Optional X6000 fetchResource telemetry route unavailable; continuing");
+        }
+
+        // Resolve VCN2 idle/channel helpers and route video context lifecycle + self-healing reset hooks.
+        // All symbols are verified present across macOS 13-26; use graceful fallback on any missing symbol.
+        resolve(patcher, id, "__ZN30AMDRadeonX6000_AMDVCN2HWEngine15releaseHardwareE21eAMDAccelVideoChannel",
+                this->vcnReleaseHardware, slide, size);
+        resolve(patcher, id, "__ZN30AMDRadeonX6000_AMDVCN2HWEngine6isIdleEv", this->vcnIsIdle, slide, size);
+        resolve(patcher, id, "__ZN26AMDRadeonX6000_AMDHWEngine12getHWChannelE18_eAMD_HW_RING_TYPE",
+                this->vcnGetHWChannel, slide, size);
+        resolve(patcher, id, "__ZN27AMDRadeonX6000_AMDHWChannel7isEmptyEv", this->vcnChannelIsEmpty, slide, size);
+        resolve(patcher, id, "__ZN27AMDRadeonX6000_AMDHWChannel5resetEv", this->vcnChannelReset, slide, size);
+
+        KernelPatcher::RouteRequest lifecycleRoutes[] = {
+            {"__ZN35AMDRadeonX6000_AMDAccelVideoContext12contextStartEv", videoContextStart,
+             this->orgVideoContextStart},
+            {"__ZN35AMDRadeonX6000_AMDAccelVideoContext11contextStopEv", videoContextStop, this->orgVideoContextStop},
+            {"__ZN35AMDRadeonX6000_AMDAccelVideoContextD2Ev", videoContextDestroy, this->orgVideoContextDestroy},
+            {"__ZN26AMDRadeonX6000_AMDHWEngine5resetE18_eAMD_HW_RING_TYPEPj", engineReset, this->orgEngineReset},
+            {"__ZN27AMDRadeonX6000_AMDHWChannel19submitCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
+             vcnSubmitCommandBuffer, this->orgVcnSubmitCommandBuffer},
+            {"__ZN27AMDRadeonX6000_AMDHWChannel14waitForHwStampEj", channelWaitForHwStamp, this->orgWaitForHwStamp},
+        };
+        for (auto& req : lifecycleRoutes) {
+            if (!patcher.routeMultiple(id, &req, 1, slide, size)) {
+                patcher.clearError();
+                SYSLOG("VCN", "Optional X6000 lifecycle/reset route %s unavailable; continuing", req.symbol);
+            }
         }
 
         VideoCommandPatch::install(

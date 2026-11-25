@@ -83,6 +83,7 @@ public:
     void processPatcher(KernelPatcher& patcher);    // TODO: Remove!
 
     void   setProp32(const char* key, UInt32 value) const;    // TODO: Remove!
+    void   setPropStr(const char* key, const char* value) const;
     bool   isMmioReady() const { return this->rmmio != nullptr && this->rmmioPtr != nullptr; }
     UInt32 readReg32(UInt32 reg) const;                       // TODO: Remove!
     void   writeReg32(UInt32 reg, UInt32 value) const;

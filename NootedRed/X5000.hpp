@@ -59,6 +59,7 @@ class X5000
     mach_vm_address_t              orgPM4SubmitCommandBuffer{0};
     mach_vm_address_t              orgAllocateLargeBlocks{0};
     mach_vm_address_t              orgRTHardwareDidStart{0};
+    mach_vm_address_t              orgProcessTransactionInterrupt{0};
     UInt32                         gfxOffSupportedOffset{0x206b8};
     void                           (*notifyGfxAccess)(void*){nullptr};
     UInt64                         (*orgTotalFreeMemory)(void*){nullptr};
@@ -89,6 +90,7 @@ private:
     static bool   wrapAllocateLargeBlocks(void* self, void* elem, UInt64 size, UInt64 align, UInt64 minBlockSize,
                                           UInt32 orig, UInt32 opType, bool onlyNonVisible);
     static void   wrapRTHardwareDidStart(void* self);
+    static void   wrapProcessTransactionInterrupt(void* self, OSObject* eventSource, void* intInfo);
     static UInt32 returnZero();
     static void*  wrapObtainAccelChannelGroup(void* self, UInt32 priority);
     static void*  wrapObtainAccelChannelGroup1304(void* self, UInt32 priority, void* task);
