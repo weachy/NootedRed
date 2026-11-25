@@ -3,6 +3,7 @@
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl3.h>
 #include <err.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -320,13 +321,15 @@ int main(int argc, char **argv)
         errx(2, "Usage: %s [--baseline | --smoke | --layouts | --wait-for-pressure | --buffers [--wait-for-pressure]]",
              argv[0]);
     }
-    if (!baseline) {
-        uint32_t active = 0;
-        size_t length = sizeof(active);
-        if (sysctlbyname("debug.nred_uma.active", &active, &length, NULL, 0) != 0 || active != 1) {
-            errx(1, "debug.nred_uma.active is not 1");
-        }
+    uint32_t active = 0;
+    size_t length = sizeof(active);
+    if (sysctlbyname("debug.nred_uma.active", &active, &length, NULL, 0) != 0) {
+        if (errno != ENOENT) { err(1, "debug.nred_uma.active"); }
+    } else if (length != sizeof(active) || active > 1) {
+        errx(1, "Unexpected debug.nred_uma.active value");
     }
+    if (baseline && active) { errx(1, "--baseline requires a boot with unified memory off"); }
+    if (!baseline && !active) { errx(1, "debug.nred_uma.active is not 1"); }
     const uint64_t queries = baseline ? 0 : counter("debug.nred_uma.gl_budget_queries");
     const bool small = baseline || smoke || layouts;
     const GLsizei edge = small ? 256 : 4096;

@@ -10,6 +10,9 @@
 		EF0400010000000000000010 /* VDA.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EF0400020000000000000010 /* VDA.cpp */; };
 		EF0400030000000000000010 /* VDA.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000010 /* VDA.hpp */; };
 		EF0400010000000000000011 /* VCNBridge.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EF0400020000000000000011 /* VCNBridge.cpp */; };
+		EF0400010000000000000021 /* VCNSubmission.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EF0400020000000000000021 /* VCNSubmission.cpp */; };
+		EF0400030000000000000021 /* VCNSubmission.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000021 /* VCNSubmission.hpp */; };
+		EF0400030000000000000022 /* RenoirDriverBuild.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000022 /* RenoirDriverBuild.hpp */; };
 		EF0400050000000000000011 /* VP9UserPatch.cpp in Sources */ = {isa = PBXBuildFile; fileRef = EF0400060000000000000011 /* VP9UserPatch.cpp */; };
 		EF0400030000000000000011 /* VCNBridge.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400040000000000000011 /* VCNBridge.hpp */; };
 		EF0400070000000000000011 /* VP9UserPatch.hpp in Headers */ = {isa = PBXBuildFile; fileRef = EF0400080000000000000011 /* VP9UserPatch.hpp */; };
@@ -130,6 +133,9 @@
 		EF0400020000000000000010 /* VDA.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = VDA.cpp; sourceTree = "<group>"; };
 		EF0400040000000000000010 /* VDA.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = VDA.hpp; sourceTree = "<group>"; };
 		EF0400020000000000000011 /* VCNBridge.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = VCNBridge.cpp; sourceTree = "<group>"; };
+		EF0400020000000000000021 /* VCNSubmission.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = VCNSubmission.cpp; sourceTree = "<group>"; };
+		EF0400040000000000000021 /* VCNSubmission.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = VCNSubmission.hpp; sourceTree = "<group>"; };
+		EF0400040000000000000022 /* RenoirDriverBuild.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = RenoirDriverBuild.hpp; sourceTree = "<group>"; };
 		EF0400040000000000000011 /* VCNBridge.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = VCNBridge.hpp; sourceTree = "<group>"; };
 		EF0400060000000000000011 /* VP9UserPatch.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = VP9UserPatch.cpp; sourceTree = "<group>"; };
 		EF0400080000000000000011 /* VP9UserPatch.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = VP9UserPatch.hpp; sourceTree = "<group>"; };
@@ -352,6 +358,9 @@
 				EF0400020000000000000010 /* VDA.cpp */,
 				EF0400040000000000000010 /* VDA.hpp */,
 				EF0400020000000000000011 /* VCNBridge.cpp */,
+				EF0400020000000000000021 /* VCNSubmission.cpp */,
+				EF0400040000000000000021 /* VCNSubmission.hpp */,
+				EF0400040000000000000022 /* RenoirDriverBuild.hpp */,
 				EF0400040000000000000011 /* VCNBridge.hpp */,
 				EF0400060000000000000011 /* VP9UserPatch.cpp */,
 				EF0400080000000000000011 /* VP9UserPatch.hpp */,
@@ -649,6 +658,8 @@
 				EF0400030000000000000002 /* DeviceProfile.hpp in Headers */,
 				EF0400030000000000000010 /* VDA.hpp in Headers */,
 				EF0400030000000000000011 /* VCNBridge.hpp in Headers */,
+				EF0400030000000000000021 /* VCNSubmission.hpp in Headers */,
+				EF0400030000000000000022 /* RenoirDriverBuild.hpp in Headers */,
 				EF0400070000000000000011 /* VP9UserPatch.hpp in Headers */,
 				EF0400030000000000000012 /* CompatTarget.hpp in Headers */,
 				EF0400030000000000000013 /* VCNKernelData.hpp in Headers */,
@@ -811,6 +822,7 @@
 				EF0400010000000000000002 /* DeviceProfile.cpp in Sources */,
 				EF0400010000000000000010 /* VDA.cpp in Sources */,
 				EF0400010000000000000011 /* VCNBridge.cpp in Sources */,
+				EF0400010000000000000021 /* VCNSubmission.cpp in Sources */,
 				EF0400050000000000000011 /* VP9UserPatch.cpp in Sources */,
 				EF0400010000000000000012 /* CompatTarget.cpp in Sources */,
 				4068898B2A229BF600028D22 /* PatcherPlus.cpp in Sources */,

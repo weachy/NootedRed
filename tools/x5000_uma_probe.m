@@ -50,7 +50,12 @@ static BOOL enabled(void)
 {
     uint32_t active = 0;
     size_t size = sizeof(active);
-    return sysctlbyname("debug.nred_uma.active", &active, &size, NULL, 0) == 0 && active == 1;
+    if (sysctlbyname("debug.nred_uma.active", &active, &size, NULL, 0) != 0) {
+        if (errno == ENOENT) { return NO; }
+        err(1, "debug.nred_uma.active");
+    }
+    if (size != sizeof(active) || active > 1) { errx(1, "Unexpected debug.nred_uma.active value"); }
+    return active == 1;
 }
 
 static ResidencySnapshot snapshot(void)
@@ -738,7 +743,9 @@ int main(int argc, char **argv)
         if (singleDispatch && groups < dispatchTextures) {
             errx(2, "--single-dispatch requires at least %lu resource groups", (unsigned long)dispatchTextures);
         }
-        if (!baseline && !enabled()) { errx(1, "debug.nred_uma.active is not 1"); }
+        const BOOL active = enabled();
+        if (baseline && active) { errx(1, "--baseline requires a boot with unified memory off"); }
+        if (!baseline && !active) { errx(1, "debug.nred_uma.active is not 1"); }
 
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         id<MTLCommandQueue> queue = [device newCommandQueue];

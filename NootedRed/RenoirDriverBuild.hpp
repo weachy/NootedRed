@@ -1,0 +1,21 @@
+#pragma once
+
+#include <CompatTarget.hpp>
+#include <libkern/libkern.h>
+
+namespace RenoirDriverBuild
+{
+    constexpr UInt8 X5000_25G332[16] = {0xE2, 0x7E, 0xFB, 0x64, 0xDE, 0x35, 0x3C, 0xE5,
+                                        0xB3, 0xAB, 0xA3, 0x22, 0x18, 0xB4, 0x95, 0xD3};
+    constexpr UInt8 X6000_25G332[16] = {0x15, 0x40, 0xD0, 0x89, 0xEE, 0x2D, 0x33, 0x39,
+                                        0xB5, 0xA8, 0x20, 0x24, 0xF9, 0xE3, 0x85, 0x81};
+    constexpr UInt8 X5000HWLibs_25G332[16] = {0x98, 0x77, 0x9C, 0xEA, 0xE3, 0x95, 0x38, 0x29,
+                                              0xA5, 0xB9, 0xFE, 0xA1, 0xCA, 0x9E, 0x11, 0xB4};
+
+    inline bool matches(uintptr_t start, size_t size, const UInt8 (&expected)[16])
+    {
+        CompatTarget::Identity image{};
+        return CompatTarget::parseMachOIdentity(image, reinterpret_cast<const UInt8*>(start), size)
+            && memcmp(image.uuid, expected, sizeof(expected)) == 0;
+    }
+}

@@ -48,6 +48,7 @@
 #include <Regs/SMU.hpp>
 #include <UserPatches.hpp>
 #include <VCNBridge.hpp>
+#include <VCNSubmission.hpp>
 #include <VDA.hpp>
 #include <VP9UserPatch.hpp>
 #include <X5000.hpp>
@@ -108,9 +109,10 @@ void NRed::init()
             X6000FB::singleton().processKext(patcher, id, slide, size);
             AppleGFXHDA::singleton().processKext(patcher, id, slide, size);
             X5000HWLibs::singleton().processKext(patcher, id, slide, size);
-            X5000::singleton().processKext(patcher, id, slide, size);
             X5000Memory::processKext(patcher, id, slide, size);
+            X5000::singleton().processKext(patcher, id, slide, size);
             VCNBridge::singleton().processKext(patcher, id, slide, size);
+            VCNSubmission::processKext(patcher, id, slide, size);
         },
         nullptr);
 }
