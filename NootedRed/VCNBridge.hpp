@@ -47,7 +47,6 @@ class VCNBridge
     };
 
     bool requested{false};
-    bool keepVcnAwake{false};
     bool x5000Prepared{false};
     bool x6000Prepared{false};
     bool loadAttempted{false};
@@ -61,7 +60,6 @@ class VCNBridge
 
     mach_vm_address_t orgAcceleratorStart{0};
     mach_vm_address_t orgAcceleratorStop{0};
-    mach_vm_address_t orgHardwarePowerUpEngines{0};
     mach_vm_address_t orgNewVideo{0};
     mach_vm_address_t orgNewShared{0};
     mach_vm_address_t orgNewClient{0};
@@ -71,8 +69,6 @@ class VCNBridge
     mach_vm_address_t orgClientStop{0};
     mach_vm_address_t orgSurfaceCopy{0};
     mach_vm_address_t orgInitHardware{0};
-    mach_vm_address_t orgReleaseHardware{0};
-    mach_vm_address_t orgSetVcnSuspendResumeState{0};
     mach_vm_address_t orgInitVCNContext{0};
     mach_vm_address_t orgSafeMetaCast{0};
     mach_vm_address_t orgFetchResource{0};
@@ -82,6 +78,8 @@ class VCNBridge
     mach_vm_address_t orgEngineReset{0};
     mach_vm_address_t orgWaitForHwStamp{0};
     mach_vm_address_t orgAccelWaitForStamp{0};
+    mach_vm_address_t orgVcnSubmitCommandBuffer{0};
+    mach_vm_address_t vcnReleaseHardware{0};
     mach_vm_address_t vcnIsIdle{0};
     mach_vm_address_t vcnGetHWChannel{0};
     mach_vm_address_t vcnChannelIsEmpty{0};
@@ -111,9 +109,7 @@ class VCNBridge
     volatile UInt32         vcnResetCount{0};
     volatile UInt32         consecutiveResets{0};
     volatile UInt64         cooldownUntilNs{0};
-    volatile bool           vcnDecPowered{false};
-    volatile bool           vcnSuspending{false};
-    volatile UInt32         vcnPowerDownSkipped{0};
+    volatile UInt32         vcnSkippedReplayRetired{0};
 
     static constexpr size_t kClassPairCount = 6;
     ClassPair              classPairs[kClassPairCount];
@@ -149,7 +145,6 @@ public:
 private:
     static bool          acceleratorStart(void* self, IOService* provider);
     static void          acceleratorStop(void* self, IOService* provider);
-    static bool          hardwarePowerUpEngines(void* self);
     static void*         newShared();
     static void*         newClient();
     static void*         newVideo(void* self);
@@ -159,14 +154,13 @@ private:
     static UInt64        surfaceCopy(void* self, void* input, UInt64 size, void* event);
     static void          signalWork(void* hardware);
     static bool          initHardware(void* self, UInt32 channel);
-    static bool          releaseHardware(void* self, UInt32 channel);
-    static void          setVcnSuspendResumeState(void* self, bool resume);
     static bool          fetchResource(void* self, void* parameters, void* resourceInfo);
     static bool          initVCNContext(void* self, void* accelerator, void* context, void* createInfo);
     static bool          videoContextStart(void* self);
     static void          videoContextStop(void* self);
     static void          videoContextDestroy(void* self);
     static bool          engineReset(void* self, UInt32 ringType, UInt32* resetMaskOut);
+    static UInt64        vcnSubmitCommandBuffer(void* self, void* submitInfo);
     static bool          channelWaitForHwStamp(void* self, UInt32 stamp);
     static IOReturn      accelWaitForStamp(void* self, int stampIdx, UInt32 stamp, UInt32* statusOut);
     static OSMetaClassBase* safeMetaCast(const OSMetaClassBase* object, const OSMetaClass* target);
