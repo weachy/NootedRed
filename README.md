@@ -144,3 +144,31 @@ ChefKiss Open Knowledge License for more details.
 You should have received a copy of the ChefKiss Open Knowledge License
 along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowledge/raw/branch/master/LICENSE-v1.md.
 ```
+
+> [!WARNING]
+> This project is under active research and development; There will be crashes here and there, as the project is glue between the existing buggy AMD drivers.
+>
+> See repository issues and [our site](https://chefkiss.dev/applehax/nootedred) for more information.
+
+## Documentation
+
+- [Compatibility architecture](docs/Compatibility-Architecture.md) — multi-macOS × multi-APU design:
+  target identity vs hardware capability, verification ladder, manifest pipeline and milestones.
+- [Contributing to UserPatches](docs/CONTRIBUTING-USERPATCHES.md) — architecture, adding macOS builds,
+  APU families, patch-data generation, resolver rules, and testing checklist.
+- [Chromium/Electron fix usage](docs/Chromium-Fix-Usage.md) — end-user installation and rollback.
+- [Device profile / media capability layer](docs/Device-Profile.md) — graphics + future VDA capability model.
+- [X5000 unified memory](docs/X5000-UnifiedMemory.md) — opt-in `-NRedUnifiedMemory` for Renoir: textures, IOSurface
+  caches and buffers in pageable system memory instead of the carve-out; design, tests and measurements.
+- [Compatibility data collector](tools/README-collect-compat-data.md) — collect a target machine's drivers, patch sites, VDA data and capabilities for new macOS/APU support.
+- [iGPU HwInfo / UBM research](docs/IGPU-HwInfo-Research-Plan.md) — research record on where the user-space
+  driver gets iGPU hardware info and what the GL fix still needs.
+- [Tester guide](docs/TESTER-GUIDE.md) — archived resolver QA handoff checklist.
+- [GL probe and reproduction notes](tools/README.md) — CGL/OpenGL dual-source probe and the evidence ladder.
+- [HW-info probe](tools/README-hwinfo-probe.md) — IOKit probe for the UBM hardware-info blob.
+- [Chromium/OpenGL issue report](Chromium-OpenGL-Issue-Report.md) — original issue write-up behind the fix.
+
+## Build artifacts
+
+Use `tools/build-branch.sh -y` to put the kext and zip under
+`build/branches/<branch>/...`. See [docs/Build-Artifacts.md](docs/Build-Artifacts.md).

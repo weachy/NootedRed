@@ -31,6 +31,8 @@ static const char* pathRadeonX6000 = "/System/Library/Extensions/AMDRadeonX6000.
 static const char* pathRadeonX5000HWLibs = "/System/Library/Extensions/AMDRadeonX5000HWServices.kext/Contents/PlugIns/"
                                            "AMDRadeonX5000HWLibs.kext/Contents/MacOS/AMDRadeonX5000HWLibs";
 static const char* pathRadeonX5000 = "/System/Library/Extensions/AMDRadeonX5000.kext/Contents/MacOS/AMDRadeonX5000";
+static const char* pathIOAcceleratorFamily2 =
+    "/System/Library/Extensions/IOAcceleratorFamily2.kext/Contents/MacOS/IOAcceleratorFamily2";
 static const char* pathBacklight   = "/System/Library/Extensions/AppleBacklight.kext/Contents/MacOS/AppleBacklight";
 static const char* pathMCCSControl = "/System/Library/Extensions/AppleMCCSControl.kext/Contents/MacOS/AppleMCCSControl";
 static const char* pathAGDP        = "/System/Library/Extensions/AppleGraphicsControl.kext/Contents/PlugIns/"
@@ -52,6 +54,11 @@ KernelPatcher::KextInfo kextRadeonX5000HWLibs{
 
 KernelPatcher::KextInfo kextRadeonX5000{
     "com.apple.kext.AMDRadeonX5000", &pathRadeonX5000, 1, {true}, {}, KernelPatcher::KextInfo::Unloaded,
+};
+
+KernelPatcher::KextInfo kextIOAcceleratorFamily2{
+    "com.apple.iokit.IOAcceleratorFamily2", &pathIOAcceleratorFamily2, 1, {true}, {},
+    KernelPatcher::KextInfo::Unloaded,
 };
 
 KernelPatcher::KextInfo kextAppleBacklight{
