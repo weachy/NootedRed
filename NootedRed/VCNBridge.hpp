@@ -110,6 +110,7 @@ class VCNBridge
     volatile UInt32         consecutiveResets{0};
     volatile UInt64         cooldownUntilNs{0};
     volatile UInt32         vcnSkippedReplayRetired{0};
+    volatile UInt32         vcnWaitTimeoutPending{0};
 
     static constexpr size_t kClassPairCount = 6;
     ClassPair              classPairs[kClassPairCount];

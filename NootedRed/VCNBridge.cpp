@@ -725,14 +725,15 @@ void VCNBridge::triggerSelfHealingCooldown(const char* const reason)
     const auto streak      = static_cast<UInt32>(OSIncrementAtomic(&this->consecutiveResets) + 1);
     NRed::singleton().setProp32("NRedVCNResetCount", totalResets);
 
-    // Stage 1: Enter a 3-second cooldown window so new VideoToolbox sessions temporarily fall back to CPU
-    // software decode while PowerPlay power-gates VCN (PowerDownVcn / PowerUpVcn) to clear any MMHUB/VCN wedge.
-    static constexpr UInt64 kCooldownDurationNs = 3000000000ULL;
+    // Stage 1: Enter a 15-second cooldown window so new VideoToolbox sessions temporarily fall back to CPU
+    // software decode while PowerPlay power-gates VCN (PowerDownVcn / PowerUpVcn) to clear any MMHUB/VCN wedge,
+    // and ensure the window outlives IOAccelEventMachine2::restart_channel() (~5s).
+    static constexpr UInt64 kCooldownDurationNs = 15000000000ULL;
     UInt64                  nowNs               = 0;
     absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
     __atomic_store_n(&this->cooldownUntilNs, nowNs + kCooldownDurationNs, __ATOMIC_RELEASE);
 
-    SYSLOG("VCN", "VCN reset triggered (%s): total=%u consecutive=%u; entering 3s self-healing cooldown",
+    SYSLOG("VCN", "VCN reset triggered (%s): total=%u consecutive=%u; entering 15s self-healing cooldown",
            reason != nullptr ? reason : "?", totalResets, streak);
 
     // Stage 2: Only trip the permanent circuit breaker if VCN fails 3 consecutive times without a clean
@@ -753,7 +754,7 @@ bool VCNBridge::videoContextStart(void* const self)
         UInt64 nowNs = 0;
         absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
         if (nowNs < cooldownEnd) {
-            SYSLOG("VCN", "videoContextStart: VCN in 3s self-healing cooldown; routing session to software decode");
+            SYSLOG("VCN", "videoContextStart: VCN in 15s self-healing cooldown; routing session to software decode");
             return false;
         }
     }
@@ -819,34 +820,42 @@ void VCNBridge::videoContextDestroy(void* const self)
 bool VCNBridge::engineReset(void* const self, const UInt32 ringType, UInt32* const resetMaskOut)
 {
     auto& bridge = singleton();
+    if (self == nullptr || (bridge.vcnEngine != nullptr && self != bridge.vcnEngine)) {
+        return FunctionCast(engineReset, bridge.orgEngineReset)(self, ringType, resetMaskOut);
+    }
+
     if (resetMaskOut != nullptr) { *resetMaskOut = 0; }
 
     // AMDRadeonX6000_AMDHWEngine::reset returns early with *resetMaskOut == 0 because ring reset types at
     // +0x1A0 are 0xE (uninitialized) on VCN2, and its fallback path calls unpatched X6000 hardware vtable
     // slots 0x2C0/0x2C8 on the X5000 AMDVega10Hardware instance.
-    // Populate *resetMaskOut with (1U << hwChannel->channelIndex) so AMDRadeonX5000_AMDHardware::resetHardware
-    // invokes AMDRadeonX6000_AMDHWChannel::reset() to retire the hung timestamp and release IOAcceleratorFamily2,
-    // then re-initialise the VCN2 hardware ring and arm the self-healing cooldown.
-    if (self != nullptr && ringType < 3) {
+    // Power-cycle the VCN2 hardware block before re-initializing the ring, and only advertise the reset
+    // mask (allowing IOAcceleratorFamily2 to reset the channel) when hardware re-initialization succeeds.
+    if (ringType < 3) {
         void* hwChannel = nullptr;
         if (bridge.vcnGetHWChannel != 0) {
             hwChannel = reinterpret_cast<void* (*)(void*, UInt32)>(bridge.vcnGetHWChannel)(self, ringType);
         }
-        if (hwChannel != nullptr) {
-            const UInt32 channelIndex = getMember<UInt32>(hwChannel, 0x0C);
-            if (resetMaskOut != nullptr && channelIndex < 32) {
-                *resetMaskOut = (1U << channelIndex);
-            }
-            else if (bridge.vcnChannelReset != 0) {
-                reinterpret_cast<void (*)(void*)>(bridge.vcnChannelReset)(hwChannel);
-            }
-        }
 
-        // Perform a real VCN2 hardware power-cycle reset (releaseHardware + initHardware), because
-        // AMDVCN2DecRing::reset() is a no-op stub and ring vtable+0x130 alone cannot recover a wedged VCN2 block.
+        // Perform a real VCN2 hardware power-cycle reset (releaseHardware + initHardware) before touching
+        // the ring, because initializing the ring while VCN2 is powered down corrupts ring/PSP state.
         const UInt32 vcnChannel = kVCNDecChannel + ringType;
         if (bridge.vcnReleaseHardware != 0) {
             reinterpret_cast<bool (*)(void*, UInt32)>(bridge.vcnReleaseHardware)(self, vcnChannel);
+        }
+
+        bool reinitOk = true;
+        if (bridge.orgInitHardware != 0) {
+            reinitOk = FunctionCast(initHardware, bridge.orgInitHardware)(self, vcnChannel);
+        }
+        if (!reinitOk) {
+            SYSLOG("VCN", "VCN2 hardware re-init failed during engineReset(channel=%u); failing media", vcnChannel);
+            if (hwChannel != nullptr && bridge.vcnChannelReset != 0) {
+                reinterpret_cast<void (*)(void*)>(bridge.vcnChannelReset)(hwChannel);
+            }
+            bridge.triggerSelfHealingCooldown("AMDHWEngine::reset");
+            bridge.failMedia(19);
+            return false;
         }
 
         void* const hwRing = getMember<void*>(self, 0x50 + ringType * sizeof(void*));
@@ -860,11 +869,13 @@ bool VCNBridge::engineReset(void* const self, const UInt32 ringType, UInt32* con
             }
         }
 
-        if (bridge.orgInitHardware != 0) {
-            const bool reinitOk = FunctionCast(initHardware, bridge.orgInitHardware)(self, vcnChannel);
-            if (!reinitOk) {
-                SYSLOG("VCN", "VCN2 hardware re-init failed during engineReset(channel=%u); failing media", vcnChannel);
-                bridge.failMedia(19);
+        if (hwChannel != nullptr) {
+            const UInt32 channelIndex = getMember<UInt32>(hwChannel, 0x0C);
+            if (resetMaskOut != nullptr && channelIndex < 32) {
+                *resetMaskOut = (1U << channelIndex);
+            }
+            else if (bridge.vcnChannelReset != 0) {
+                reinterpret_cast<void (*)(void*)>(bridge.vcnChannelReset)(hwChannel);
             }
         }
     }
@@ -897,6 +908,12 @@ UInt64 VCNBridge::vcnSubmitCommandBuffer(void* const self, void* const submitInf
 
         const auto retired = static_cast<UInt32>(OSIncrementAtomic(&bridge.vcnSkippedReplayRetired) + 1);
         NRed::singleton().setProp32("NRedVCNSkipReplayRetired", retired);
+
+        static constexpr UInt64 kCooldownDurationNs = 15000000000ULL;
+        UInt64                  nowNs               = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+        __atomic_store_n(&bridge.cooldownUntilNs, nowNs + kCooldownDurationNs, __ATOMIC_RELEASE);
+
         SYSLOG("VCN", "vcnSubmitCommandBuffer: retired skipped replay CB lock-free (flags=0x%x, ts=0x%x, count=%u)",
                flags, submitted, retired);
     }
@@ -915,15 +932,21 @@ IOReturn VCNBridge::accelWaitForStamp(void* const self, const int stampIdx, cons
             absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
             inCooldown = nowNs < cooldownEnd;
         }
-        if (inCooldown) {
+        const bool priorTimeout = __atomic_exchange_n(&bridge.vcnWaitTimeoutPending, 0, __ATOMIC_ACQ_REL) != 0;
+        if (inCooldown || priorTimeout) {
             if (statusOut != nullptr) { *statusOut = stamp; }
-            SYSLOG("VCN", "accelWaitForStamp(ch=%d, stamp=0x%x): VCN in cooldown/failed; retiring wait cleanly",
-                   stampIdx, stamp);
+            SYSLOG("VCN",
+                   "accelWaitForStamp(ch=%d, stamp=0x%x): VCN post-reset/cooldown (cd=%u prior=%u); retiring wait cleanly",
+                   stampIdx, stamp, inCooldown ? 1U : 0U, priorTimeout ? 1U : 0U);
             return kIOReturnSuccess;
         }
     }
 
-    return FunctionCast(accelWaitForStamp, bridge.orgAccelWaitForStamp)(self, stampIdx, stamp, statusOut);
+    const IOReturn ret = FunctionCast(accelWaitForStamp, bridge.orgAccelWaitForStamp)(self, stampIdx, stamp, statusOut);
+    if (stampIdx >= 12 && stampIdx <= 14 && ret != kIOReturnSuccess) {
+        __atomic_store_n(&bridge.vcnWaitTimeoutPending, 1, __ATOMIC_RELEASE);
+    }
+    return ret;
 }
 
 bool VCNBridge::channelWaitForHwStamp(void* const self, const UInt32 stamp)
