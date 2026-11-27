@@ -335,7 +335,7 @@ void X5000::processKext(KernelPatcher& patcher, const size_t id, const mach_vm_a
     this->allocatorTraceEnabled = checkKernelArgument("-NRedAllocTrace");
 
     // Unified memory keeps the native VRAM allocator for the allocations that stay in the carve-out.
-    if (!X5000Memory::managesX5000(slide, size) && this->orgTotalFreeMemory != nullptr && this->orgAllocate != nullptr
+    if (!X5000Memory::managesX5000() && this->orgTotalFreeMemory != nullptr && this->orgAllocate != nullptr
         && this->orgAllocateNonContiguous != nullptr)
     {
         PenguinWizardry::PatternRouteRequest allocLargeReq{

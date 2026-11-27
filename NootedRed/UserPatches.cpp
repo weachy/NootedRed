@@ -589,13 +589,24 @@ void UserPatches::applyUnifiedMemorySites(const VnodeKind vnodeKind, const UInt6
     const auto* const sites = X5000Memory::userBudgetSites(count);
     for (size_t index = 0; index < count; ++index) {
         const auto& site = sites[index];
-        if (site.sharedCache != (vnodeKind == kVnodeSharedCache) || site.patch.pageOffset != pageOffset) { continue; }
+        if (site.sharedCache != (vnodeKind == kVnodeSharedCache)
+            || (site.patch.pageOffset != UINT64_MAX && site.patch.pageOffset != pageOffset))
+        {
+            continue;
+        }
         size_t matchOffset = 0, second = 0;
         if (!matchSignature(bytes, site.patch, matchOffset)) { continue; }
         if (matchSignature(bytes, site.patch, second, matchOffset + 1)) {
             SYSLOG("UserPatch", "Unified memory budget site %zu is ambiguous on page 0x%llX", index, pageOffset);
             continue;
         }
+        UInt8 origBytes[64]{};
+        if (site.patch.replaceSize == 0 || site.patch.replaceSize > sizeof(origBytes)
+            || matchOffset + site.patch.patchOffset + site.patch.replaceSize > kPageSize)
+        {
+            continue;
+        }
+        memcpy(origBytes, bytes + matchOffset + site.patch.patchOffset, site.patch.replaceSize);
         if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
             SYSLOG("UserPatch", "Resolver: failed to disable kernel write protection (unified memory budget)");
             return;
@@ -603,8 +614,14 @@ void UserPatches::applyUnifiedMemorySites(const VnodeKind vnodeKind, const UInt6
         memcpy(const_cast<UInt8*>(bytes) + matchOffset + site.patch.patchOffset, site.patch.replace,
                site.patch.replaceSize);
         MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-        this->recordCachedSite(vnodeKind, pageOffset, matchOffset + site.patch.patchOffset, site.patch.context,
+        this->recordCachedSite(vnodeKind, pageOffset, matchOffset + site.patch.patchOffset, origBytes,
                                site.patch.replace, site.patch.replaceSize);
+        if (vnodeKind == kVnodeGLDriver && site.patch.replaceSize == sizeof(GLResourceBudgetPatch::Find)
+            && memcmp(origBytes, GLResourceBudgetPatch::Find, sizeof(GLResourceBudgetPatch::Find)) == 0)
+        {
+            this->glResourceBudgetApplied = true;
+            NRed::singleton().setProp32("NRedGLResourceBudgetApplied", 1);
+        }
         X5000Memory::userBudgetSiteApplied(index);
         SYSLOG("UserPatch", "Patched unified memory budget site %zu at page 0x%llX + 0x%zX", index, pageOffset,
                matchOffset);

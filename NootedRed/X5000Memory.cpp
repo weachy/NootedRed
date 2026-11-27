@@ -4,7 +4,6 @@
 // IOAcceleratorFamily2 buffer pool and orphaned-mapping reuse, coalesced SDMA page-table writes, and the Metal and
 // OpenGL budgets. See docs/X5000-UnifiedMemory.md.
 
-#include <CompatTarget.hpp>
 #include <DeviceProfile.hpp>
 #include <GLResourceBudgetPatch.hpp>
 #include <Headers/kern_api.hpp>
@@ -15,6 +14,7 @@
 #include <IOKit/pci/IOPCIDevice.h>
 #include <Kexts.hpp>
 #include <NRed.hpp>
+#include <PenguinWizardry/KernelVersion.hpp>
 #include <UserPatches.hpp>
 #include <X5000Memory.hpp>
 #include <X5000MemoryPolicy.hpp>
@@ -32,11 +32,6 @@ namespace
     using X5000Memory::Residency;
     using X5000Memory::ResourceKind;
 
-    constexpr UInt8 ioAccelUUID[] = {0x6C, 0x4A, 0x16, 0xB1, 0x66, 0xDC, 0x3A, 0x8B,
-                                     0x9F, 0x0B, 0xD3, 0xE0, 0x27, 0xB1, 0x6E, 0xB1};
-    constexpr UInt8 x5000UUID[]   = {0xE2, 0x7E, 0xFB, 0x64, 0xDE, 0x35, 0x3C, 0xE5,
-                                     0xB3, 0xAB, 0xA3, 0x22, 0x18, 0xB4, 0x95, 0xD3};
-
     constexpr char allocPrimarySymbol[] = "__ZN16IOAccelResource211allocMemoryEP14IOAccelShared2";
     constexpr char allocDataSymbol[]    = "__ZN16IOAccelResource221allocDataBufferMemoryEP14IOAccelShared2bj";
     constexpr char sysFactorySymbol[] =
@@ -51,6 +46,8 @@ namespace
         "__"
         "ZN34IOAccelBufferMemoryDescriptorPool218releaseDescriptorsEPP24IOBufferMemoryDescriptorjP4taskP12IOAccelEvent";
     constexpr char poolKickSymbol[]      = "__ZN22IOGraphicsAccelerator219kickMemoryPoolTimerEv";
+    constexpr char commitPTESymbol[]     = "__ZN16IOAccelMemoryMap10commit_pteEv";
+    constexpr char releasePTEIOSymbol[]  = "__ZN16IOAccelMemoryMap11release_pteEv";
     constexpr char eventMachineSymbol[]  = "__ZNK13IOAccelMemory15getEventMachineEv";
     constexpr char mergeEventsSymbol[]   = "__ZN13IOAccelMemory20merge_mapping_eventsEP12IOAccelEvent";
     constexpr char sharedReleaseSymbol[] = "__ZN25IOAccelOrphanedMemoryPool13sharedReleaseEP14IOAccelShared2";
@@ -132,6 +129,7 @@ namespace
     constexpr size_t acceleratorWiredBytes     = 0x350;
     constexpr size_t deviceAccelerator         = 0x108;
     constexpr size_t configTextureBudget       = 0x08;
+    constexpr size_t configNativeVram          = 0x10;
     constexpr size_t configWiredBudget         = 0x20;
     constexpr UInt32 configSeparateWorkingSet  = 1U << 31;
     constexpr size_t sharedTask                = 0x88;
@@ -143,26 +141,20 @@ namespace
     constexpr size_t taskFlags                 = 0x268;
     constexpr UInt8  perTaskPageTable          = 1;
 
-    constexpr size_t primaryGateOffset       = 0x27;
-    constexpr size_t primaryNativeSystem     = 0xDA;
-    constexpr size_t primaryOptionsOffset    = 0x161;
-    constexpr size_t primaryFactoryCall      = 0x186;
-    constexpr size_t bufferFactoryArgsOffset = 0xBA;
-    constexpr size_t bufferFactoryCall       = 0xC4;
-    constexpr size_t bufferCPUMappingOffset  = 0xD5;
-    constexpr size_t poolGateOffset          = 0x87;
-    constexpr size_t pageableBodyOffset      = 0x165;
-    constexpr size_t poolFactoryCall         = 0x114;
-    constexpr UInt8  primaryGate[] = {0x8B, 0x87, 0x90, 0x0C, 0, 0, 0x0F, 0xBA, 0xE0, 0x15, 0x0F, 0x82, 0xA3, 0, 0, 0};
-    constexpr UInt8  poolGate[]    = {0x83, 0xBB, 0xBC, 0x09, 0, 0, 0, 0x0F, 0x84, 0xD1, 0, 0, 0, 0x31, 0xC0};
-    // IOGraphicsAccelerator2::start creates the buffer pool only for drivers whose config marks system memory as
-    // primary: testb $0x20, 0xc92(%r14); je skip; movl $0x1b0, %edi; callq operator new.
-    constexpr size_t poolCreateGateOffset = 0x97E;
-    constexpr size_t poolCreateCall       = 0x98D;
-    constexpr size_t poolCreateSkip       = 0x9AF;
-    constexpr UInt8  poolCreateGate[] = {0x41, 0xF6, 0x86, 0x92, 0x0C, 0, 0, 0x20, 0x74, 0x27, 0xBF, 0xB0, 0x01, 0, 0};
-    static_assert(poolCreateGateOffset + sizeof(poolCreateGate) == poolCreateCall);
-    static_assert(poolCreateGateOffset + 10 + 0x27 == poolCreateSkip);
+    // The gates of IOAccelResource2::allocMemory and IOGraphicsAccelerator2::start are located by their instruction
+    // structure: the register assignment differs between macOS 13, 14 and 15+, the operands do not.
+    //   allocMemory: [movq %rsi, %r15][movq %rdi, %rbx|%r14] movq 0x18(%rdi), %rdi; movl 0xc90(%rdi), %eax;
+    //                btl $0x15, %eax; jb <system memory>
+    //   start:       testb $0x20, 0xc92(%rbx|%r14); je skip; movl $0x1b0, %edi; callq IOAccelBufferMemoryDescriptorPool2::new
+    constexpr UInt8 primaryHead[]      = {0x48, 0x8B, 0x7F, 0x18, 0x8B, 0x87, 0x90, 0x0C, 0, 0, 0x0F, 0xBA, 0xE0, 0x15};
+    constexpr UInt8 movRsiR15[]        = {0x49, 0x89, 0xF7};
+    constexpr UInt8 movRdiRbx[]        = {0x48, 0x89, 0xFB};
+    constexpr UInt8 movRdiR14[]        = {0x49, 0x89, 0xFE};
+    constexpr UInt8 systemHeadRbx[]    = {0x48, 0x8B, 0x8B, 0xC8, 0, 0, 0};
+    constexpr UInt8 systemHeadR14[]    = {0x49, 0x8B, 0x8E, 0xC8, 0, 0, 0};
+    constexpr UInt8 poolSizeArg[]      = {0xBF, 0xB0, 0x01, 0, 0};
+    constexpr UInt8 poolConfigTestRbx[] = {0xF6, 0x83, 0x92, 0x0C, 0, 0, 0x20, 0x74};
+    constexpr UInt8 poolConfigTestR14[] = {0x41, 0xF6, 0x86, 0x92, 0x0C, 0, 0, 0x20, 0x74};
     // IOAccelMemory flag 2 makes IOAccelMemoryMap::release keep a task's last mapping, with its GPU address and
     // committed page-table entries, on the task's orphan list instead of freeing it. createMappingInTaskAtAddressLength
     // revives it for the same task. setFlags: testb $0x2, %sil; je; orbs $0x10 into byte 0xd. release: movq 0x18(%rbx),
@@ -170,10 +162,8 @@ namespace
     constexpr UInt32 keepOrphanedMappings   = 2;
     constexpr UInt32 keptMappings           = 1U << 12;
     constexpr UInt8  setFlagsKeepMappings[] = {0x40, 0xF6, 0xC6, 0x02, 0x74, 0x04, 0x80, 0x4F, 0x0D, 0x10};
-    constexpr UInt8  mapReleaseKeepTest[]   = {0x48, 0x8B, 0x4B, 0x18, 0xF6, 0x41, 0x0D, 0x10, 0x75, 0x37};
-    // pruneOrphanedMappings walks the mapping array: movswq 0x5a(%rdi), %r15.
-    constexpr size_t memoryMappingCount  = 0x5A;
-    constexpr UInt8  pruneMappingCount[] = {0x4C, 0x0F, 0xBF, 0x7F, 0x5A};
+    // pruneOrphanedMappings walks the mapping array: movswq|movzwl 0x5a(%rdi).
+    constexpr size_t memoryMappingCount = 0x5A;
 
     // Native buffer pool. IOAccelSysMemory::orphanIt hands a pooled backing's descriptors back with
     // releaseDescriptors(pool = accel+0xc30 if accel+0x9bc, memory+0xf8, memory+0x100, *(shared+0x80) or kernel_task,
@@ -221,14 +211,7 @@ namespace
     // leaq disp(%rip), %rcx and stores a fixed prefill of 24 (movabsq $0x1800000000). newWiredDescriptorsWithLength
     // caps a request at prefill << shift of the first bucket and gathers at most 64 descriptors in a stack array
     // (memset 0x200). With the native first bucket of 1 MiB the cap is 24 MiB.
-    constexpr size_t poolInfoLoad      = 0x6B;
-    constexpr size_t poolPurgeableLoad = 0x127;
-    constexpr size_t poolPrefillStore  = 0x5C;
-    constexpr UInt8  poolInfoLea[]     = {0x48, 0x8D, 0x0D};
     constexpr UInt8  poolPrefill[]     = {0x48, 0xB8, 0, 0, 0, 0, 0x18, 0, 0, 0};
-    constexpr size_t poolCapCheck      = 0x36;
-    constexpr UInt8  poolCap[]         = {0x8A, 0x4F, 0x34, 0x8B, 0x7F, 0x2C, 0xD3, 0xE7, 0x31, 0xC0, 0x48, 0x39, 0xFE};
-    constexpr size_t poolStackClear    = 0x62;
     constexpr UInt8  poolStack[]       = {0x48, 0x8D, 0xBD, 0xD0, 0xFD, 0xFF, 0xFF, 0xBA, 0x00, 0x02, 0x00, 0x00};
     constexpr UInt32 nativeWiredInfo[15]     = {20, 64, 24, 18, 32, 24, 16, 32, 24, 14, 32, 24, 12, 32, 24};
     constexpr UInt32 nativePurgeableInfo[15] = {20, 64, 0, 18, 16, 0, 16, 16, 0, 14, 16, 0, 12, 16, 0};
@@ -238,73 +221,55 @@ namespace
     constexpr UInt32 largeWiredInfo[15]     = {22, 32, 24, 20, 64, 24, 18, 32, 24, 16, 32, 24, 12, 32, 24};
     constexpr UInt32 largePurgeableInfo[15] = {22, 32, 0, 20, 64, 0, 18, 16, 0, 16, 16, 0, 12, 16, 0};
     constexpr UInt64 nativePoolLimit        = 24ULL << 20;
-    constexpr UInt8  nativeSystemHead[]     = {0x49, 0x8B, 0x8E, 0xC8, 0, 0, 0};
-    constexpr UInt8  primaryOptionsHead[]   = {0x0F, 0xBA, 0xE0, 0x1E, 0xB8, 0x63, 0x03, 0,    0,   0x41,
-                                               0xB8, 0x33, 0,    0,    0,    0x44, 0x0F, 0x43, 0xC0};
-    constexpr UInt8  primaryPostFactory[]   = {0x49, 0x89, 0xC4, 0x48, 0x85, 0xC0};
-    constexpr UInt8  bufferFactoryArgs[]    = {0x31, 0xF6, 0x4C, 0x89, 0xE2, 0x31, 0xC9, 0x45, 0x89, 0xF0};
-    constexpr UInt8  bufferPostFactory[]    = {0x48, 0x85, 0xC0, 0x74, 0x4E, 0x49, 0x89, 0xC5, 0x80, 0x48, 0x0C, 0x01};
-    constexpr UInt8  bufferCPUMappingGate[] = {0xF6, 0x83, 0xF4, 0, 0, 0, 0x01, 0x75, 0x6E};
-    static_assert(bufferFactoryArgsOffset + sizeof(bufferFactoryArgs) == bufferFactoryCall);
-    constexpr size_t purgeRequestCall       = 0xFD;
     constexpr UInt8  purgeRequestArgs[]     = {0x48, 0x89, 0xC7, 0x44, 0x89, 0xFE, 0x44, 0x89, 0xFA};
-    constexpr UInt8  purgeablePrimaryLoad[] = {0x48, 0x8B, 0xBB, 0x88, 0, 0, 0};
-    constexpr UInt8  purgeableFlagsLoad[]   = {0x41, 0x8B, 0x46, 0x0C, 0x89, 0xC1, 0xF7, 0xD1};
-    constexpr UInt8  memoryOptionsStore[]   = {0x41, 0x89, 0x85, 0xD8, 0, 0, 0};
-    constexpr UInt8 prepareCountHead[] = {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x8B, 0x5F, 0x10};
-    constexpr UInt8 testEventsHead[]   = {0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0x48,
-                                          0x89, 0xFB, 0x66, 0x83, 0x7F, 0x5A, 0};
-    constexpr UInt8 unwireClearsWired[] = {0x80, 0x63, 0x0C, 0xFD, 0x48, 0x8B, 0x7B, 0x28};
-    constexpr UInt8 pageableHead[]      = {0x31, 0xC0, 0x48, 0x89, 0x45, 0xA0};
-    constexpr UInt8 wiredLimitBody[]   = {0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x87, 0x48, 0x03, 0, 0, 0x5D, 0xC3, 0x90};
-    constexpr UInt8 singleLimitHead[]  = {0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x87, 0x48,
-                                          0x03, 0,    0,    0x48, 0x8D, 0x0C, 0x40};
-    constexpr UInt8 taskHead[]         = {0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x47, 0x68, 0x48, 0x85, 0xC0};
-    constexpr UInt8 surfaceOwnerLoad[] = {0x48, 0x8B, 0x9B, 0xE0, 0, 0, 0};
-    constexpr UInt8 sharedTaskStore[]  = {0x48, 0x89, 0x83, 0x88, 0, 0, 0, 0x48, 0x85, 0xC0};
-    constexpr UInt8 clientBufferFlagStore[] = {0x80, 0x4B, 0x0C, 0x40};
-    constexpr UInt8 configAcceleratorLoad[] = {0x4C, 0x8B, 0xA7, 0x08, 0x01, 0, 0};
-    constexpr UInt8 configBitsStore[]       = {0x0F, 0xB7, 0xC8, 0xC1, 0xE8, 0x09, 0x25, 0x00,
-                                               0x10, 0,    0,    0x09, 0xC8, 0x89, 0x03};
-    constexpr UInt8 configTextureStore[]    = {0xFF, 0x90, 0x68, 0x08, 0, 0, 0x48, 0x89, 0x43, 0x08};
-    constexpr UInt8 configWiredStore[]      = {0xFF, 0x90, 0x90, 0x09, 0, 0, 0x48, 0x89, 0x43, 0x20};
-    constexpr UInt8 nativeAlignmentField[]  = {0x48, 0x81, 0xC3, 0x18, 0x02, 0, 0, 0x48, 0x89, 0xD8};
-    constexpr UInt8 sysAlignmentInit[]      = {0xC7, 0x87, 0xA0, 0x01, 0, 0, 0, 0, 0, 0};
-    constexpr UInt8 sysAlignmentRead[]      = {0x41, 0x8B, 0x87, 0xA0, 0x01, 0, 0, 0x48, 0x39, 0x83, 0x80, 0, 0, 0};
-    constexpr UInt8 mappingTaskTest[]       = {0x48, 0x8B, 0x87, 0x90, 0, 0, 0, 0xF6, 0x80, 0x68, 0x02, 0, 0, 0x01};
-    constexpr UInt8 commitPageTableLoad[]   = {0x4C, 0x8B, 0xB8, 0x60, 0x02, 0, 0, 0x48, 0x8B, 0x83, 0x98, 0, 0, 0};
-    constexpr UInt8 releasePageTableLoad[]  = {0x48, 0x8B, 0xB8, 0x60, 0x02, 0, 0, 0x48, 0x8D, 0x73, 0x38};
-    constexpr UInt8 mapFreeHead[]           = {0x55, 0x48, 0x89, 0xE5, 0x31, 0xC0, 0x48, 0x89, 0x87, 0x18, 0x01, 0, 0};
-    constexpr UInt8 flipEligibility[]       = {0x41, 0xF6, 0x87, 0xB8, 0x01, 0, 0, 0x20};
-    constexpr UInt8 surfaceLayoutGate[]     = {0x41, 0x80, 0xBE, 0xB8, 0x01, 0,    0, 0, 0x78,
-                                               0x2B, 0x49, 0x8B, 0x86, 0x80, 0x01, 0, 0};
+    constexpr UInt8  wiredLimitBody[]       = {0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x87, 0x48, 0x03, 0, 0, 0x5D, 0xC3};
+    constexpr UInt8  singleLimitHead[]      = {0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x87, 0x48,
+                                               0x03, 0,    0,    0x48, 0x8D, 0x0C, 0x40};
+    constexpr UInt8  taskHead[]             = {0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x47, 0x68, 0x48, 0x85, 0xC0};
+    constexpr UInt8  nativeAlignmentField[] = {0x48, 0x81, 0xC3, 0x18, 0x02, 0, 0, 0x48, 0x89, 0xD8};
+    constexpr UInt8  sysAlignmentInit[]     = {0xC7, 0x87, 0xA0, 0x01, 0, 0, 0, 0, 0, 0};
+    constexpr UInt8  flipEligibility[]      = {0x41, 0xF6, 0x87, 0xB8, 0x01, 0, 0, 0x20};
 
     // Metal driver (dyld shared cache): the recommended working set and the command segment limit read the system
     // memory budget that getConfig stores in the device configuration, and fall back to the native fields otherwise.
-    constexpr UInt64 metalWorkingSetPage      = 0xF5A1000;
-    constexpr UInt8  metalWorkingSetFind[]    = {0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x05, 0x73, 0xA0, 0x7B, 0x34,
-                                                 0x48, 0x8B, 0x04, 0x07, 0x48, 0x85, 0xC0, 0x75, 0x0B, 0x48, 0x8B,
-                                                 0x05, 0x8B, 0xA0, 0x7B, 0x34, 0x48, 0x8B, 0x04, 0x07, 0x5D, 0xC3};
-    constexpr UInt8  metalWorkingSetReplace[] = {0x48, 0x8D, 0x8F, 0x20, 0x03, 0,    0,    0x80, 0x79, 0x03, 0,
-                                                 0x78, 0x0E, 0x48, 0x8B, 0x41, 0x10, 0x48, 0x85, 0xC0, 0x75, 0x04,
-                                                 0x48, 0x8B, 0x41, 0x18, 0xC3, 0x48, 0x8B, 0x41, 0x08, 0xC3, 0x90};
-    constexpr UInt64 metalSegmentPage         = 0x10C55000;
-    constexpr UInt8  metalSegmentFind[]       = {0x48, 0x8B, 0x05, 0,    0x19, 0x3C, 0x2F, 0x48, 0x8B, 0x00,
-                                                 0x48, 0x8B, 0x04, 0x03, 0x48, 0x8B, 0x0D, 0xE2, 0x18, 0x3C,
-                                                 0x2F, 0x48, 0x8B, 0x09, 0x48, 0x89, 0x04, 0x0B};
-    constexpr UInt8  metalSegmentReplace[]    = {0x48, 0x8D, 0x83, 0x20, 0x03, 0,    0,    0x48, 0x8B, 0x48,
-                                                 0x10, 0x80, 0x78, 0x03, 0,    0x79, 0x07, 0x48, 0x8B, 0x48,
-                                                 0x08, 0x48, 0xD1, 0xE9, 0x48, 0x89, 0x48, 0x28};
-    static_assert(sizeof(metalWorkingSetFind) == sizeof(metalWorkingSetReplace)
-                  && sizeof(metalSegmentFind) == sizeof(metalSegmentReplace));
+    // The sites are found by a masked context (0x100 is a wildcard, mostly rip-relative displacements) that is unique
+    // in the shared cache of macOS 13.6, 14.6, 15.8 and 26.7. The only build-specific value is the offset of the
+    // device configuration inside MTLIOAccelDevice (the _configBits ivar group), so the replacement is composed at
+    // boot for the running macOS version. Other versions get no Metal sites and keep the native Metal budgets.
+    constexpr UInt16 metalWorkingSetSpec[] = {
+        // preceding function tail
+        0xE5, 0x48, 0x8B, 0x05, 0x100, 0x100, 0x100, 0x100, 0x8B, 0x44, 0x07, 0x18, 0x5D, 0xC3, 0x100, 0x100,
+        // recommendedMaxWorkingSetSize (33 bytes)
+        0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x05, 0x100, 0x100, 0x100, 0x100, 0x48, 0x8B, 0x04, 0x07, 0x48, 0x85, 0xC0,
+        0x75, 0x0B, 0x48, 0x8B, 0x05, 0x100, 0x100, 0x100, 0x100, 0x48, 0x8B, 0x04, 0x07, 0x5D, 0xC3,
+        // following function
+        0x100, 0x100, 0x55, 0x48, 0x89, 0xE5, 0x53, 0x50, 0x48, 0x89, 0xFB, 0x48, 0x8B, 0x3D,
+    };
+    constexpr size_t metalWorkingSetOffset = 16;
+    constexpr size_t metalWorkingSetSize   = 33;
+    // macOS 14 and later (device in %rbx): copy of the native `ivarA -> ivarB` segment limit move.
+    constexpr UInt16 metalSegmentSpec[] = {
+        0xEB, 0x0A, 0x100, 0x83, 0xFE, 0x04, 0x0F, 0x85, 0x100, 0x100, 0x00, 0x00,
+        0x48, 0x8B, 0x05, 0x100, 0x100, 0x100, 0x100, 0x48, 0x8B, 0x00, 0x48, 0x8B, 0x04, 0x03, 0x48, 0x8B, 0x0D,
+        0x100, 0x100, 0x100, 0x100, 0x48, 0x8B, 0x09, 0x48, 0x89, 0x04, 0x0B,
+        0x48, 0x8B, 0x35, 0x100, 0x100, 0x100, 0x100,
+    };
+    // macOS 13 (device in %r12).
+    constexpr UInt16 metalSegmentSpec13[] = {
+        0xEB, 0x0A, 0x41, 0x83, 0xFE, 0x04, 0x0F, 0x85, 0x100, 0x100, 0x00, 0x00,
+        0x48, 0x8B, 0x05, 0x100, 0x100, 0x100, 0x100, 0x48, 0x8B, 0x00, 0x49, 0x8B, 0x04, 0x04, 0x48, 0x8B, 0x0D,
+        0x100, 0x100, 0x100, 0x100, 0x48, 0x8B, 0x09, 0x49, 0x89, 0x04, 0x0C,
+        0x48, 0x8B, 0x35, 0x100, 0x100, 0x100, 0x100,
+    };
+    constexpr size_t metalSegmentOffset = 12;
+    constexpr size_t metalSegmentSize   = 28;
 
     // The OpenGL driver's resource list takes its budget from the device configuration (UnifiedReplace replaces
-    // GLResourceBudgetPatch::Find at the same site), and the share group copies it into each context.
+    // GLResourceBudgetPatch::Find at the same site), and the share group copies it into each context. The OpenGL
+    // driver is byte-identical on macOS 13.6 to 26.7 apart from its position, so these sites match on any page.
     namespace GLBudget
     {
 
-        constexpr UInt64   ShareGroupPage             = 0x1000;
-        constexpr UInt64   ResourceListPage           = 0x5000;
         constexpr size_t   ConfigBudget               = 0x1C;
         constexpr uint32_t ConfigCommandBudgetPresent = 1U << 30;
 
@@ -352,19 +317,105 @@ namespace
 
     enum UserSiteIndex : size_t
     {
+        GLShareGroup,
+        GLResourceList,
         MetalWorkingSet,
         MetalSegment,
-        GLShareGroup,
-        GLResourceList
-    };
-    constexpr X5000Memory::UserSite userSites[] = {
-        {true, userSite(metalWorkingSetFind, metalWorkingSetReplace, metalWorkingSetPage)},
-        {true, userSite(metalSegmentFind, metalSegmentReplace, metalSegmentPage)},
-        {false, userSite(GLBudget::ShareGroupFind, GLBudget::ShareGroupReplace, GLBudget::ShareGroupPage)},
-        {false, userSite(GLResourceBudgetPatch::Find, GLBudget::UnifiedReplace, GLBudget::ResourceListPage)},
+        UserSiteCount
     };
 
+    // Filled by buildUserSites() at init. Both pageOffsets are UINT64_MAX: the sites are not tied to a page.
+    X5000Memory::UserSite userSites[UserSiteCount]{};
+    size_t                userSiteCount{0};
+    UInt8                 metalWorkingSetContext[sizeof(metalWorkingSetSpec) / sizeof(UInt16)]{};
+    UInt8                 metalWorkingSetMask[sizeof(metalWorkingSetContext)]{};
+    UInt8                 metalWorkingSetReplace[metalWorkingSetSize]{};
+    UInt8                 metalSegmentContext[sizeof(metalSegmentSpec) / sizeof(UInt16)]{};
+    UInt8                 metalSegmentMask[sizeof(metalSegmentContext)]{};
+    UInt8                 metalSegmentReplace[metalSegmentSize]{};
+    static_assert(sizeof(metalSegmentSpec) == sizeof(metalSegmentSpec13));
+
+    template<size_t Count>
+    void expandSpec(const UInt16 (&spec)[Count], UInt8 (&context)[Count], UInt8 (&mask)[Count])
+    {
+        for (size_t index = 0; index < Count; index++) {
+            context[index] = static_cast<UInt8>(spec[index] & 0xFF);
+            mask[index]    = spec[index] > 0xFF ? 0x00 : 0xFF;
+        }
+    }
+
+    // Offset of the device configuration in MTLIOAccelDevice, read from the Metal driver of each macOS (the second
+    // ivar of recommendedMaxWorkingSetSize is at +0x18, the segment limit is at +0x28). 0 for versions not sampled.
+    UInt32 metalConfigOffset()
+    {
+        const auto& version = currentKernelVersion();
+        if (version.majorMatches(MACOS_13)) { return 0x2A8; }
+        if (version.majorMatches(MACOS_14)) { return 0x2A0; }
+        if (version.majorMatches(MACOS_15)) { return 0x2E8; }
+        if (version.majorMatches(MACOS_26)) { return 0x320; }
+        return 0;
+    }
+
+    void buildUserSites()
+    {
+        userSites[GLShareGroup] = {
+            false, userSite(GLBudget::ShareGroupFind, GLBudget::ShareGroupReplace, UINT64_MAX)};
+        userSites[GLResourceList] = {
+            false, userSite(GLResourceBudgetPatch::Find, GLBudget::UnifiedReplace, UINT64_MAX)};
+        userSiteCount = GLResourceList + 1;
+
+        const auto offset = metalConfigOffset();
+        if (offset == 0) {
+            SYSLOG("UnifiedMemory", "No Metal budget sites for Darwin %u; Metal keeps its native budgets",
+                   static_cast<unsigned>(currentKernelVersion().major()));
+            return;
+        }
+        const UInt8 displacement[4] = {static_cast<UInt8>(offset), static_cast<UInt8>(offset >> 8),
+                                       static_cast<UInt8>(offset >> 16), static_cast<UInt8>(offset >> 24)};
+
+        // lea offset(%rdi), %rcx; cmpb $0, 3(%rcx); js +14; movq 0x10(%rcx), %rax; testq %rax, %rax; jne +4;
+        // movq 0x18(%rcx), %rax; retq; movq 8(%rcx), %rax; retq; nop
+        const UInt8 workingSet[metalWorkingSetSize] = {0x48, 0x8D, 0x8F, displacement[0], displacement[1],
+                                                       displacement[2], displacement[3], 0x80, 0x79, 0x03, 0,
+                                                       0x78, 0x0E, 0x48, 0x8B, 0x41, 0x10, 0x48, 0x85, 0xC0, 0x75,
+                                                       0x04, 0x48, 0x8B, 0x41, 0x18, 0xC3, 0x48, 0x8B, 0x41, 0x08,
+                                                       0xC3, 0x90};
+        memcpy(metalWorkingSetReplace, workingSet, sizeof(workingSet));
+        expandSpec(metalWorkingSetSpec, metalWorkingSetContext, metalWorkingSetMask);
+        userSites[MetalWorkingSet] = {
+            true,
+            {metalWorkingSetContext, metalWorkingSetMask, sizeof(metalWorkingSetContext), metalWorkingSetOffset,
+             metalWorkingSetReplace, sizeof(metalWorkingSetReplace), 0, 1, UINT64_MAX, nullptr, 0}};
+
+        // lea offset(%rbx|%r12), %rax; movq 0x10(%rax), %rcx; cmpb $0, 3(%rax) [cmpl $0, (%rax)]; jns +7;
+        // movq 8(%rax), %rcx; shrq %rcx; movq %rcx, 0x28(%rax)
+        UInt8 segment[metalSegmentSize]{};
+        if (currentKernelVersion().majorMatches(MACOS_13)) {
+            const UInt8 bytes[metalSegmentSize] = {0x49, 0x8D, 0x84, 0x24, displacement[0], displacement[1],
+                                                   displacement[2], displacement[3], 0x48, 0x8B, 0x48, 0x10, 0x83,
+                                                   0x38, 0x00, 0x79, 0x07, 0x48, 0x8B, 0x48, 0x08, 0x48, 0xD1, 0xE9,
+                                                   0x48, 0x89, 0x48, 0x28};
+            memcpy(segment, bytes, sizeof(bytes));
+            expandSpec(metalSegmentSpec13, metalSegmentContext, metalSegmentMask);
+        }
+        else {
+            const UInt8 bytes[metalSegmentSize] = {0x48, 0x8D, 0x83, displacement[0], displacement[1],
+                                                   displacement[2], displacement[3], 0x48, 0x8B, 0x48, 0x10, 0x80,
+                                                   0x78, 0x03, 0x00, 0x79, 0x07, 0x48, 0x8B, 0x48, 0x08, 0x48,
+                                                   0xD1, 0xE9, 0x48, 0x89, 0x48, 0x28};
+            memcpy(segment, bytes, sizeof(bytes));
+            expandSpec(metalSegmentSpec, metalSegmentContext, metalSegmentMask);
+        }
+        memcpy(metalSegmentReplace, segment, sizeof(segment));
+        userSites[MetalSegment] = {true,
+                                   {metalSegmentContext, metalSegmentMask, sizeof(metalSegmentContext),
+                                    metalSegmentOffset, metalSegmentReplace, sizeof(metalSegmentReplace), 0, 3,
+                                    UINT64_MAX, nullptr, 0}};
+        userSiteCount = UserSiteCount;
+    }
+
     bool               enabledAtBoot{false};
+    bool               userSitesBuilt{false};
     bool               ioChecked{false};
     bool               amdChecked{false};
     bool               ioReady{false};
@@ -405,6 +456,11 @@ namespace
     IOService* pruneAccelerator{nullptr};
     alignas(8) UInt8 pruneEvent[eventBytes]{};
     mach_vm_address_t primaryFactoryReturn{0};
+    mach_vm_address_t bufferFactoryReturn{0};
+    mach_vm_address_t originalPoolFactory{0};
+    // The native OpenGL client buffer flag (IOAccelSysMemory flags, 0x40) was seen in this build.
+    bool         clientBufferVerified{false};
+    IOService*   activeAccelerator{nullptr};
     mach_vm_address_t purgeRequestReturn{0};
     mach_vm_address_t originalDataAllocator{0};
     mach_vm_address_t originalSingleLimit{0};
@@ -478,6 +534,50 @@ namespace
     bool ready() { return __atomic_load_n(&active, __ATOMIC_ACQUIRE) != 0; }
 
     void increment(UInt64& counter, const UInt64 amount = 1) { __atomic_add_fetch(&counter, amount, __ATOMIC_RELAXED); }
+
+    // Per-thread request scopes. A thread marks the allocation it is making (the key is the accelerator or the shared
+    // object) so that the hooks below it, which are plain C++ routes, can tell it from everybody else's. Slots are
+    // claimed with a compare-and-swap on the thread; only the owning thread reads its own key.
+    struct ThreadScope
+    {
+        thread_t    thread;
+        const void* key;
+    };
+    constexpr size_t scopeSlots = 8;
+    ThreadScope      pooledScopes[scopeSlots]{};
+    ThreadScope      dataScopes[scopeSlots]{};
+
+    bool enterScope(ThreadScope (&slots)[scopeSlots], const void* const key)
+    {
+        for (auto& slot : slots) {
+            thread_t expected = nullptr;
+            if (__atomic_compare_exchange_n(&slot.thread, &expected, current_thread(), false, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE))
+            {
+                slot.key = key;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool inScope(ThreadScope (&slots)[scopeSlots], const void* const key)
+    {
+        for (auto& slot : slots) {
+            if (__atomic_load_n(&slot.thread, __ATOMIC_ACQUIRE) == current_thread() && slot.key == key) { return true; }
+        }
+        return false;
+    }
+
+    void leaveScope(ThreadScope (&slots)[scopeSlots], const void* const key)
+    {
+        for (auto& slot : slots) {
+            if (__atomic_load_n(&slot.thread, __ATOMIC_ACQUIRE) == current_thread() && slot.key == key) {
+                __atomic_store_n(&slot.thread, static_cast<thread_t>(nullptr), __ATOMIC_RELEASE);
+                return;
+            }
+        }
+    }
 
     Backing*& bucketFor(void* const memory)
     {
@@ -583,20 +683,13 @@ namespace
                 usage.specialAddress            |= (attributes & externalSurfaceLayout) != 0;
                 usage.hasSurfaceCache = systemBacking && layout != nullptr && (attributes & surfaceInitialized) != 0;
                 usage.hasLinearClientBuffer =
-                    systemBacking && layout == nullptr && attributes == 0 && task == ownerTask
+                    clientBufferVerified && systemBacking && layout == nullptr && attributes == 0 && task == ownerTask
                     && (getMember<UInt8>(imported, memoryFlags) & clientBufferMemory) != 0
                     && (getMember<UInt32>(resource, resourceCopyFlags) & (copyKindMask | copyFormatMask))
                            == copyKindLinear;
             }
         }
         return X5000Memory::choosePrimaryBacking(usage);
-    }
-
-    bool verifiedImage(const mach_vm_address_t start, const size_t length, const UInt8 (&expected)[16])
-    {
-        CompatTarget::Identity image{};
-        return CompatTarget::parseMachOIdentity(image, reinterpret_cast<const UInt8*>(start), length)
-               && memcmp(image.uuid, expected, sizeof(expected)) == 0;
     }
 
     struct EntryHead
@@ -638,6 +731,58 @@ namespace
             SInt32 relative{};
             memcpy(&relative, reinterpret_cast<const void*>(address + 1), sizeof(relative));
             return address + 5 + static_cast<mach_vm_address_t>(static_cast<SInt64>(relative)) == target;
+        }
+
+        // Bytes of [base, base + wanted) that lie inside the image.
+        size_t span(const mach_vm_address_t base, const size_t wanted) const
+        {
+            if (base < start || base - start >= size) { return 0; }
+            const auto left = size - static_cast<size_t>(base - start);
+            return wanted < left ? wanted : left;
+        }
+
+        // First address in [base, base + wanted) where predicate(bytes) holds (it may read 8 bytes), or 0.
+        template<typename Predicate>
+        mach_vm_address_t scan(const mach_vm_address_t base, const size_t wanted, Predicate predicate,
+                               const size_t from = 0) const
+        {
+            const auto limit = span(base, wanted);
+            for (size_t index = from; index + 8 <= limit; index++) {
+                if (predicate(reinterpret_cast<const UInt8*>(base + index))) { return base + index; }
+            }
+            return 0;
+        }
+
+        template<size_t Count>
+        mach_vm_address_t find(const mach_vm_address_t base, const size_t wanted, const UInt8 (&bytes)[Count],
+                               const size_t from = 0) const
+        {
+            const auto limit = span(base, wanted);
+            for (size_t index = from; index + Count <= limit; index++) {
+                if (memcmp(reinterpret_cast<const void*>(base + index), bytes, Count) == 0) { return base + index; }
+            }
+            return 0;
+        }
+
+        bool hasU32(const mach_vm_address_t base, const size_t wanted, const UInt32 value) const
+        {
+            return scan(base, wanted,
+                        [value](const UInt8* bytes)
+                        {
+                            UInt32 word{};
+                            memcpy(&word, bytes, sizeof(word));
+                            return word == value;
+                        }) != 0;
+        }
+
+        // First callq <target> in [base, base + wanted), or 0.
+        mach_vm_address_t findCall(const mach_vm_address_t base, const size_t wanted, const mach_vm_address_t target) const
+        {
+            const auto limit = span(base, wanted);
+            for (size_t index = 0; index + 5 <= limit; index++) {
+                if (calls(base + index, target)) { return base + index; }
+            }
+            return 0;
         }
 
         bool install(KernelPatcher::RouteRequest* routes, const size_t count) const
@@ -682,12 +827,6 @@ static mach_vm_address_t nredUnifiedPrimaryNative asm("_nredUnifiedPrimaryNative
 [[gnu::used]]
 static mach_vm_address_t nredUnifiedPrimarySystem asm("_nredUnifiedPrimarySystem"){0};
 [[gnu::used]]
-static mach_vm_address_t nredUnifiedBufferResume asm("_nredUnifiedBufferResume"){0};
-[[gnu::used]]
-static mach_vm_address_t nredUnifiedPoolNative asm("_nredUnifiedPoolNative"){0};
-[[gnu::used]]
-static mach_vm_address_t nredUnifiedPoolPageable asm("_nredUnifiedPoolPageable"){0};
-[[gnu::used]]
 static mach_vm_address_t nredUnifiedOriginalFactory asm("_nredUnifiedOriginalFactory"){0};
 
 extern "C" [[gnu::used, gnu::noinline]]
@@ -700,8 +839,31 @@ bool nredUnifiedUseSystem(void* const resource, void* const shared)
            && X5000Memory::validAlignment(getMember<UInt64>(resource, allocationAlignment), PAGE_SIZE);
 }
 
+// IOAccelResource2::allocMemory takes the system memory path when bit 21 of the driver configuration is set. The branch
+// replaces `movq 0x18(%rdi), %rdi; movl 0xc90(%rdi), %eax; btl $0x15, %eax` (14 bytes) and sends eligible Renoir
+// resources to the system memory path (bit 26 cleared for the macOS 15+ code that tests it), everything else to the
+// instruction after the original `jb`. %rbx|%r14 hold the resource and %r15 the shared object in every build.
 [[gnu::naked]]
-static void primaryBranch()
+static void primaryBranchRbx()
+{
+    asm volatile("movq %rbx, %rdi\n"
+                 "movq %r15, %rsi\n"
+                 "callq _nredUnifiedUseSystem\n"
+                 "movq 0x18(%rbx), %rdi\n"
+                 "testb %al, %al\n"
+                 "movl 0xc90(%rdi), %eax\n"
+                 "jz 1f\n"
+                 "btrl $0x1a, %eax\n"
+                 "jmpq *_nredUnifiedPrimarySystem(%rip)\n"
+                 "1:\n"
+                 "btl $0x15, %eax\n"
+                 "jc 2f\n"
+                 "jmpq *_nredUnifiedPrimaryNative(%rip)\n"
+                 "2: jmpq *_nredUnifiedPrimarySystem(%rip)\n");
+}
+
+[[gnu::naked]]
+static void primaryBranchR14()
 {
     asm volatile("movq %r14, %rdi\n"
                  "movq %r15, %rsi\n"
@@ -719,46 +881,6 @@ static void primaryBranch()
                  "2: jmpq *_nredUnifiedPrimarySystem(%rip)\n");
 }
 
-[[gnu::naked]]
-static void bufferBranch()
-{
-    asm volatile("movq %rbx, %rdi\n"
-                 "movq %r12, %rsi\n"
-                 "movl %r14d, %edx\n"
-                 "movq %r9, %rcx\n"
-                 "callq _nredUnifiedMakeDataBacking\n"
-                 "jmpq *_nredUnifiedBufferResume(%rip)\n");
-}
-
-// Only unified-memory backings requested through allocatePooled use the native buffer pool. Every other caller keeps
-// the pageable path it used before the pool existed.
-[[gnu::naked]]
-static void poolBranch()
-{
-    asm volatile("leaq _nredUnifiedPooledReturn(%rip), %rax\n"
-                 "cmpq %rax, 8(%rbp)\n"
-                 "jne 1f\n"
-                 "cmpl $0, 0x9bc(%rbx)\n"
-                 "je 1f\n"
-                 "xorl %eax, %eax\n"
-                 "jmpq *_nredUnifiedPoolNative(%rip)\n"
-                 "1: jmpq *_nredUnifiedPoolPageable(%rip)\n");
-}
-
-[[gnu::naked]]
-static void* allocatePooled(IOService*, void*, void*, void*, UInt32, UInt64, bool)
-{
-    asm volatile("pushq %rbp\n"
-                 "movq %rsp, %rbp\n"
-                 "subq $16, %rsp\n"
-                 "movl 16(%rbp), %eax\n"
-                 "movl %eax, (%rsp)\n"
-                 "callq *_nredUnifiedOriginalFactory(%rip)\n"
-                 "_nredUnifiedPooledReturn:\n"
-                 "leaveq\n"
-                 "retq\n");
-}
-
 [[gnu::used]]
 static mach_vm_address_t nredBufferPoolCreate asm("_nredBufferPoolCreate"){0};
 [[gnu::used]]
@@ -769,13 +891,28 @@ bool nredUnifiedBufferPool(IOService* const accelerator)
 {
     // Without the pooled path (hand-back and re-keying) no pool is created, so no task-keyed dirty slots appear.
     if (!ownsAccelerator(accelerator) || !pooledHandBack) { return false; }
+    __atomic_store_n(&activeAccelerator, accelerator, __ATOMIC_RELEASE);
     SYSLOG("UnifiedMemory", "Creating the native buffer pool for unified memory backings");
     return true;
 }
 
 // Replaces the native config test so the accelerator start path also creates the pool for the Renoir accelerator.
 [[gnu::naked]]
-static void poolCreateBranch()
+static void poolCreateBranchRbx()
+{
+    asm volatile("testb $0x20, 0xc92(%rbx)\n"
+                 "jnz 1f\n"
+                 "movq %rbx, %rdi\n"
+                 "callq _nredUnifiedBufferPool\n"
+                 "testb %al, %al\n"
+                 "jz 2f\n"
+                 "1: movl $0x1b0, %edi\n"
+                 "jmpq *_nredBufferPoolCreate(%rip)\n"
+                 "2: jmpq *_nredBufferPoolSkip(%rip)\n");
+}
+
+[[gnu::naked]]
+static void poolCreateBranchR14()
 {
     asm volatile("testb $0x20, 0xc92(%r14)\n"
                  "jnz 1f\n"
@@ -827,13 +964,15 @@ namespace
             increment(allocationFailures);
             return nullptr;
         }
-        const bool large  = size > nativePoolLimit;
-        const bool pooled = pooledHandBack && (!large || largeBuckets);
+        const bool large     = size > nativePoolLimit;
+        const bool wantsPool = pooledHandBack && (!large || largeBuckets);
+        // newPoolDescriptors only serves requests made inside this scope; withOptions takes its pageable path otherwise.
+        const bool pooled = wantsPool && enterScope(pooledScopes, accelerator);
         if (large && pooled) { increment(poolLargeRequests); }
         auto* const memory = static_cast<OSObject*>(
-            pooled ? allocatePooled(accelerator, task, shared, resource, options, size, unshared) :
-                     reinterpret_cast<void* (*)(IOService*, void*, void*, void*, UInt32, UInt64, bool)>(
-                         nredUnifiedOriginalFactory)(accelerator, task, shared, resource, options, size, unshared));
+            reinterpret_cast<void* (*)(IOService*, void*, void*, void*, UInt32, UInt64, bool)>(
+                nredUnifiedOriginalFactory)(accelerator, task, shared, resource, options, size, unshared));
+        if (pooled) { leaveScope(pooledScopes, accelerator); }
         if (memory == nullptr) {
             IOFree(backing, sizeof(Backing));
             increment(allocationFailures);
@@ -882,7 +1021,15 @@ namespace
                            const UInt32 options, const UInt64 size, const bool unshared)
     {
         const auto caller = reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0));
-        const auto kind   = backingKind(caller, accelerator, shared, resource, options);
+        // allocDataBufferMemory asks for its backing without a resource; allocateData marked the thread when it chose
+        // a pageable data buffer.
+        if (resource == nullptr && task == nullptr && bufferFactoryReturn != 0 && caller == bufferFactoryReturn
+            && ownsAccelerator(accelerator) && (options & ~dataMemoryOptions) == 0 && inScope(dataScopes, shared))
+        {
+            return newPageableBacking(accelerator, nullptr, shared, nullptr, options | kIOMemoryPageable, size, false,
+                                      BackingKind::Buffer, 0);
+        }
+        const auto kind = backingKind(caller, accelerator, shared, resource, options);
         if (kind == BackingKind::Native) {
             return FunctionCast(makeSystemMemory, nredUnifiedOriginalFactory)(accelerator, task, shared, resource,
                                                                               options, size, unshared);
@@ -895,19 +1042,10 @@ namespace
     bool allocateData(void* const resource, void* const shared, const bool preferVideo, const UInt32 options)
     {
         const auto original = FunctionCast(allocateData, originalDataAllocator);
-        return original(resource, shared, preferVideo && !usePageableData(resource, shared, options), options);
-    }
-
-    extern "C" [[gnu::used, gnu::noinline]]
-    void* nredUnifiedMakeDataBacking(void* const resource, void* const shared, const UInt32 options, const UInt64 size)
-    {
-        auto* const accelerator = getMember<IOService*>(resource, resourceAccelerator);
-        if (usePageableData(resource, shared, options)) {
-            return newPageableBacking(accelerator, nullptr, shared, nullptr, options | kIOMemoryPageable, size, false,
-                                      BackingKind::Buffer, 0);
-        }
-        return FunctionCast(makeSystemMemory, nredUnifiedOriginalFactory)(accelerator, nullptr, shared, nullptr,
-                                                                          options, size, false);
+        const bool pageable = usePageableData(resource, shared, options) && enterScope(dataScopes, shared);
+        const auto result   = original(resource, shared, preferVideo && !pageable, options);
+        if (pageable) { leaveScope(dataScopes, shared); }
+        return result;
     }
 
     UInt64 getWiredBudget(IOService* const accelerator)
@@ -936,8 +1074,9 @@ namespace
         if (api == nullptr) { return result; }
 
         const auto wired = getMember<UInt64>(config, configWiredBudget);
+        const auto vram  = getMember<UInt64>(config, configNativeVram);
         if (api->isEqualTo("GL/CL")) {
-            const auto budget = X5000Memory::glCommandBudgetKiB(wired, PAGE_SIZE);
+            const auto budget = X5000Memory::glCommandBudgetKiBForUMA(wired, vram, PAGE_SIZE);
             if (budget != 0) {
                 getMember<UInt32>(config, GLBudget::ConfigBudget)  = budget;
                 getMember<UInt32>(config, 0)                      |= GLBudget::ConfigCommandBudgetPresent;
@@ -948,7 +1087,7 @@ namespace
         }
         if (!api->isEqualTo("Metal") || !__atomic_load_n(&metalSegmentReady, __ATOMIC_ACQUIRE)) { return result; }
 
-        const auto budget = X5000Memory::recommendedWorkingSet(wired, PAGE_SIZE);
+        const auto budget = X5000Memory::recommendedWorkingSetForUMA(wired, vram, PAGE_SIZE);
         if (budget != 0) {
             getMember<UInt64>(config, configTextureBudget)  = budget;
             getMember<UInt32>(config, 0)                   |= configSeparateWorkingSet;
@@ -1742,31 +1881,69 @@ namespace
         return wanted;
     }
 
-    // Rewrites the pool bucket tables before IOGraphicsAccelerator2::start creates the pool. Returns false without
-    // writing when any byte differs from 25G332.
-    bool installLargePoolBuckets(const Image& image)
+    // Decodes `jcc rel8` (short8) or `jcc rel32` (0F near8) at address. The target must lie in the image.
+    bool decodeBranch(const Image& image, const mach_vm_address_t address, const UInt8 short8, const UInt8 near8,
+                      mach_vm_address_t& next, mach_vm_address_t& target)
+    {
+        if (!image.contains(address, 6)) { return false; }
+        const auto* const bytes = reinterpret_cast<const UInt8*>(address);
+        if (bytes[0] == short8) {
+            next   = address + 2;
+            target = next + static_cast<mach_vm_address_t>(static_cast<SInt64>(static_cast<SInt8>(bytes[1])));
+        }
+        else if (bytes[0] == 0x0F && bytes[1] == near8) {
+            SInt32 relative{};
+            memcpy(&relative, bytes + 2, sizeof(relative));
+            next   = address + 6;
+            target = next + static_cast<mach_vm_address_t>(static_cast<SInt64>(relative));
+        }
+        else {
+            return false;
+        }
+        return image.contains(target, 16);
+    }
+
+    // The pool code the large buckets and the hand-back were written against: the prefill constant of 24, the stack
+    // array of 64 descriptors and the shift of the first bucket size.
+    bool poolCodeVerified(const Image& image)
     {
         const auto init    = image.resolve(poolInitSymbol);
         const auto request = image.resolve(poolFactorySymbol);
-        if (init == 0 || request == 0 || !image.matches(init + poolInfoLoad, poolInfoLea)
-            || !image.matches(init + poolPurgeableLoad, poolInfoLea)
-            || !image.matches(init + poolPrefillStore, poolPrefill) || !image.matches(request + poolCapCheck, poolCap)
-            || !image.matches(request + poolStackClear, poolStack))
-        {
-            return false;
-        }
-        const auto target = [&](const size_t load)
-        {
+        return init != 0 && request != 0 && image.find(init, 0x200, poolPrefill) != 0
+               && image.find(request, 0x100, poolStack) != 0
+               && image.scan(request, 0x100,
+                             [](const UInt8* bytes) { return bytes[0] == 0xD3 && (bytes[1] & 0xF8) == 0xE0; })
+                      != 0;
+    }
+
+    // The bucket table that initWithAccelerator loads through `leaq disp(%rip), %reg`, found by its native content.
+    UInt32* poolTable(const Image& image, const mach_vm_address_t init, const UInt32 (&native)[15])
+    {
+        const auto limit = image.span(init, 0x200);
+        for (size_t index = 0; index + 8 <= limit; index++) {
+            const auto* const bytes = reinterpret_cast<const UInt8*>(init + index);
+            if (bytes[0] != 0x48 || bytes[1] != 0x8D || (bytes[2] & 0xC7) != 0x05) { continue; }
             SInt32 relative{};
-            memcpy(&relative, reinterpret_cast<const void*>(init + load + 3), sizeof(relative));
-            return init + load + 7 + static_cast<mach_vm_address_t>(static_cast<SInt64>(relative));
-        };
-        auto* const wired     = reinterpret_cast<UInt32*>(target(poolInfoLoad));
-        auto* const purgeable = reinterpret_cast<UInt32*>(target(poolPurgeableLoad));
-        if (!image.contains(reinterpret_cast<mach_vm_address_t>(wired), sizeof(nativeWiredInfo))
-            || !image.contains(reinterpret_cast<mach_vm_address_t>(purgeable), sizeof(nativePurgeableInfo))
-            || memcmp(wired, nativeWiredInfo, sizeof(nativeWiredInfo)) != 0
-            || memcmp(purgeable, nativePurgeableInfo, sizeof(nativePurgeableInfo)) != 0
+            memcpy(&relative, bytes + 3, sizeof(relative));
+            const auto target = init + index + 7 + static_cast<mach_vm_address_t>(static_cast<SInt64>(relative));
+            if (image.contains(target, sizeof(native))
+                && memcmp(reinterpret_cast<const void*>(target), native, sizeof(native)) == 0)
+            {
+                return reinterpret_cast<UInt32*>(target);
+            }
+        }
+        return nullptr;
+    }
+
+    // Rewrites the pool bucket tables before IOGraphicsAccelerator2::start creates the pool. Returns false without
+    // writing when a table is not in its native state.
+    bool installLargePoolBuckets(const Image& image)
+    {
+        const auto init = image.resolve(poolInitSymbol);
+        if (init == 0) { return false; }
+        auto* const wired     = poolTable(image, init, nativeWiredInfo);
+        auto* const purgeable = poolTable(image, init, nativePurgeableInfo);
+        if (wired == nullptr || purgeable == nullptr
             || MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS)
         {
             return false;
@@ -1785,6 +1962,22 @@ namespace
             poolPurgeableTable = purgeable;
         }
         return written;
+    }
+
+    // IOAccelBufferMemoryDescriptorPool2::newWiredDescriptorsWithLength. withOptions asks the pool of a pool-enabled
+    // accelerator for wired descriptors on every system memory allocation; only requests made by newPageableBacking
+    // (inside its scope) may use the pool. For everything else this reports "no descriptors", and withOptions
+    // continues with its pageable path, as it does whenever the pool cannot serve a request.
+    void* newPoolDescriptors(void* const pool, const UInt64 length, UInt32* const count, void* const task,
+                             void* const event, const bool wait, bool* const flag)
+    {
+        auto* const accelerator = __atomic_load_n(&activeAccelerator, __ATOMIC_ACQUIRE);
+        if (accelerator != nullptr && pool != nullptr && pool == getMember<void*>(accelerator, acceleratorPool)
+            && !inScope(pooledScopes, accelerator))
+        {
+            return nullptr;
+        }
+        return FunctionCast(newPoolDescriptors, originalPoolFactory)(pool, length, count, task, event, wait, flag);
     }
 
     bool installIOAccel(const Image& image)
@@ -1811,50 +2004,139 @@ namespace
         const auto prepareCount      = image.resolve(prepareCountSymbol);
         const auto testEvents        = image.resolve(testEventsSymbol);
         const auto unwire            = image.resolve(unwireSymbol);
-        if (!image.matches(primary + primaryGateOffset, primaryGate)
-            || !image.matches(primary + primaryNativeSystem, nativeSystemHead)
-            || !image.matches(primary + primaryOptionsOffset, primaryOptionsHead)
-            || !image.calls(primary + primaryFactoryCall, factory)
-            || !image.matches(primary + primaryFactoryCall + 5, primaryPostFactory)
-            || !image.matches(buffer + bufferFactoryArgsOffset, bufferFactoryArgs)
-            || !image.calls(buffer + bufferFactoryCall, factory)
-            || !image.matches(buffer + bufferFactoryCall + 5, bufferPostFactory)
-            || !image.matches(buffer + bufferCPUMappingOffset, bufferCPUMappingGate)
-            || !image.matches(purgeRequest + purgeRequestCall - sizeof(purgeRequestArgs), purgeRequestArgs)
-            || !image.calls(purgeRequest + purgeRequestCall, resourcePurgeable)
-            || !image.matches(resourcePurgeable + 0x92, purgeablePrimaryLoad)
-            || !image.matches(memoryPurgeable + 0x1C, purgeableFlagsLoad)
-            || !image.matches(factory + 0x33B, memoryOptionsStore) || !image.matches(prepareCount, prepareCountHead)
-            || !image.matches(testEvents, testEventsHead) || !image.matches(unwire + 0x189, unwireClearsWired)
-            || !image.matches(clientBuffer + 0x19D, clientBufferFlagStore)
-            || !image.matches(factory + poolGateOffset, poolGate)
-            || !image.matches(factory + pageableBodyOffset, pageableHead)
-            || !image.calls(factory + poolFactoryCall, pool)
-            || !image.matches(start + poolCreateGateOffset, poolCreateGate)
-            || !image.calls(start + poolCreateCall, poolNew) || !image.matches(setFlags + 0x0E, setFlagsKeepMappings)
-            || !image.matches(mapRelease + 0x24, mapReleaseKeepTest) || !image.matches(prune + 0x1A, pruneMappingCount)
-            || !image.matches(limit, wiredLimitBody) || !image.matches(singleLimit, singleLimitHead)
-            || !image.matches(task, taskHead) || !image.matches(storage + 0x86, surfaceOwnerLoad)
-            || !image.matches(sharedInit + 0x37, sharedTaskStore)
-            || !image.matches(config + 0x11, configAcceleratorLoad) || !image.matches(config + 0x6B, configBitsStore)
-            || !image.matches(config + 0x91, configTextureStore) || !image.matches(config + 0xAE, configWiredStore))
+        const auto commitPTE         = image.resolve(commitPTESymbol);
+        const auto releasePTE        = image.resolve(releasePTEIOSymbol);
+
+        const mach_vm_address_t required[] = {primary,           buffer,   clientBuffer, factory,     pool,
+                                              start,             setFlags, mapRelease,   prune,       poolNew,
+                                              limit,             singleLimit, task,      storage,     sharedInit,
+                                              config,            purgeRequest, resourcePurgeable, memoryPurgeable,
+                                              prepareCount,      testEvents, unwire,     commitPTE,   releasePTE};
+        for (const auto address : required) {
+            if (address == 0) { return false; }
+        }
+
+        // allocMemory: [movq %rsi, %r15][movq %rdi, %rbx|%r14] <primaryHead> jb <system memory>
+        const auto gate = image.find(primary, 0x80, primaryHead);
+        if (gate < primary + sizeof(movRsiR15) + sizeof(movRdiRbx)) { return false; }
+        const bool viaRbx = image.matches(gate - sizeof(movRdiRbx), movRdiRbx);
+        const bool viaR14 = image.matches(gate - sizeof(movRdiR14), movRdiR14);
+        mach_vm_address_t primaryNext = 0, systemTarget = 0;
+        if (!image.matches(gate - sizeof(movRdiRbx) - sizeof(movRsiR15), movRsiR15) || (!viaRbx && !viaR14)
+            || !decodeBranch(image, gate + sizeof(primaryHead), 0x72, 0x82, primaryNext, systemTarget)
+            || !(viaRbx ? image.matches(systemTarget, systemHeadRbx) : image.matches(systemTarget, systemHeadR14)))
+        {
+            return false;
+        }
+        const auto primaryCall = image.findCall(systemTarget, 0x200, factory);
+        const auto bufferCall  = image.findCall(buffer, 0x180, factory);
+        const auto purgeCall   = image.findCall(purgeRequest, 0x180, resourcePurgeable);
+        if (primaryCall == 0 || bufferCall == 0 || purgeCall == 0
+            || !image.matches(purgeCall - sizeof(purgeRequestArgs), purgeRequestArgs))
         {
             return false;
         }
 
-        primaryFactoryReturn    = primary + primaryFactoryCall + 5;
-        purgeRequestReturn      = purgeRequest + purgeRequestCall + 5;
-        getGPUTask              = FunctionCast(getGPUTask, task);
-        getPrepareCount         = FunctionCast(getPrepareCount, prepareCount);
-        allEventsComplete       = FunctionCast(allEventsComplete, testEvents);
-        unwireMemory            = FunctionCast(unwireMemory, unwire);
-        setMemoryFlags          = FunctionCast(setMemoryFlags, setFlags);
-        pruneOrphanedMappings   = FunctionCast(pruneOrphanedMappings, prune);
-        const auto poolRelease  = image.resolve(poolReleaseSymbol);
-        const auto poolKick     = image.resolve(poolKickSymbol);
-        const auto eventMachine = image.resolve(eventMachineSymbol);
-        const auto mergeEvents  = image.resolve(mergeEventsSymbol);
-        if (poolRelease != 0 && poolKick != 0 && eventMachine != 0 && mergeEvents != 0) {
+        // The structure offsets and virtual slots the routes rely on, looked up inside the functions that use them.
+        const auto cmpw5A = [](const UInt8* bytes)
+        { return bytes[0] == 0x66 && bytes[1] == 0x83 && (bytes[2] & 0xF8) == 0x78 && bytes[3] == 0x5A && bytes[4] == 0; };
+        const auto vcall = [](const UInt32 slot)
+        {
+            return [slot](const UInt8* bytes)
+            {
+                UInt32 word{};
+                memcpy(&word, bytes + 2, sizeof(word));
+                return bytes[0] == 0xFF && (bytes[1] & 0xF8) == 0x90 && word == slot;
+            };
+        };
+        const bool operands =
+            image.matches(limit, wiredLimitBody) && image.matches(singleLimit, singleLimitHead)
+            && image.matches(task, taskHead) && image.matches(setFlags + 0x0E, setFlagsKeepMappings)
+            && image.scan(mapRelease, 0x60,
+                          [](const UInt8* bytes)
+                          { return bytes[0] == 0xF6 && (bytes[1] & 0xF8) == 0x40 && bytes[2] == 0x0D && bytes[3] == 0x10; })
+                   != 0
+            && image.scan(prune, 0x40,
+                          [](const UInt8* bytes)
+                          {
+                              return bytes[0] == 0x0F && (bytes[1] == 0xB7 || bytes[1] == 0xBF)
+                                     && (bytes[2] & 0xC0) == 0x40 && bytes[3] == memoryMappingCount;
+                          })
+                   != 0
+            && image.scan(prepareCount, 0x30, cmpw5A) != 0 && image.scan(testEvents, 0x30, cmpw5A) != 0
+            && image.scan(unwire, 0x220,
+                          [](const UInt8* bytes)
+                          {
+                              return (bytes[0] == 0x80 && (bytes[1] & 0xF8) == 0x60 && bytes[2] == 0x0C
+                                      && bytes[3] == 0xFD)
+                                     || (bytes[0] == 0x80 && bytes[1] == 0x64 && bytes[2] == 0x24 && bytes[3] == 0x0C
+                                         && bytes[4] == 0xFD);
+                          })
+                   != 0
+            && image.hasU32(resourcePurgeable, 0x100, 0x88)
+            && image.scan(memoryPurgeable, 0x60,
+                          [](const UInt8* bytes)
+                          { return bytes[0] == 0x8B && (bytes[1] & 0xC0) == 0x40 && bytes[2] == 0x0C; })
+                   != 0
+            && image.hasU32(factory, 0x450, 0x9BC) && image.hasU32(factory, 0x450, 0xC30)
+            && image.hasU32(factory, 0x450, 0xD8) && image.findCall(factory, 0x200, pool) != 0
+            && image.hasU32(config, 0xD0, 0x108) && image.hasU32(config, 0xD0, 0x868)
+            && image.hasU32(config, 0xD0, 0x990) && image.hasU32(config, 0xD0, 0xC90)
+            && image.hasU32(sharedInit, 0x60, 0x80) && image.hasU32(sharedInit, 0x60, 0x88)
+            && image.hasU32(storage, 0x120, 0xE0) && image.hasU32(buffer, 0x200, 0xF4)
+            && image.hasU32(primary, 0x300, 0x363)
+            && image.scan(commitPTE, 0x90, vcall(0x1D0)) != 0 && image.scan(releasePTE, 0x90, vcall(0x1D8)) != 0;
+        if (!operands) { return false; }
+
+        // Optional: the OpenGL client buffer flag. Without it OpenGL linear buffers stay in the carve-out.
+        clientBufferVerified =
+            image.scan(clientBuffer, 0x260,
+                       [](const UInt8* bytes)
+                       { return bytes[0] == 0x80 && (bytes[1] & 0xF8) == 0x48 && bytes[2] == 0x0C && bytes[3] == 0x40; })
+            != 0;
+
+        // IOGraphicsAccelerator2::start: testb $0x20, 0xc92(%rbx|%r14); je skip; movl $0x1b0, %edi; callq pool new.
+        // Optional: without it no pool is created.
+        mach_vm_address_t poolGate = 0, poolCall = 0, poolSkip = 0;
+        bool              poolViaRbx = false;
+        for (size_t from = 0;;) {
+            const auto sizeArg = image.find(start, 0xD00, poolSizeArg, from);
+            if (sizeArg == 0) { break; }
+            from = static_cast<size_t>(sizeArg - start) + 1;
+            if (!image.calls(sizeArg + sizeof(poolSizeArg), poolNew)) { continue; }
+            const bool rbx = image.matches(sizeArg - 9, poolConfigTestRbx);
+            const bool r14 = image.matches(sizeArg - 10, poolConfigTestR14);
+            if (!rbx && !r14) { continue; }
+            const auto relative = static_cast<SInt8>(*reinterpret_cast<const UInt8*>(sizeArg - 1));
+            poolGate            = rbx ? sizeArg - 9 : sizeArg - 10;
+            poolViaRbx          = rbx;
+            poolCall            = sizeArg + sizeof(poolSizeArg);
+            poolSkip            = sizeArg + static_cast<mach_vm_address_t>(static_cast<SInt64>(relative));
+            break;
+        }
+
+        primaryFactoryReturn  = primaryCall + 5;
+        bufferFactoryReturn   = bufferCall + 5;
+        purgeRequestReturn    = purgeCall + 5;
+        getGPUTask            = FunctionCast(getGPUTask, task);
+        getPrepareCount       = FunctionCast(getPrepareCount, prepareCount);
+        allEventsComplete     = FunctionCast(allEventsComplete, testEvents);
+        unwireMemory          = FunctionCast(unwireMemory, unwire);
+        setMemoryFlags        = FunctionCast(setMemoryFlags, setFlags);
+        pruneOrphanedMappings = FunctionCast(pruneOrphanedMappings, prune);
+
+        // The pooled path (native buffer pool, hand-back, re-keying) was written against the pool and release code of
+        // macOS 15 and later; it stays off where any of that code differs.
+        const auto poolRelease   = image.resolve(poolReleaseSymbol);
+        const auto poolKick      = image.resolve(poolKickSymbol);
+        const auto eventMachine  = image.resolve(eventMachineSymbol);
+        const auto mergeEvents   = image.resolve(mergeEventsSymbol);
+        const auto memoryRelease = image.resolve(memoryReleaseSymbol);
+        const auto pruneCall     = memoryRelease != 0 ? image.findCall(memoryRelease, 0x120, prune) : 0;
+        const bool releaseTail   = pruneCall != 0 && image.matches(pruneCall + 5, releasePruneTail);
+        if (poolRelease != 0 && poolKick != 0 && eventMachine != 0 && mergeEvents != 0 && poolGate != 0 && releaseTail
+            && poolCodeVerified(image) && image.scan(mergeEvents, 0x90, vcall(0x1B8)) != 0)
+        {
             releasePoolDescriptors = FunctionCast(releasePoolDescriptors, poolRelease);
             kickPoolTimer          = FunctionCast(kickPoolTimer, poolKick);
             getEventMachine        = FunctionCast(getEventMachine, eventMachine);
@@ -1868,17 +2150,15 @@ namespace
         }
         SYSLOG("UnifiedMemory", "Pooled hand-back %s, buffer pool buckets %s", pooledHandBack ? "on" : "off",
                largeBuckets ? "large" : "native");
-        nredUnifiedPrimaryNative = primary + primaryGateOffset + sizeof(primaryGate);
-        nredUnifiedPrimarySystem = primary + primaryNativeSystem;
-        nredUnifiedBufferResume  = buffer + bufferFactoryCall + 5;
-        nredUnifiedPoolNative    = factory + poolGateOffset + sizeof(poolGate);
-        nredUnifiedPoolPageable  = factory + pageableBodyOffset;
-        nredBufferPoolCreate     = start + poolCreateCall;
-        nredBufferPoolSkip       = start + poolCreateSkip;
+        nredUnifiedPrimaryNative = primaryNext;
+        nredUnifiedPrimarySystem = systemTarget;
+        nredBufferPoolCreate     = poolCall;
+        nredBufferPoolSkip       = poolSkip;
 
         KernelPatcher::RouteRequest routes[] = {
             {allocDataSymbol, allocateData, originalDataAllocator},
             {sysFactorySymbol, makeSystemMemory, nredUnifiedOriginalFactory},
+            {poolFactorySymbol, newPoolDescriptors, originalPoolFactory},
             {singleLimitSymbol, getSingleAllocationBudget, originalSingleLimit},
             {configSymbol, getConfig, originalGetConfig},
             {wiredSymbol, didWire, originalWired},
@@ -1888,20 +2168,13 @@ namespace
             {orphanSymbol, orphanBacking, originalOrphan},
             {mapAtSymbol, mapAtAddress, originalMapAt},
         };
-        const auto memoryRelease = image.resolve(memoryReleaseSymbol);
-        const auto sharedHead    = image.head(sharedReleaseSymbol);
-        const auto pruneHead     = image.head(pruneSymbol);
+        const auto sharedHead = image.head(sharedReleaseSymbol);
+        const auto pruneHead  = image.head(pruneSymbol);
         if (pooledHandBack && (sharedHead.address == 0 || pruneHead.address == 0)) {
             disablePooledPath("Shared release or prune entry not found; pooled hand-back disabled");
         }
-        if (pooledHandBack
-            && (memoryRelease == 0 || !image.calls(memoryRelease + releasePruneCall, prune)
-                || !image.matches(memoryRelease + releasePruneCall + 5, releasePruneTail)))
-        {
-            disablePooledPath("IOAccelMemory::release does not match; pooled hand-back disabled");
-        }
         if (pooledHandBack) {
-            releasePruneReturn                   = memoryRelease + releasePruneCall + 5;
+            releasePruneReturn                   = pruneCall + 5;
             KernelPatcher::RouteRequest shared[] = {
                 {sharedReleaseSymbol, releaseShared, originalSharedRelease},
                 {pruneSymbol, pruneFromRelease, originalPrune},
@@ -1916,11 +2189,12 @@ namespace
             // NootedRed's own prune calls (orphanBacking, mapAtAddress) bypass the route.
             if (originalPrune != 0) { pruneOrphanedMappings = FunctionCast(pruneOrphanedMappings, originalPrune); }
         }
-        return image.install(routes, arrsize(routes)) && image.branch(limit, getWiredBudget)
-               && image.branch(factory + poolGateOffset, poolBranch)
-               && image.branch(start + poolCreateGateOffset, poolCreateBranch)
-               && image.branch(buffer + bufferFactoryArgsOffset, bufferBranch)
-               && image.branch(primary + primaryGateOffset, primaryBranch);
+        bool installedAll = image.install(routes, arrsize(routes)) && image.branch(limit, getWiredBudget)
+                            && image.branch(gate, viaRbx ? primaryBranchRbx : primaryBranchR14);
+        if (installedAll && pooledHandBack) {
+            installedAll = image.branch(poolGate, poolViaRbx ? poolCreateBranchRbx : poolCreateBranchR14);
+        }
+        return installedAll;
     }
 
     bool installX5000(const Image& image)
@@ -1935,14 +2209,16 @@ namespace
         const auto commit      = image.resolve(commitSymbol);
         const auto releasePTE  = image.resolve(releasePTESymbol);
         const auto layout      = image.resolve(surfaceLayoutSymbol);
-        if (!image.contains(accelerator, sizeof(void*)) || !image.contains(sysMemory, sizeof(void*))
-            || !image.matches(parameters + 0x1A, nativeAlignmentField)
-            || !image.matches(sysInit + 0x12, sysAlignmentInit) || !image.matches(mapInit + 0xC8, sysAlignmentRead)
-            || !image.matches(flip + 0x78, flipEligibility) || !image.matches(mapFree, mapFreeHead)
-            || !image.matches(commit + 0x11, mappingTaskTest) || !image.matches(commit + 0x30, commitPageTableLoad)
-            || !image.matches(releasePTE + 0xD, mappingTaskTest)
-            || !image.matches(releasePTE + 0x1D, releasePageTableLoad)
-            || !image.matches(layout + 0x1C, surfaceLayoutGate))
+        if (parameters == 0 || sysInit == 0 || mapInit == 0 || mapFree == 0 || flip == 0 || commit == 0
+            || releasePTE == 0 || layout == 0 || !image.contains(accelerator, sizeof(void*))
+            || !image.contains(sysMemory, sizeof(void*)) || !image.matches(parameters + 0x1A, nativeAlignmentField)
+            || !image.matches(sysInit + 0x12, sysAlignmentInit) || !image.hasU32(mapInit, 0x160, 0x1A0)
+            || !image.matches(flip + 0x78, flipEligibility) || !image.hasU32(mapFree, 0x30, 0x118)
+            || !image.hasU32(commit, 0x60, 0x90) || !image.hasU32(commit, 0x60, 0x268)
+            || !image.hasU32(commit, 0x60, 0x260) || !image.hasU32(commit, 0x60, 0x98)
+            || !image.hasU32(releasePTE, 0x50, 0x90) || !image.hasU32(releasePTE, 0x50, 0x268)
+            || !image.hasU32(releasePTE, 0x50, 0x260) || !image.hasU32(layout, 0x50, 0x1B8)
+            || !image.hasU32(layout, 0x50, 0x180))
         {
             return false;
         }
@@ -1962,10 +2238,21 @@ namespace
 
         // Optional: page-table write coalescing. A failure leaves it unavailable and changes nothing else.
         const auto      commitFn   = image.resolve(poolCommitSymbol);
+        const auto      pteUpdate  = image.resolve(pteUpdateSymbol);
         const EntryHead pteHeads[] = {image.head(poolReserveSymbol), image.head(poolSubmitSymbol),
                                       image.head(pteUpdateSymbol), image.head(mapVMPTSymbol), image.head(mapVASymbol)};
         bool            pteReady   = false;
-        if (commitFn != 0) {
+        // The command buffer pool is the AMDHWVMContext field at +0x30: mov 0x30(%reg), %reg inside the writer.
+        const bool poolOffset =
+            pteUpdate != 0
+            && image.scan(pteUpdate, 0x100,
+                          [](const UInt8* bytes)
+                          {
+                              return (bytes[0] == 0x48 || bytes[0] == 0x49 || bytes[0] == 0x4C || bytes[0] == 0x4D)
+                                     && bytes[1] == 0x8B && (bytes[2] & 0xC0) == 0x40 && bytes[3] == 0x30;
+                          })
+                   != 0;
+        if (commitFn != 0 && poolOffset) {
             poolCommit                              = reinterpret_cast<void (*)(void*, UInt32*)>(commitFn);
             KernelPatcher::RouteRequest pteRoutes[] = {
                 {poolReserveSymbol, reservePoolHook, originalPoolReserve},
@@ -2004,20 +2291,20 @@ void X5000Memory::init()
         SYSLOG("UnifiedMemory", "Could not initialize the residency registry");
         return;
     }
+    buildUserSites();
+    userSitesBuilt = true;
     lilu.onKextLoadForce(&kextIOAcceleratorFamily2);
 }
 
 bool X5000Memory::requested() { return enabledAtBoot; }
 
-bool X5000Memory::managesX5000(const mach_vm_address_t slide, const size_t size)
-{
-    return requested() && ioReady && deviceAllowed() && verifiedImage(slide, size, x5000UUID);
-}
+bool X5000Memory::managesX5000() { return requested() && ready(); }
 
 const X5000Memory::UserSite* X5000Memory::userBudgetSites(size_t& count)
 {
-    // The sites read the budgets getConfig publishes, which needs the kernel routes in place.
-    count = ready() ? arrsize(userSites) : 0;
+    // Available from boot on: the sites fall back to the native fields until getConfig publishes a budget, which only
+    // happens once the kernel routes are in place, so they are harmless when unified memory does not install.
+    count = requested() && userSitesBuilt ? userSiteCount : 0;
     return userSites;
 }
 
@@ -2042,13 +2329,13 @@ void X5000Memory::processKext(KernelPatcher& patcher, const size_t id, const mac
     const Image image{patcher, id, slide, size};
     if (id == kextIOAcceleratorFamily2.loadIndex) {
         ioChecked = true;
-        ioReady   = verifiedImage(slide, size, ioAccelUUID) && installIOAccel(image);
+        ioReady   = installIOAccel(image);
         if (!ioReady) { SYSLOG("UnifiedMemory", "Unsupported IOAcceleratorFamily2 residency ABI"); }
     }
     else if (id == kextRadeonX5000.loadIndex) {
         amdChecked = true;
         if (deviceAllowed()) {
-            amdReady = verifiedImage(slide, size, x5000UUID) && installX5000(image);
+            amdReady = installX5000(image);
             if (!amdReady) { SYSLOG("UnifiedMemory", "Unsupported X5000 display ABI"); }
         }
         else {

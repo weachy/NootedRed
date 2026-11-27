@@ -108,8 +108,8 @@ void NRed::init()
             X6000FB::singleton().processKext(patcher, id, slide, size);
             AppleGFXHDA::singleton().processKext(patcher, id, slide, size);
             X5000HWLibs::singleton().processKext(patcher, id, slide, size);
-            X5000::singleton().processKext(patcher, id, slide, size);
             X5000Memory::processKext(patcher, id, slide, size);
+            X5000::singleton().processKext(patcher, id, slide, size);
             VCNBridge::singleton().processKext(patcher, id, slide, size);
         },
         nullptr);
