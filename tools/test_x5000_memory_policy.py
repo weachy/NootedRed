@@ -89,6 +89,29 @@ void testBudgets() {
     assert(glCommandBudgetKiB(UINT64_MAX, page) == UINT32_MAX);
 }
 
+// Wired limit as the driver derives it from RAM (about three quarters); carve-outs of 512 MiB to 8 GiB.
+void testCarveOuts() {
+    for (const uint64_t ram : {8 * GiB, 16 * GiB, 32 * GiB, 64 * GiB}) {
+        for (const uint64_t uma : {512 * MiB, 1 * GiB, 2 * GiB, 3 * GiB, 4 * GiB, 8 * GiB}) {
+            if (uma >= ram / 2) { continue; }
+            const auto wired = (ram - uma) * 3 / 4;
+            const auto ws    = recommendedWorkingSetForUMA(wired, uma, page);
+            const auto gl    = glCommandBudgetKiBForUMA(wired, uma, page);
+            // Either a budget larger than the native one is published, or nothing (native kept).
+            assert(ws == 0 || ws > uma);
+            assert(gl == 0 || gl > nativeGLCommandBudgetKiB(uma));
+            // Typical machines (16 GiB and more, up to 2 GiB carve-out) always gain.
+            if (ram >= 16 * GiB && uma <= 2 * GiB) { assert(ws > uma && gl != 0); }
+        }
+    }
+    // Small RAM with a big carve-out keeps the native budget.
+    assert(recommendedWorkingSetForUMA((8 * GiB - 4 * GiB) * 3 / 4, 4 * GiB, page) == 0);
+    assert(glCommandBudgetKiBForUMA((8 * GiB - 4 * GiB) * 3 / 4, 4 * GiB, page) == 0);
+    assert(nativeGLCommandBudgetKiB(512 * MiB) == 256 * 1024);
+    assert(nativeGLCommandBudgetKiB(2 * GiB) == 1536 * 1024);
+    assert(nativeGLCommandBudgetKiB(0) == 0);
+}
+
 void testPoolBuckets() {
     assert(!largePoolBuckets(0, 0));
     assert(!largePoolBuckets(8 * GiB, 0));
@@ -104,6 +127,7 @@ int main() {
     testPlacement();
     testResidency();
     testBudgets();
+    testCarveOuts();
     testPoolBuckets();
     std::puts("memory policy checks passed");
 }

@@ -121,4 +121,29 @@ namespace X5000Memory
         return kib <= UINT32_MAX ? static_cast<uint32_t>(kib) : UINT32_MAX;
     }
 
+    // Carve-out aware variants. A machine with a large BIOS UMA carve-out (3 GiB and more) but little RAM can have a
+    // native budget that is already larger than what unified memory would publish; then 0 is returned and the driver
+    // keeps its native budget (the budget bits stay unset in the device configuration).
+    constexpr uint64_t recommendedWorkingSetForUMA(const uint64_t wired, const uint64_t nativeVramBytes,
+                                                   const uint64_t pageSize)
+    {
+        const auto budget = recommendedWorkingSet(wired, pageSize);
+        return budget > nativeVramBytes ? budget : 0;
+    }
+
+    // The native OpenGL resource list budget: max(totalKiB - 512 MiB, totalKiB / 2).
+    constexpr uint64_t nativeGLCommandBudgetKiB(const uint64_t nativeVramBytes)
+    {
+        const uint64_t vramKiB = nativeVramBytes / 1024;
+        const uint64_t half    = vramKiB / 2;
+        return vramKiB > 512ULL * 1024 && vramKiB - 512ULL * 1024 > half ? vramKiB - 512ULL * 1024 : half;
+    }
+
+    constexpr uint32_t glCommandBudgetKiBForUMA(const uint64_t wired, const uint64_t nativeVramBytes,
+                                                const uint64_t pageSize)
+    {
+        const auto kib = glCommandBudgetKiB(wired, pageSize);
+        return kib > nativeGLCommandBudgetKiB(nativeVramBytes) ? kib : 0;
+    }
+
 }    // namespace X5000Memory
