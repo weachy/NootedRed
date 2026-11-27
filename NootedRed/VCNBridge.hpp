@@ -24,6 +24,8 @@
 #include <Headers/kern_patcher.hpp>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOService.h>
+#include <IOKit/IOWorkLoop.h>
+#include <VCNQueueDrain.hpp>
 #include <libkern/OSTypes.h>
 #include <libkern/c++/OSMetaClass.h>
 
@@ -79,6 +81,7 @@ class VCNBridge
     mach_vm_address_t orgWaitForHwStamp{0};
     mach_vm_address_t orgAccelWaitForStamp{0};
     mach_vm_address_t orgVcnSubmitCommandBuffer{0};
+    mach_vm_address_t orgReleaseHardware{0};
     mach_vm_address_t vcnReleaseHardware{0};
     mach_vm_address_t vcnIsIdle{0};
     mach_vm_address_t vcnGetHWChannel{0};
@@ -111,6 +114,26 @@ class VCNBridge
     volatile UInt64         cooldownUntilNs{0};
     volatile UInt32         vcnSkippedReplayRetired{0};
     volatile UInt32         vcnWaitTimeoutPending{0};
+    bool                    minOnTime{false};
+    volatile UInt64         lastHardwareInitNs{0};
+    volatile UInt32         minOnDelays{0};
+    using ThreadCheck = boolean_t (*)();
+    ThreadCheck             interruptsEnabled{nullptr};
+    ThreadCheck             onInterrupt{nullptr};
+    ThreadCheck             preemptionEnabled{nullptr};
+    mach_vm_address_t       stopQueueStart{0};
+    mach_vm_address_t       stopQueueEnd{0};
+
+    bool                    queueDrainRouted{false};
+    void*                   queueDrainEngine{nullptr};
+    VCNQueueDrain::Layout   queueDrainLayout{};
+    mach_vm_address_t       orgStopQueue{0};
+    mach_vm_address_t       wait5000{0};
+    mach_vm_address_t       replay5000{0};
+    size_t                  replay5000Size{0};
+    mach_vm_address_t       accelLookup{0};
+    UInt32                  hardwareWorkLoopOwner{0};
+    IOWorkLoop*           (*hardwareWorkLoop)(const IOService*){nullptr};
 
     static constexpr size_t kClassPairCount = 6;
     ClassPair              classPairs[kClassPairCount];
@@ -155,17 +178,23 @@ private:
     static UInt64        surfaceCopy(void* self, void* input, UInt64 size, void* event);
     static void          signalWork(void* hardware);
     static bool          initHardware(void* self, UInt32 channel);
+    static bool          releaseHardware(void* self, UInt32 channel);
     static bool          fetchResource(void* self, void* parameters, void* resourceInfo);
     static bool          initVCNContext(void* self, void* accelerator, void* context, void* createInfo);
     static bool          videoContextStart(void* self);
     static void          videoContextStop(void* self);
     static void          videoContextDestroy(void* self);
     static bool          engineReset(void* self, UInt32 ringType, UInt32* resetMaskOut);
+    static bool          stopQueue(void* engine, UInt32 channel);
     static UInt64        vcnSubmitCommandBuffer(void* self, void* submitInfo);
     static bool          channelWaitForHwStamp(void* self, UInt32 stamp);
     static IOReturn      accelWaitForStamp(void* self, int stampIdx, UInt32 stamp, UInt32* statusOut);
     static OSMetaClassBase* safeMetaCast(const OSMetaClassBase* object, const OSMetaClass* target);
 
+    void prepareQueueDrain5000(KernelPatcher& patcher, size_t id, mach_vm_address_t slide, size_t size);
+    void prepareQueueDrainWorkLoop(KernelPatcher& patcher, size_t id, mach_vm_address_t slide, size_t size);
+    bool installQueueDrain(KernelPatcher& patcher, size_t id, mach_vm_address_t slide, size_t size);
+    bool queueDrainLayoutFits() const;
     void drainVCN(const char* reason);
     void triggerSelfHealingCooldown(const char* reason);
     bool trackContextStart(void* context);

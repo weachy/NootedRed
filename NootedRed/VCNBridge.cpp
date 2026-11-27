@@ -57,8 +57,11 @@ static VCNBridge moduleInstance;
 namespace
 {
 
-    const char* const kBootArgNoVDA  = "-NRedNoVDA";
-    constexpr UInt32  kVCNDecChannel = 8;
+    const char* const kBootArgNoVDA      = "-NRedNoVDA";
+    const char* const kBootArgNoVCNMinOn = "-NRedNoVCNMinOn";
+    constexpr UInt32  kVCNDecChannel     = 8;
+    constexpr UInt32  kVCNMinOnMs        = 50;
+    constexpr UInt64  kVCNMinOnNs        = static_cast<UInt64>(kVCNMinOnMs) * 1000000ULL;
 
 
     // VCN bridge supports macOS 13 through 26 (Darwin 22 - 25).
@@ -239,6 +242,62 @@ namespace
         NRed::singleton().setProp32(VP9Probe::StatusKey, status);
     }
 
+    // Retires an AMDRadeonX6000_AMDHWChannel's pending HW timestamp lock-free using offsets verified
+    // across macOS 13-26 (+0x80 fSubmittedTimestamp, +0x84 fCompletedTimestamp, +0xC0 fTimestampPtr).
+    // Avoids calling AMDHWChannel::reset() when AMDSWScheduler's mutex may already be held.
+    UInt32 retireChannelTimestampLockFree(void* const hwChannel)
+    {
+        UInt32       submitted    = 0;
+        const auto*  base         = static_cast<const UInt8*>(hwChannel);
+        memcpy(&submitted, base + 0x80, sizeof(submitted));
+        auto* const  completedPtr = reinterpret_cast<volatile UInt32*>(static_cast<UInt8*>(hwChannel) + 0x84);
+        volatile UInt32* tsPtr    = nullptr;
+        memcpy(&tsPtr, base + 0xC0, sizeof(tsPtr));
+        if (tsPtr != nullptr && tsPtr != completedPtr) {
+            __atomic_store_n(tsPtr, submitted, __ATOMIC_RELEASE);
+        }
+        __atomic_store_n(completedPtr, submitted, __ATOMIC_RELEASE);
+        return submitted;
+    }
+
+    template<typename T>
+    const T& queueField(const void* const object, const size_t offset)
+    {
+        return *reinterpret_cast<const T*>(static_cast<const UInt8*>(object) + offset);
+    }
+
+    mach_vm_address_t queueSlot(const void* const object, const size_t slot)
+    {
+        return queueField<mach_vm_address_t>(queueField<void*>(object, 0), slot);
+    }
+
+    enum class QueueDrainResult
+    {
+        Skipped,
+        Completed,
+        TimestampChanged
+    };
+
+    // Native stopQueue callers may hold the accelerator busy lock, so hardware workloop acquisition must not block.
+    struct QueueWorkLoop : IOWorkLoop
+    {
+        static bool tryEnter(IOWorkLoop* const loop) { return (loop->*&QueueWorkLoop::tryCloseGate)(); }
+        static void leave(IOWorkLoop* const loop) { (loop->*&QueueWorkLoop::openGate)(); }
+    };
+
+    struct QueueGate
+    {
+        IOWorkLoop* loop{nullptr};
+        bool        entered{false};
+
+        bool enter() { return this->loop != nullptr && (this->loop->inGate() || (this->entered = QueueWorkLoop::tryEnter(this->loop))); }
+        void leave()
+        {
+            if (this->entered) { QueueWorkLoop::leave(this->loop); }
+            this->entered = false;
+        }
+    };
+
 }    // namespace
 
 VCNBridge& VCNBridge::singleton() { return moduleInstance; }
@@ -266,9 +325,10 @@ void VCNBridge::init()
         return;
     }
 
-    // Register the optional X6000 load callback up front.  The kext is only requested from inside the
-    // X5000 accelerator start, i.e. after both drivers' load hooks are in place.
+    // Register the optional X6000 and IOAcceleratorFamily2 load callbacks up front.  X6000 is only requested
+    // from inside the X5000 accelerator start, i.e. after both drivers' load hooks are in place.
     lilu.onKextLoadForce(&kextRadeonX6000);
+    lilu.onKextLoadForce(&kextIOAcceleratorFamily2);
 
     SInt32 maxCtx = 6;
     if (PE_parse_boot_argn("vcnmaxctx", &maxCtx, sizeof(maxCtx))) {
@@ -353,6 +413,9 @@ void* VCNBridge::allocateEngine(void* const hardware)
     auto* const engine    = this->engineMC->alloc();
     this->vcnEngine       = engine;
     this->engineAllocated = engine != nullptr;
+    __atomic_store_n(&this->lastHardwareInitNs, 0, __ATOMIC_RELEASE);
+    const bool drainEnabled = this->queueDrainRouted && engine != nullptr && this->queueDrainLayoutFits();
+    __atomic_store_n(&this->queueDrainEngine, drainEnabled ? engine : nullptr, __ATOMIC_RELEASE);
     this->clearTrackedContexts();
 
     NRed::singleton().setProp32("NRedVCNEngineAllocated", static_cast<UInt32>(this->engineAllocated));
@@ -362,6 +425,8 @@ void* VCNBridge::allocateEngine(void* const hardware)
     NRed::singleton().setProp32("NRedVCNQuotaFallbacks", 0);
     NRed::singleton().setProp32("NRedVCNResetCount", 0);
     NRed::singleton().setProp32("NRedVCNSkipReplayRetired", 0);
+    NRed::singleton().setProp32("NRedVCNMinOnDelays", 0);
+    NRed::singleton().setProp32("NRedVCNQueueDrain", drainEnabled ? 1U : 0U);
     NRed::singleton().setPropStr("NRedVCNActiveOwners", "none");
     if (!this->engineAllocated) {
         this->failMedia(7);
@@ -427,6 +492,8 @@ bool VCNBridge::acceleratorStart(void* const self, IOService* const provider)
         bridge.loadCompleted   = false;
         bridge.engineAllocated = false;
         bridge.vcnEngine       = nullptr;
+        __atomic_store_n(&bridge.queueDrainEngine, nullptr, __ATOMIC_RELEASE);
+        __atomic_store_n(&bridge.lastHardwareInitNs, 0, __ATOMIC_RELEASE);
         bridge.clearTrackedContexts();
         NRed::singleton().setProp32("NRedVCNEngineAllocated", 0);
         NRed::singleton().setProp32("NRedVDAMediaEnabled", 0);
@@ -453,6 +520,8 @@ void VCNBridge::acceleratorStop(void* const self, IOService* const provider)
     bridge.engineAllocated = false;
     bridge.vcnEngine       = nullptr;
     bridge.hardwareHandle  = nullptr;
+    __atomic_store_n(&bridge.queueDrainEngine, nullptr, __ATOMIC_RELEASE);
+    __atomic_store_n(&bridge.lastHardwareInitNs, 0, __ATOMIC_RELEASE);
     bridge.clearTrackedContexts();
     bridge.setAccelerator(nullptr);
 
@@ -539,6 +608,9 @@ bool VCNBridge::initHardware(void* const self, const UInt32 channel)
     NRed::singleton().setProp32("NRedVCNLastHardwareInit", static_cast<UInt32>(result));
 
     if (result) {
+        UInt64 nowNs = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+        __atomic_store_n(&bridge.lastHardwareInitNs, nowNs, __ATOMIC_RELEASE);
         publishStage(11);
         SYSLOG("VCN", "VCN2 initHardware channel=%u succeeded", channel);
         return true;
@@ -553,6 +625,8 @@ bool VCNBridge::initHardware(void* const self, const UInt32 channel)
     bridge.engineAllocated = false;
     bridge.vcnEngine       = nullptr;
     bridge.loadCompleted   = false;
+    __atomic_store_n(&bridge.queueDrainEngine, nullptr, __ATOMIC_RELEASE);
+    __atomic_store_n(&bridge.lastHardwareInitNs, 0, __ATOMIC_RELEASE);
     bridge.clearTrackedContexts();
     NRed::singleton().setProp32("NRedVCNEngineAllocated", 0);
     NRed::singleton().setProp32("NRedVDAMediaEnabled", 0);
@@ -561,6 +635,34 @@ bool VCNBridge::initHardware(void* const self, const UInt32 channel)
     }
 
     return false;
+}
+
+bool VCNBridge::releaseHardware(void* const self, const UInt32 channel)
+{
+    auto&      bridge = singleton();
+    const auto caller = reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0));
+    if (bridge.minOnTime && bridge.engineEnabled() && !bridge.hasMediaFailed()
+        && channel >= VCNQueueDrain::DecodeChannel && channel <= VCNQueueDrain::EncodeChannel + 2
+        && self != nullptr && self == bridge.vcnEngine
+        && caller >= bridge.stopQueueStart && caller < bridge.stopQueueEnd
+        && bridge.interruptsEnabled != nullptr && bridge.onInterrupt != nullptr && bridge.preemptionEnabled != nullptr
+        && bridge.interruptsEnabled() && !bridge.onInterrupt() && bridge.preemptionEnabled())
+    {
+        for (;;) {
+            const UInt64 lastInit = __atomic_load_n(&bridge.lastHardwareInitNs, __ATOMIC_ACQUIRE);
+            if (lastInit == 0) { break; }
+            UInt64 nowNs = 0;
+            absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+            if (nowNs < lastInit || nowNs - lastInit >= kVCNMinOnNs) { break; }
+            const UInt32 sleepMs =
+                static_cast<UInt32>((kVCNMinOnNs - (nowNs - lastInit) + 999999ULL) / 1000000ULL);
+            IOSleep(sleepMs);
+            const auto delays = static_cast<UInt32>(OSIncrementAtomic(&bridge.minOnDelays) + 1);
+            NRed::singleton().setProp32("NRedVCNMinOnDelays", delays);
+        }
+    }
+
+    return FunctionCast(releaseHardware, bridge.orgReleaseHardware)(self, channel);
 }
 
 bool VCNBridge::fetchResource(void* const self, void* const parameters, void* const resourceInfo)
@@ -792,7 +894,7 @@ void VCNBridge::videoContextStop(void* const self)
 {
     auto&      bridge     = singleton();
     const bool wasTracked = bridge.trackContextStop(self);
-    if (wasTracked) {
+    if (wasTracked && __atomic_load_n(&bridge.queueDrainEngine, __ATOMIC_ACQUIRE) == nullptr) {
         bridge.drainVCN("videoContextStop");
     }
 
@@ -811,7 +913,7 @@ void VCNBridge::videoContextStop(void* const self)
 void VCNBridge::videoContextDestroy(void* const self)
 {
     auto& bridge = singleton();
-    if (bridge.trackContextStop(self)) {
+    if (bridge.trackContextStop(self) && __atomic_load_n(&bridge.queueDrainEngine, __ATOMIC_ACQUIRE) == nullptr) {
         bridge.drainVCN("videoContextDestroy");
     }
     FunctionCast(videoContextDestroy, bridge.orgVideoContextDestroy)(self);
@@ -840,8 +942,10 @@ bool VCNBridge::engineReset(void* const self, const UInt32 ringType, UInt32* con
         // Perform a real VCN2 hardware power-cycle reset (releaseHardware + initHardware) before touching
         // the ring, because initializing the ring while VCN2 is powered down corrupts ring/PSP state.
         const UInt32 vcnChannel = kVCNDecChannel + ringType;
-        if (bridge.vcnReleaseHardware != 0) {
-            reinterpret_cast<bool (*)(void*, UInt32)>(bridge.vcnReleaseHardware)(self, vcnChannel);
+        const mach_vm_address_t releaseFn =
+            bridge.orgReleaseHardware != 0 ? bridge.orgReleaseHardware : bridge.vcnReleaseHardware;
+        if (releaseFn != 0) {
+            reinterpret_cast<bool (*)(void*, UInt32)>(releaseFn)(self, vcnChannel);
         }
 
         bool reinitOk = true;
@@ -892,21 +996,8 @@ UInt64 VCNBridge::vcnSubmitCommandBuffer(void* const self, void* const submitInf
 
     const UInt64 result = FunctionCast(vcnSubmitCommandBuffer, bridge.orgVcnSubmitCommandBuffer)(self, submitInfo);
     if (skipGuiltyCb && self != nullptr) {
-        // Apple's AMDVCN2DecChannel::commitIndirectCommandBuffer returns early on flags & 0x02 without
-        // emitting a fence packet or ringing the doorbell, leaving the skipped CB's HW timestamp unretired.
-        // Do NOT call AMDHWChannel::reset() here because AMDSWScheduler::advance() already holds the
-        // SWScheduler mutex and reset() would call resetHwChannel() and self-deadlock on the same lock.
-        // Instead, retire the skipped CB's HW timestamp lock-free via AMDHWChannel's verified offsets
-        // (+0x80 submitted, +0x84 completed, +0xC0 HW timestamp pointer).
-        const UInt32 submitted    = getMember<UInt32>(self, 0x80);
-        auto* const  completedPtr = reinterpret_cast<volatile UInt32*>(static_cast<UInt8*>(self) + 0x84);
-        auto* const  tsPtr        = getMember<volatile UInt32*>(self, 0xC0);
-        if (tsPtr != nullptr && tsPtr != completedPtr) {
-            __atomic_store_n(tsPtr, submitted, __ATOMIC_RELEASE);
-        }
-        __atomic_store_n(completedPtr, submitted, __ATOMIC_RELEASE);
-
-        const auto retired = static_cast<UInt32>(OSIncrementAtomic(&bridge.vcnSkippedReplayRetired) + 1);
+        const UInt32 submitted = retireChannelTimestampLockFree(self);
+        const auto   retired   = static_cast<UInt32>(OSIncrementAtomic(&bridge.vcnSkippedReplayRetired) + 1);
         NRed::singleton().setProp32("NRedVCNSkipReplayRetired", retired);
 
         static constexpr UInt64 kCooldownDurationNs = 15000000000ULL;
@@ -962,22 +1053,232 @@ bool VCNBridge::channelWaitForHwStamp(void* const self, const UInt32 stamp)
             absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
         }
         if (bridge.hasMediaFailed() || nowNs < cooldownEnd) {
-            if (self != nullptr && bridge.vcnChannelReset != 0) {
-                reinterpret_cast<void (*)(void*)>(bridge.vcnChannelReset)(self);
-            }
+            if (self != nullptr) { retireChannelTimestampLockFree(self); }
             return true;
         }
     }
 
     const bool ok = FunctionCast(channelWaitForHwStamp, bridge.orgWaitForHwStamp)(self, stamp);
     if (!ok && self != nullptr) {
-        if (bridge.vcnChannelReset != 0) {
-            reinterpret_cast<void (*)(void*)>(bridge.vcnChannelReset)(self);
-        }
+        retireChannelTimestampLockFree(self);
         bridge.triggerSelfHealingCooldown("AMDHWChannel::waitForHwStamp timeout");
         return true;
     }
     return ok;
+}
+
+static OSMetaClassBase* getQueueChannel(VCNBridge& bridge, void* const engine, IOService* const accelerator,
+                                        const UInt32 slot, const VCNQueueDrain::Layout& layout,
+                                        const mach_vm_address_t accelLookup, const OSMetaClass* const channelClass,
+                                        const mach_vm_address_t safeCast)
+{
+    auto* const hw = queueField<void*>(engine, layout.channels[slot]);
+    if (hw == nullptr) { return nullptr; }
+    const auto getIndex = reinterpret_cast<SInt32 (*)(void*)>(queueSlot(hw, layout.getChannelIndex));
+    if (getIndex == nullptr) { return nullptr; }
+    const auto index = getIndex(hw);
+    if (index < 0) { return nullptr; }
+    const auto  lookup    = reinterpret_cast<OSMetaClassBase* (*)(void*, UInt32)>(accelLookup);
+    auto* const candidate = lookup(accelerator, static_cast<UInt32>(index));
+    if (candidate == nullptr) { return nullptr; }
+    const auto cast =
+        reinterpret_cast<OSMetaClassBase* (*)(const OSMetaClassBase*, const OSMetaClass*)>(safeCast);
+    return cast(candidate, channelClass);
+}
+
+static QueueDrainResult waitForQueue(VCNBridge& bridge, void* const engine, IOService* const accelerator,
+                                     const UInt32 channel, QueueGate& gate, const VCNQueueDrain::Layout& layout,
+                                     const mach_vm_address_t accelLookup, const mach_vm_address_t wait5000,
+                                     const UInt32 workLoopOwner, IOWorkLoop* (*const getWorkLoop)(const IOService*),
+                                     const OSMetaClass* const channelClass, const mach_vm_address_t safeCast,
+                                     void* const* const engineSlot)
+{
+    const UInt32 first = channel == VCNQueueDrain::DecodeChannel ? 0U : 1U;
+    if (queueField<UInt8>(engine, 0x10) != 1 || queueField<UInt32>(engine, layout.users[first]) != 1) {
+        return QueueDrainResult::Skipped;
+    }
+    const UInt32 end  = first == 0 ? 1U : 3U;
+    const auto   wait = reinterpret_cast<bool (*)(void*, UInt32)>(wait5000);
+    OSObject*    channels[3]{};
+    UInt32       submitted[3]{};
+    for (UInt32 i = first; i < end; ++i) {
+        channels[i] = static_cast<OSObject*>(
+            getQueueChannel(bridge, engine, accelerator, i, layout, accelLookup, channelClass, safeCast));
+        if (channels[i] == nullptr) { return QueueDrainResult::Skipped; }
+        submitted[i] = queueField<UInt32>(channels[i], layout.submitted);
+    }
+    for (UInt32 i = first; i < end; ++i) { channels[i]->retain(); }
+    gate.leave();
+    auto drain = QueueDrainResult::Completed;
+    for (UInt32 i = first; i < end; ++i) {
+        if (!wait(channels[i], submitted[i])) {
+            drain = QueueDrainResult::Skipped;
+            break;
+        }
+    }
+    if (drain == QueueDrainResult::Completed) {
+        if (!gate.enter()) { drain = QueueDrainResult::Skipped; }
+        else if (engine != __atomic_load_n(engineSlot, __ATOMIC_ACQUIRE)
+                 || queueField<IOService*>(engine, layout.accelerator) != accelerator
+                 || queueField<void*>(accelerator, workLoopOwner) == nullptr
+                 || getWorkLoop(accelerator) != gate.loop)
+        {
+            drain = QueueDrainResult::Skipped;
+        }
+        else {
+            for (UInt32 i = first; i < end; ++i) {
+                if (getQueueChannel(bridge, engine, accelerator, i, layout, accelLookup, channelClass, safeCast)
+                    != channels[i])
+                {
+                    drain = QueueDrainResult::Skipped;
+                    break;
+                }
+                if (queueField<UInt32>(channels[i], layout.submitted) != submitted[i]) {
+                    drain = QueueDrainResult::TimestampChanged;
+                    break;
+                }
+            }
+        }
+    }
+    for (UInt32 i = first; i < end; ++i) { channels[i]->release(); }
+    return drain;
+}
+
+bool VCNBridge::stopQueue(void* const engine, const UInt32 channel)
+{
+    auto&      bridge   = singleton();
+    const auto original = reinterpret_cast<bool (*)(void*, UInt32)>(bridge.orgStopQueue);
+    if (channel < VCNQueueDrain::DecodeChannel || channel > VCNQueueDrain::EncodeChannel + 1 || engine == nullptr
+        || engine != __atomic_load_n(&bridge.queueDrainEngine, __ATOMIC_ACQUIRE))
+    {
+        return original(engine, channel);
+    }
+    auto* const accelerator = queueField<IOService*>(engine, bridge.queueDrainLayout.accelerator);
+    const auto  cast        = reinterpret_cast<OSMetaClassBase* (*)(const OSMetaClassBase*, const OSMetaClass*)>(
+        bridge.orgSafeMetaCast);
+    QueueGate gate{nullptr};
+    if (bridge.hardwareWorkLoop != nullptr && accelerator != nullptr
+        && cast(accelerator, bridge.classPairs[0].oldClass) != nullptr
+        && queueField<void*>(accelerator, bridge.hardwareWorkLoopOwner) != nullptr
+        && queueSlot(accelerator, bridge.queueDrainLayout.getAccelChannel) == bridge.accelLookup)
+    {
+        gate.loop = bridge.hardwareWorkLoop(accelerator);
+    }
+    if (gate.loop != nullptr && accelerator != nullptr) {
+        gate.loop->retain();
+        accelerator->retain();
+    }
+    auto drain = gate.enter()
+                   ? waitForQueue(bridge, engine, accelerator, channel, gate, bridge.queueDrainLayout,
+                                  bridge.accelLookup, bridge.wait5000, bridge.hardwareWorkLoopOwner,
+                                  bridge.hardwareWorkLoop, bridge.classPairs[2].oldClass, bridge.orgSafeMetaCast,
+                                  &bridge.queueDrainEngine)
+                   : QueueDrainResult::Skipped;
+    if (drain == QueueDrainResult::TimestampChanged) {
+        drain = waitForQueue(bridge, engine, accelerator, channel, gate, bridge.queueDrainLayout,
+                             bridge.accelLookup, bridge.wait5000, bridge.hardwareWorkLoopOwner,
+                             bridge.hardwareWorkLoop, bridge.classPairs[2].oldClass, bridge.orgSafeMetaCast,
+                             &bridge.queueDrainEngine);
+    }
+    if (drain != QueueDrainResult::Completed) { gate.leave(); }
+    const auto result = original(engine, channel);
+    gate.leave();
+    if (gate.loop != nullptr && accelerator != nullptr) {
+        gate.loop->release();
+        accelerator->release();
+    }
+    return result;
+}
+
+void VCNBridge::prepareQueueDrain5000(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide,
+                                      const size_t size)
+{
+    resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDAccelChannel16waitForTimestampEj", this->wait5000, slide, size);
+    if (this->wait5000 < slide || this->wait5000 - slide >= size) { this->wait5000 = 0; }
+    if (resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDAccelChannel22resetHardwareAndReplayEv", this->replay5000, slide,
+                size)
+        && this->replay5000 >= slide && this->replay5000 - slide < size)
+    {
+        const size_t available = size - (this->replay5000 - slide);
+        this->replay5000Size   = available < 0x280 ? available : 0x280;
+    }
+}
+
+void VCNBridge::prepareQueueDrainWorkLoop(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide,
+                                          const size_t size)
+{
+    static constexpr UInt8 kLoadOwner[] = {0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x87};
+    static constexpr UInt8 kLoadLoop[]  = {0x48, 0x8B, 0x40, 0x58, 0x5D, 0xC3};
+    static constexpr size_t kGetterSize = sizeof(kLoadOwner) + sizeof(UInt32) + sizeof(kLoadLoop);
+    mach_vm_address_t getter{0};
+    if (size < kGetterSize
+        || !resolve(patcher, id, "__ZNK22IOGraphicsAccelerator219getHardwareWorkLoopEv", getter, slide, size)
+        || getter < slide || getter - slide > size - kGetterSize)
+    {
+        return;
+    }
+    const auto* const code  = reinterpret_cast<const UInt8*>(getter);
+    const UInt32      owner = VCNQueueDrain::read32(code + sizeof(kLoadOwner));
+    if (memcmp(code, kLoadOwner, sizeof(kLoadOwner)) != 0
+        || memcmp(code + kGetterSize - sizeof(kLoadLoop), kLoadLoop, sizeof(kLoadLoop)) != 0
+        || owner < sizeof(void*) || owner > 0xFFF8 || owner % sizeof(void*) != 0)
+    {
+        return;
+    }
+    this->hardwareWorkLoopOwner = owner;
+    this->hardwareWorkLoop      = reinterpret_cast<decltype(this->hardwareWorkLoop)>(getter);
+}
+
+bool VCNBridge::installQueueDrain(KernelPatcher& patcher, const size_t id, const mach_vm_address_t slide,
+                                  const size_t size)
+{
+    static constexpr size_t kStopSize = 0x100, kSuspendSize = 0x1CA, kLookupSlot = 0x1A0;
+    static constexpr char   kStopQueueSym[] = "__ZN29AMDRadeonX6000_AMDVCNHWEngine9stopQueueE21eAMDAccelVideoChannel";
+    mach_vm_address_t       stop{0}, suspend{0}, wait6000{0}, acceleratorTable{0};
+    if (this->hardwareWorkLoop == nullptr || this->wait5000 == 0 || this->replay5000Size == 0 || size < kSuspendSize) {
+        return false;
+    }
+    if (!resolve(patcher, id, kStopQueueSym, stop, slide, size)
+        || !resolve(patcher, id, "__ZN29AMDRadeonX6000_AMDVCNHWEngine21setSuspendResumeStateEb", suspend, slide, size)
+        || !resolve(patcher, id, "__ZN30AMDRadeonX6000_AMDAccelChannel16waitForTimestampEj", wait6000, slide, size)
+        || !resolve(patcher, id, "__ZTV42AMDRadeonX6000_AMDGFX10GraphicsAccelerator", acceleratorTable, slide, size)
+        || stop < slide || stop - slide > size - kStopSize || suspend < slide || suspend - slide > size - kSuspendSize
+        || acceleratorTable < slide || acceleratorTable - slide > size - kLookupSlot - 3 * sizeof(void*))
+    {
+        return false;
+    }
+    VCNQueueDrain::Layout layout{};
+    const auto* const     wait = reinterpret_cast<const UInt8*>(wait6000);
+    if (!VCNQueueDrain::readStop(reinterpret_cast<const UInt8*>(stop), kStopSize, layout)
+        || !VCNQueueDrain::readSuspend(reinterpret_cast<const UInt8*>(suspend), kSuspendSize, wait, layout)
+        || !VCNQueueDrain::readsSubmittedStamp(reinterpret_cast<const UInt8*>(this->replay5000), this->replay5000Size,
+                                               reinterpret_cast<const UInt8*>(this->wait5000), layout.submitted))
+    {
+        return false;
+    }
+    this->queueDrainLayout = layout;
+    this->accelLookup =
+        queueField<mach_vm_address_t>(reinterpret_cast<const void*>(acceleratorTable), 2 * sizeof(void*) + kLookupSlot);
+    if (this->accelLookup == 0) { return false; }
+    KernelPatcher::RouteRequest route{kStopQueueSym, stopQueue, this->orgStopQueue};
+    const bool                  installed = patcher.routeMultiple(id, &route, 1, slide, size);
+    patcher.clearError();
+    return installed;
+}
+
+bool VCNBridge::queueDrainLayoutFits() const
+{
+    if (this->engineMC == nullptr || this->classPairs[0].oldClass == nullptr
+        || this->classPairs[2].oldClass == nullptr)
+    {
+        return false;
+    }
+    const auto engineSize = this->engineMC->getClassSize();
+    return this->queueDrainLayout.accelerator + sizeof(void*) <= engineSize
+        && this->queueDrainLayout.channels[2] + sizeof(void*) <= engineSize
+        && this->queueDrainLayout.users[1] + sizeof(UInt32) <= engineSize
+        && this->hardwareWorkLoopOwner + sizeof(void*) <= this->classPairs[0].oldClass->getClassSize()
+        && this->queueDrainLayout.submitted + sizeof(UInt32) <= this->classPairs[2].oldClass->getClassSize();
 }
 
 OSMetaClassBase* VCNBridge::safeMetaCast(const OSMetaClassBase* const object, const OSMetaClass* const target)
@@ -1008,6 +1309,11 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
                             const size_t size)
 {
     if (!this->requested) { return; }
+
+    if (id == kextIOAcceleratorFamily2.loadIndex) {
+        this->prepareQueueDrainWorkLoop(patcher, id, slide, size);
+        return;
+    }
 
     if (id == kextRadeonX5000.loadIndex) {
         NRed::singleton().setProp32("NRedVCNX5000Seen", 1);
@@ -1102,6 +1408,8 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
             this->x5000Prepared = false;
             return;
         }
+
+        this->prepareQueueDrain5000(patcher, id, slide, size);
 
         this->x5000Prepared = true;
         NRed::singleton().setProp32("NRedVCNX5000ABIValidated", 1);
@@ -1264,6 +1572,52 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
         // All symbols are verified present across macOS 13-26; use graceful fallback on any missing symbol.
         resolve(patcher, id, "__ZN30AMDRadeonX6000_AMDVCN2HWEngine15releaseHardwareE21eAMDAccelVideoChannel",
                 this->vcnReleaseHardware, slide, size);
+        if (checkKernelArgument(kBootArgNoVCNMinOn)) {
+            NRed::singleton().setProp32("NRedVCNMinOn", 0);
+        }
+        else {
+            // Short jump: only `add esi, -8; cmp esi, 2` (6 bytes) go to the trampoline, avoiding the
+            // relative `ja` at +6 that a 14-byte long jump would copy without relocation.
+            static constexpr UInt8 kReleasePrologue[] = {0x83, 0xC6, 0xF8, 0x83, 0xFE, 0x02, 0x77};
+            mach_vm_address_t      stop{0}, suspend{0};
+            resolve(patcher, id, "__ZN29AMDRadeonX6000_AMDVCNHWEngine9stopQueueE21eAMDAccelVideoChannel", stop, slide,
+                    size);
+            resolve(patcher, id, "__ZN29AMDRadeonX6000_AMDVCNHWEngine21setSuspendResumeStateEb", suspend, slide, size);
+            const bool validStopRange = stop != 0 && suspend > stop && suspend - stop <= 0x200;
+
+            auto resolveThreadCheck = [&patcher](const char* const sym) -> ThreadCheck {
+                const auto fn = reinterpret_cast<ThreadCheck>(patcher.solveSymbol(KernelPatcher::KernelID, sym));
+                patcher.clearError();
+                return fn;
+            };
+            this->interruptsEnabled = resolveThreadCheck("_ml_get_interrupts_enabled");
+            this->onInterrupt       = resolveThreadCheck("_ml_at_interrupt_context");
+            this->preemptionEnabled = resolveThreadCheck("_preemption_enabled");
+            const bool checksReady  = this->interruptsEnabled != nullptr && this->onInterrupt != nullptr
+                                  && this->preemptionEnabled != nullptr;
+
+            KernelPatcher::RouteRequest minOnRoute{
+                "__ZN30AMDRadeonX6000_AMDVCN2HWEngine15releaseHardwareE21eAMDAccelVideoChannel", releaseHardware,
+                this->orgReleaseHardware};
+            const bool canRoute = validStopRange && checksReady && this->vcnReleaseHardware != 0
+                               && size >= sizeof(kReleasePrologue) && this->vcnReleaseHardware >= slide
+                               && this->vcnReleaseHardware - slide <= size - sizeof(kReleasePrologue)
+                               && memcmp(reinterpret_cast<const void*>(this->vcnReleaseHardware), kReleasePrologue,
+                                         sizeof(kReleasePrologue))
+                                      == 0
+                               && patcher.routeMultipleShort(id, &minOnRoute, 1, slide, size);
+            patcher.clearError();
+            if (canRoute) {
+                this->stopQueueStart = stop;
+                this->stopQueueEnd   = suspend;
+            }
+            this->minOnTime = canRoute;
+            NRed::singleton().setProp32("NRedVCNMinOn", this->minOnTime ? kVCNMinOnMs : 0xFFFFFFFFU);
+            if (!this->minOnTime) {
+                SYSLOG("VCN", "Optional X6000 releaseHardware minOnTime route unavailable; continuing");
+            }
+        }
+        this->queueDrainRouted = this->installQueueDrain(patcher, id, slide, size);
         resolve(patcher, id, "__ZN30AMDRadeonX6000_AMDVCN2HWEngine6isIdleEv", this->vcnIsIdle, slide, size);
         resolve(patcher, id, "__ZN26AMDRadeonX6000_AMDHWEngine12getHWChannelE18_eAMD_HW_RING_TYPE",
                 this->vcnGetHWChannel, slide, size);
